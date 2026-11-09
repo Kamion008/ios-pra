@@ -94,6 +94,32 @@ What the diagnostic does now:
 - Next revision (built) floods whole regions, disables the watchdog, and adds
   the DSS-register fallback. Not yet flashed at the time of writing.
 
+## Button-free mode switching (proven 2026-11-09)
+
+The `fastboot` partition (`mmcblk0p5`) is a raw ARM64 bootloader image with an
+embedded symbol table. Its misc parser (`check_misc_info`,
+`comm_read_misc_cmd`) accepts `boot-recovery`, `boot-erecovery` and
+`boot-safemode`.
+
+Empirically confirmed on the device:
+
+- Writing ASCII `boot-recovery` at **offset 0** of `misc` (`mmcblk0p20`) and
+  issuing a normal `adb reboot` boots **TWRP**, not Android.
+- The bootloader **clears the command after reading it** (one-shot BCB): after
+  the recovery boot, `misc` was already all zeros.
+- `misc` is restored to zeros; the phone is back in Android.
+
+Exact test (from TWRP root, where the block device is writable):
+
+```
+printf "boot-recovery" | dd of=/dev/block/bootdevice/by-name/misc bs=1 count=13
+sync
+adb reboot
+```
+
+This removes the need for the power+volume button combo (which is awkward
+because of the unlocked-bootloader warning screen).
+
 ## Host helper
 - `tools/notify.sh [short|long]` plays a host alert when the human must act on
   the phone (PulseAudio `paplay`).
