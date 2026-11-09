@@ -22,6 +22,14 @@ Collected over ADB root in TWRP. Source files were temporary
   (0x31000000..0x32A40000, inside System RAM)
 - `/framebuffer@E8600000` is the DSS MMIO window (`dss_base_phy=0xe8600000`),
   **not** a RAM framebuffer
+- Bootloader splash backing store, confirmed from the kernel log line
+  `hisi_fb_probe: g_logo_buffer_base = 0x5d000000, g_logo_buffer_size = 0x3000000`
+  and `/reserved-memory/logo-buffer`:
+  `reg = <0x00000000 0x5d000000 0x00000000 0x03000000>`
+  (0x5D000000..0x60000000, 48 MiB, inside the lower System RAM bank).
+  The earlier shim flooded this range plus the `graphic` carveout and the
+  screen did not change; that run is now attributed to the SDHCI bug below,
+  not to a wrong scanout address.
 
 ### UART
 - live `/proc/iomem`: `/amba/uart@fdf02000` → PL011 at `0xFDF02000`
@@ -55,6 +63,95 @@ Collected over ADB root in TWRP. Source files were temporary
   sha256 `1f84618832688868e094d1c35f490877603a755317ffc91be4888fed46075d56`.
 - TWRP lives in `recovery_ramdisk` (ramdisk-only image, `kernel_size=0`).
 - Stock kernel has no `CONFIG_KEXEC`, so TWRP cannot kexec an OS.
+
+#### kexec on the newer hi6250 kernels (verified 2026-11-09, GitHub API only)
+
+The stock 4.4.23 tree (`/home/kamion008/Ai/hi6250-kernel`, and the LineageOS
+source `kernel/huawei/hi6250-8`) cannot get kexec: it has the generic
+`kernel/kexec*.c` but **no `arch/arm64/kernel/machine_kexec.c`**, and arm64
+kexec support only landed in Linux 4.6. Flipping `CONFIG_KEXEC` there would
+not link.
+
+`Iceows/android_kernel_huawei_hi6250` (fork, 1.4 GiB) has six branches, and
+**every one of them has the arm64 kexec backend**:
+
+| Branch | Kernel | Defconfig | `CONFIG_KEXEC` |
+|---|---|---|---|
+| `Phenix-4.9.337` (default) | 4.9.337 | `phenix_defconfig` | not set |
+| `OSS` | 4.9.337 | `phenix_defconfig` | not set |
+| `TEEOS` | 4.9.337 | `phenix_defconfig` | not set |
+| `android-14` | 4.9.337 | `phenix_defconfig` | not set |
+| `lineage-16.0` | 4.9.148 | `merge_hi6250_defconfig` | not set |
+| `lineage-17.1` | 4.9.148 | `merge_hi6250_defconfig` | not set |
+
+All six contain `arch/arm64/kernel/machine_kexec.c` (`machine_kexec`,
+`machine_kexec_prepare`, `machine_kexec_cleanup`, `machine_crash_shutdown`,
+`cpu_soft_restart`) plus `arch/arm64/kernel/relocate_kernel.S` and
+`arch/arm64/kernel/cpu-reset.S`/`cpu-reset.h`. `arch/arm64/Kconfig` declares
+
+```
+config KEXEC
+        depends on PM_SLEEP_SMP
+        select KEXEC_CORE
+```
+
+`merge_hi6250_defconfig` and `phenix_defconfig` both set
+`CONFIG_SMP=y CONFIG_HOTPLUG_CPU=y CONFIG_PM_SLEEP=y CONFIG_PM_SLEEP_SMP=y`,
+so the only dependency is already satisfied: adding `CONFIG_KEXEC=y` to the
+defconfig is the whole change. Neither branch has a `CONFIG_KEXEC_FILE`
+backend (`arch/arm64/kernel/kexec_image.c` is absent), so use the
+`kexec_load` syscall, not `kexec_file`.
+
+Both trees also carry the drivers our XNU port must match:
+`CONFIG_MMC_SDHCI_OF_ARASAN=y` (the Arasan SDHCI at `0xFF390000`) and
+`CONFIG_HISI_FB_6250=y` (`hisifb` display). No release assets and no tags, so
+there is no prebuilt Image to download: using any of them means building.
+
+Conclusion: kexec is a **one-line enable on a buildable 4.9 tree**, but it is
+an iteration-speed device, not a prerequisite. The p30 route already executes
+our code, and XNU still has to be built on macOS CI either way.
+
+#### CI build gates for `MACHINE_CONFIG=PRA` (fixed 2026-11-09)
+
+`0125` added PRA to `SUPPORTED_ARM64_MACHINE_CONFIGS`, `MACHINE_FLAGS_ARM64_PRA`
+and the arm64/arm64e selection, but four make gates and the three staging
+scripts still accepted only `SWEET A5XELTE`. With `MACHINE_CONFIG=PRA`:
+
+- the three `xnu/patches/*.sh` stagers exited 0, so `bsd/pthread/sweet_libpthread`,
+  `libkern/crypto/sweet_bearssl` and `bsd/sweet_hfs` were never created;
+- `bsd/conf/Makefile.template` and `libkern/conf/Makefile.template` did not
+  point at those providers;
+- `makedefs/MakeInc.def` did not apply the 39-bit compact kernel VA layout
+  (4 KiB pages need it);
+- and every C file guarded by
+  `#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)`
+  compiled to nothing, because `MACHINE_FLAGS_ARM64_PRA` defines only
+  `ARM64_BOARD_CONFIG_PRA`. That failure is **silent**: the kernel links
+  without the early console, built-in pthread, portable AES, UFS/eMMC drivers
+  and the rest of the shared bring-up code.
+
+Fixed by `xnu/patches/0127-pra-shared-build-gates.patch`:
+
+- `PRA.h` defines `ARM64_BOARD_CONFIG_A5XELTE`, so PRA builds exactly the
+  A5XELTE code generation; SWEET-only blocks stay off, as they do on A5XELTE,
+  and board addresses still come from `PRA.h` (not `A5XELTE.h`);
+- the two provider gates and the 39-bit VA gate include PRA;
+- the three stagers accept PRA;
+- `PRA.h` sets `A5_KEYS_DEFAULT`/`A5_TOUCH_DEFAULT` to 0, because those
+  drivers compile for every `ARM64_BOARD_CONFIG_A5XELTE` board but poll
+  Exynos7580 pins.
+
+Verified locally: `git apply --check` passes and every gate now reads PRA.
+
+Note: the local `xnu-src` tree has no `bsd/sweet_hfs` because the stagers were
+never run here (they need macOS `xcrun` and network). `0031`/`0041` being
+skipped locally is therefore a local artifact; in CI, `0026` runs first and
+stages the files, after which `0031`/`0041` should apply.
+
+Next audit (not done): PRA now compiles the A5XELTE-guarded Samsung drivers
+(`bsd/dev/a5xelte_emmc.c`, `a5xelte_keys.c`, `a5xelte_touch.c`,
+`bsd/dev/sweet_ufs.c`, `bsd/dev/sweet_sample.c`). Confirm each is
+boot-arg/ADT-gated and cannot auto-probe Huawei hardware at boot.
 
 ### Bootloader
 - `bootlock=unlocked`, `userlock=unlocked`, `verifiedbootstate=ORANGE`
@@ -119,6 +216,32 @@ adb reboot
 
 This removes the need for the power+volume button combo (which is awkward
 because of the unlocked-bootloader warning screen).
+
+## Shim run 2026-11-09 (p30 route, display + eMMC confirmed)
+
+- `fastboot flash kernel` (p30) is allowed; `misc` and `erecovery_kernel` are
+  rejected with "Command not allowed". The shim can therefore run from the
+  normal kernel partition.
+- The UART clock is gated at handoff: `FR` reads all-ones, so the old
+  `uart_wait()` spun 1e6 iterations per character before reaching the
+  framebuffer. UART output is now disabled in `console.c`; the screen is the
+  only output we can observe.
+- The old shim gated on Present State bit 16, which is **Buffer Read Enable**,
+  not card-present. Both `sdhci_read` and `sdhci_write` returned -1 before
+  touching the card. Fixed: no bit-16 gate, normal status low 16 / error status
+  high 16, bounded busy waits, and a read-back verify of the written sector.
+- Early-flood test: the shim floods `0x5D000000..0x60000000` red and
+  `0x31000000..0x32A40000` blue as its first action. The screen turned **red**,
+  proving (a) the shim executes from p30, and (b) the bootloader splash
+  scanout base is the **logo buffer `0x5D000000`**, not the graphic carveout.
+- The shim then wrote `misc=boot-recovery`, read it back, wrote the 25-sector
+  `PRADMP01` dump to `erecovery_kernel + 16 MiB`, and reset via PSCI. The phone
+  rebooted every ~10-15 s: recovery shares the `kernel` partition, so with
+  p30 = shim, `boot-recovery` runs the shim again. This proves the misc write,
+  read-back and PSCI `SYSTEM_RESET` all work.
+- Next: restore stock p30, boot TWRP with the volume combo, read
+  `/dev/block/mmcblk0p27` at LBA 786432 (25 sectors), and parse with
+  `tools/pra_parse_dump.py`.
 
 ## Host helper
 - `tools/notify.sh [short|long]` plays a host alert when the human must act on

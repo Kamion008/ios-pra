@@ -22,6 +22,13 @@
 static inline uint32_t rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
 static inline void wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
 
+/* The screen is the only output we can observe. The bootloader may gate the
+ * PL011 clock at handoff; in that case FR reads all-ones and every character
+ * spins uart_wait() a million times, stalling the diagnostic before it ever
+ * reaches the framebuffer. Keep the code for a future UART cable, but leave
+ * output disabled by default. */
+static volatile int uart_ok;
+
 static void uart_wait(void)
 {
 	for (unsigned i = 0; i < 1000000; i++) {
@@ -32,18 +39,13 @@ static void uart_wait(void)
 
 void uart_init(void)
 {
-	wr32(UART_BASE + UART_CR, 0);
-	wr32(UART_BASE + UART_IBRD, 10);
-	wr32(UART_BASE + UART_FBRD, 27);
-	wr32(UART_BASE + UART_LCR, (3u << 5) | (1u << 4));
-	wr32(UART_BASE + UART_IMSC, 0);
-	wr32(UART_BASE + UART_ICR, 0x7ff);
-	wr32(UART_BASE + UART_CR, (1u << 0) | (1u << 8) | (1u << 9));
-	(void)rd32(UART_BASE + UART_FR);
+	uart_ok = 0;
 }
 
 void uart_putc(char c)
 {
+	if (!uart_ok)
+		return;
 	if (c == '\n')
 		uart_putc('\r');
 	uart_wait();

@@ -41,8 +41,8 @@ hisi log/mntn area).
 
 | Component | Patch | A5XELTE value | PRA value | Status |
 |---|---|---|---|---|
-| Early framebuffer | 0090 `A5_FB` | `0x67000000` | `0x5D000000` (logo buffer) | TODO |
-| Early text | 0092 | `0x67000000` | `0x5D000000` | TODO |
+| Early framebuffer | 0090 `A5_FB` | `0x67000000` | `0x5D000000` (logo buffer) | CONFIRMED 2026-11-09: red flood |
+| Early text | 0092 | `0x67000000` | `0x5D000000` | CONFIRMED (same buffer) |
 | Screen stages | 0091 | `0x670a08c0`, `0x670c24c0`, `0x670e40c0` | logo-buffer equivalents | TODO |
 | DECON checkpoints | 0089 | `0x6705d0c0`, `0x6707ecc0` | logo-buffer equivalents | TODO |
 | eMMC GPT probe | 0104 | `0x13540000` | `0xFF390000` | TODO |

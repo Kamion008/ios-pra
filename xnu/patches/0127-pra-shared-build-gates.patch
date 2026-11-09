@@ -1,0 +1,89 @@
+From: PRA-LX1 bring-up
+Subject: [PATCH] pra: include PRA in the shared SWEET/A5XELTE build gates
+
+0125 adds PRA to SUPPORTED_ARM64_MACHINE_CONFIGS, MACHINE_FLAGS_ARM64_PRA
+and the arm64/arm64e selection, but four gates still list only
+SWEET/A5XELTE, and the three staging scripts refuse to run for PRA.
+With MACHINE_CONFIG=PRA that means:
+
+  - bsd/pthread/sweet_libpthread, libkern/crypto/sweet_bearssl and
+    bsd/sweet_hfs are never staged (the scripts exit 0);
+  - bsd/conf/Makefile.template and libkern/conf/Makefile.template do not
+    point at those providers;
+  - makedefs/MakeInc.def does not apply the 39-bit compact kernel VA
+    layout that PRA needs (4 KiB pages);
+  - and every C file guarded by
+    `#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)`
+    compiles to nothing, because MACHINE_FLAGS_ARM64_PRA only defines
+    ARM64_BOARD_CONFIG_PRA.
+
+The last point is the dangerous one: it is silent. The kernel would link
+without the early console, built-in pthread, portable AES, UFS/eMMC
+drivers and the rest of the shared bring-up code.
+
+Fix by making PRA take exactly the A5XELTE code generation at the C
+level (PRA.h defines ARM64_BOARD_CONFIG_A5XELTE; the older SWEET-only
+blocks stay off, matching what A5XELTE builds today) and by widening the
+four make gates and the three stage scripts to include PRA.
+
+This patch is ordered after 0125, so it matches the post-0125 text.
+
+--- a/pexpert/pexpert/arm64/PRA.h
++++ b/pexpert/pexpert/arm64/PRA.h
+@@ -13,7 +13,14 @@
+  */
+ #define SWEET                         1
+ #define A5XELTE                       1
+ #define SWEET_SMP_MAX_CPUS            8
++
++/* The donor's shared drivers are guarded at the C level by
++ * `#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)`.
++ * Defining the A5XELTE one here makes PRA build exactly the code generation
++ * that A5XELTE is built and booted with; SWEET-only blocks stay off, and the
++ * board addresses come from this header, not from A5XELTE.h. */
++#define ARM64_BOARD_CONFIG_A5XELTE    1
+ 
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__                  8
+@@ -42,6 +42,12 @@
+ #define A5_FB_HEIGHT                  1920
+ #define A5_FB_STRIDE                  4320
+ #define A5_FB_2M_BLOCKS               5
+ #define A5_ENTRY_MARKER_PHYS          0x8FF00000
++
++/* The donor's key and touch drivers are compiled for every
++ * ARM64_BOARD_CONFIG_A5XELTE board, but they poll Exynos7580 pins. Keep them
++ * off on PRA; a Huawei pinctrl driver is a separate bring-up item. */
++#define A5_KEYS_DEFAULT               0
++#define A5_TOUCH_DEFAULT              0
+ 
+ #ifndef ASSEMBLER
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -45,6 +45,6 @@
+ SFLAGS+= -include meta_features.h
+ 
+ # This provider is built into SWEET; other boards use their normal kext.
+-ifneq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET A5XELTE),)
++ifneq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET A5XELTE PRA),)
+ SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
+ SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
+--- a/libkern/conf/Makefile.template
++++ b/libkern/conf/Makefile.template
+@@ -19,5 +19,5 @@
+ CFLAGS+= -include meta_features.h -DLIBKERN_KERNEL_PRIVATE -DOSALLOCDEBUG=1
+ SFLAGS+= -include meta_features.h
+ 
+-ifneq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET A5XELTE),)
++ifneq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET A5XELTE PRA),)
+ SWEET_AES_ROOT = $(SRCROOT)/libkern/crypto/sweet_bearssl
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -341,6 +341,6 @@
+ 
+ # Exynos7580 uses 4 KiB pages: TTBR1 has a 39-bit range. The macOS
+ # ARM_LARGE_MEMORY link address at -2 TiB is outside that range. Keep this
+ # board inside the existing compact kernel VA layout instead.
+-ifeq ($(CURRENT_MACHINE_CONFIG),A5XELTE)
++ifneq ($(filter $(CURRENT_MACHINE_CONFIG),A5XELTE PRA),)
+ LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
