@@ -1,0 +1,15 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 1966bdd..68fc12b 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -874,7 +874,9 @@ fbcon_probe(void)
+ 	uint32_t const *val;
+ 	unsigned int size;
+ 
+-	#if defined(A5XELTE)
++	#if defined(PRA)
++	if (SecureDTFindEntry("name", "pra-fbcon", &entry) != kSuccess ||
++#elif defined(A5XELTE)
+ 	if (SecureDTFindEntry("name", "a5xelte-fbcon", &entry) != kSuccess ||
+ #else
+ 	if (SecureDTFindEntry("name", "sweet-fbcon", &entry) != kSuccess ||

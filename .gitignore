@@ -1,0 +1,20 @@
+# device dumps: persist/modemst/fsg hold IMEI + calibration; live DT holds the serial
+backup/
+dtb/
+recovery/
+# third-party/Apple sources fetched for reading
+research/
+xnu-src/
+*.ipsw
+# live device harvest: dmesg/config may contain serials and calibration
+live/
+shim/out/
+xnu/out/
+xnu/out-*/
+__pycache__/
+shim/a5xelte/out/
+shim/a5xelte/out4k/
+shim/a5xelte/outxnu/
+shim/dreamlte/out/
+shim/pra/out/
+logs/
