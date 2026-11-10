@@ -30,6 +30,13 @@ if ! git remote get-url origin >/dev/null 2>&1; then
 fi
 git push -u origin HEAD
 
+# Snapshot the existing dispatch runs before triggering. Looking at "the
+# newest run" after the dispatch is racy: the list API can still return the
+# previous run, and a push-triggered build can also appear. Remember the IDs
+# and wait for one that did not exist before.
+BEFORE=$(gh run list --repo "$REPO" --workflow xnu.yml --event workflow_dispatch \
+    --limit 20 --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
+
 # Dispatch with the PRA target. The push trigger defaults to A5XELTE, so this
 # must be an explicit workflow_dispatch run.
 gh workflow run xnu.yml --repo "$REPO" \
@@ -39,13 +46,16 @@ gh workflow run xnu.yml --repo "$REPO" \
     -f runner="${RUNNER:-macos-14}" \
     -f keep_going=true
 
-# Find the run this dispatch created. A push-triggered run can appear at the
-# same time, so match on the event rather than taking the newest run.
 RUN=
 i=0
-while [ "$i" -lt 12 ]; do
-    RUN=$(gh run list --repo "$REPO" --workflow xnu.yml --event workflow_dispatch \
-        --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+while [ "$i" -lt 24 ]; do
+    for ID in $(gh run list --repo "$REPO" --workflow xnu.yml --event workflow_dispatch \
+            --limit 20 --json databaseId --jq '.[].databaseId' 2>/dev/null || true); do
+        if ! printf '%s\n' "$BEFORE" | grep -qx "$ID"; then
+            RUN=$ID
+            break
+        fi
+    done
     [ -n "$RUN" ] && break
     i=$((i + 1))
     sleep 5
