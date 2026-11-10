@@ -9,6 +9,11 @@
 # address 0x500000 (__payload_start), so the bootloader's add_device_tree()
 # puts the DTB after it and the loader's bounds check is just dtb-payload.
 set -eu
+# Resolve PAYLOAD before cd so callers can pass a path relative to their cwd.
+case "${PAYLOAD:-}" in
+    ""|/*) ;;
+    *) PAYLOAD="$(pwd)/$PAYLOAD" ;;
+esac
 cd "$(dirname "$0")"
 : "${CC:=clang}"
 : "${LD:=ld.lld}"
@@ -71,7 +76,10 @@ if [ -z "$PAYLOAD" ]; then
         "$OUT/adt-pra.bin" "$OUT/payload.bin" \
         --cmdline "debug=0x8 serial=0 cpus=1"
 else
-    cp "$PAYLOAD" "$OUT/payload.bin"
+    DEST="$(pwd)/$OUT/payload.bin"
+    if [ "$PAYLOAD" != "$DEST" ]; then
+        cp "$PAYLOAD" "$DEST"
+    fi
 fi
 
 $OBJCOPY -O binary "$OUT/loader.elf" "$OUT/loader.bin"
