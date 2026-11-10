@@ -1,0 +1,26 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 0535b28..0b80e7d 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -14,8 +14,21 @@
+ #include <pexpert/pexpert.h>
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /* Galaxy S8: MAX77865 fuel gauge (bsd/dev/a5xelte_touch.c). */
++#if defined(DREAMLTE)
+ extern "C" int dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+     int *external, int *charging, int *full);
++#else
++/* PRA-LX1 has no MAX77865; the gauge implementation is DREAMLTE-only.  Report
++ * failure so poll() publishes the static fallback and never probes Exynos I2C. */
++static inline int
++dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
++    int *external, int *charging, int *full)
++{
++	(void)percent; (void)mv; (void)ma;
++	(void)external; (void)charging; (void)full;
++	return -1;
++}
++#endif
+ static inline int sweet_spmi_init(void) { return -1; }
+ static inline int sweet_spmi_read(unsigned, unsigned, uint8_t *) { return -1; }
+ #define SWEET_BAT_MAH 3000u

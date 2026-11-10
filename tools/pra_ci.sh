@@ -69,6 +69,7 @@ gh run watch "$RUN" --repo "$REPO" || true
 CONCLUSION=$(gh run view "$RUN" --repo "$REPO" --json conclusion --jq .conclusion)
 echo "conclusion: $CONCLUSION"
 
+rm -rf out/ci
 mkdir -p out/ci
 gh run download "$RUN" --repo "$REPO" -n xnu-kernel -D out/ci || true
 gh run download "$RUN" --repo "$REPO" -n xnu-buildtree -D out/ci || true

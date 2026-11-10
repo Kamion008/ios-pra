@@ -439,6 +439,14 @@ The eMMC probe is still opt-in (`emmcprobe=1`), keys and touch keep their
 `A5_*_DEFAULT 0`, and `rd=md0` never reaches the eMMC/UFS root paths, so the
 Exynos drivers are linked but inert on the first PRA boot.
 
+The third build (run 42851091532) then came down to a single undefined
+symbol, `_dreamlte_battery_read` from `SweetBattery::poll()`. That function
+lives in the `#if defined(DREAMLTE)` half of `bsd/dev/a5xelte_touch.c`
+(MAX77865 gauge), and PRA correctly does not define `DREAMLTE`.
+`0131-pra-battery-no-dreamlte-gauge.patch` adds a PRA-only inline stub that
+returns failure, so `poll()` publishes the static fallback instead of probing
+Exynos I2C; the S8 build still links the real gauge.
+
 The full log was unreadable through `gh run view --log` (HTTP/2 reset); see
 `docs/pra-ci-access.md` for the `curl --http1.1` job-log workaround.
 
