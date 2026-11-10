@@ -1,0 +1,27 @@
+name: zz-xcode
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: macos-15
+    steps:
+      - name: Toolchain inventory
+        run: |
+          uname -m
+          sw_vers
+          echo "== Xcodes =="
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "none"
+          for x in /Applications/Xcode*.app; do
+            [ -d "$x" ] || continue
+            echo "--- $x"
+            DEVELOPER_DIR="$x/Contents/Developer" xcodebuild -version 2>&1 | head -2
+          done
+          echo "== default =="
+          xcode-select -p
+          xcodebuild -version
+          echo "== iig =="
+          xcrun --find iig 2>&1 || true
+          echo "== rosetta =="
+          /usr/bin/pgrep -q oahd && echo "rosetta installed" || echo "no rosetta daemon"
+          echo "== kdk =="
+          ls -d /Library/Developer/KDKs/* 2>/dev/null || echo "no KDK"

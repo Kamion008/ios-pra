@@ -36,13 +36,21 @@ gh workflow run xnu.yml --repo "$REPO" \
     -f machine_config=PRA \
     -f macos_version=13.5 \
     -f kernel_config=DEVELOPMENT \
+    -f runner="${RUNNER:-macos-14}" \
     -f keep_going=true
 
-# Give Actions a moment to register the run, then follow the newest one.
-sleep 5
-RUN=$(gh run list --repo "$REPO" --workflow xnu.yml --limit 1 \
-    --json databaseId --jq '.[0].databaseId')
-[ -n "$RUN" ] || { echo "error: no run appeared" >&2; exit 1; }
+# Find the run this dispatch created. A push-triggered run can appear at the
+# same time, so match on the event rather than taking the newest run.
+RUN=
+i=0
+while [ "$i" -lt 12 ]; do
+    RUN=$(gh run list --repo "$REPO" --workflow xnu.yml --event workflow_dispatch \
+        --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+    [ -n "$RUN" ] && break
+    i=$((i + 1))
+    sleep 5
+done
+[ -n "$RUN" ] || { echo "error: no dispatch run appeared" >&2; exit 1; }
 echo "run: https://github.com/$REPO/actions/runs/$RUN"
 
 # Download even on failure: the workflow uploads xnu-kernel and buildtree with

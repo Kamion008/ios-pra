@@ -43,6 +43,23 @@ printf '%s' 'github_pat_...' | gh auth login --with-token
 
 Do not paste the token into the chat.
 
+## Troubleshooting: `HTTP 404: workflow xnu.yml not found`
+
+Symptom: `.github/workflows/xnu.yml` is on the default branch and parses
+locally (`actionlint` clean), but `gh workflow run` and the REST dispatch
+endpoint both return 404, and `GET /repos/:owner/:repo/actions/workflows`
+lists nothing.
+
+This is not a YAML error. GitHub caches a parse result per workflow *path*,
+and the first push registered a failure for `xnu.yml` that survived later
+pushes with identical content. Proof: a byte-identical copy at
+`.github/workflows/zz-xnu-copy.yml` was registered immediately.
+
+Fix: change the blob at that path so GitHub re-parses it. Committing the
+`push.branches` fix (adding `master`) was enough; the workflow then appeared
+as `active`. If it ever recurs, delete the file in one commit and re-add it
+in the next.
+
 ## After authentication
 
 From `ios-pra`:
