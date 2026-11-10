@@ -1,0 +1,16 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 9a35982..d5e24e4 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -39,7 +39,11 @@ const char * gIOKernelConfigTables =
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(ARM64_BOARD_CONFIG_PRA)
++    "     'IONameMatch'     = ('hisilicon,hi6250', 'samsung,a5xelte', 'samsung,dreamlte');"
++#else
+     "     'IONameMatch'     = ('samsung,a5xelte', 'samsung,dreamlte');"
++#endif
+ #else
+     "     'IONameMatch'     = 'xiaomi,sweet';"
+ #endif

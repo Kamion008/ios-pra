@@ -450,14 +450,43 @@ Exynos I2C; the S8 build still links the real gauge.
 The full log was unreadable through `gh run view --log` (HTTP/2 reset); see
 `docs/pra-ci-access.md` for the `curl --http1.1` job-log workaround.
 
+## First real kernel boots on hardware
+
+Build 4 (run 42852547344) produced a 17 MB arm64 Mach-O kernel; the single
+reported "LSE" hit is a false positive (`K256`, the SHA-256 constant table,
+misdisassembled as `ldumaxah`). Packaged to a 5,980,160-byte boot image and
+flashed to p30.
+
+Boot 1 proved loader -> XNU -> framebuffer console on the phone, then panicked
+at `pe_init.c:314` (`*delta >= 0`). The macOS-target build defaults
+`show_progress = TRUE`, and `PE_state.video` comes from `boot_args->Video`,
+which the shim leaves zero, so `display_size / 2 == 0`. Repackaged with
+`-noprogress`; no kernel change needed.
+
+Boot 2 got through `zone_init` and panicked in `IOPanicPlatform::start`:
+
+    panic(cpu 0 caller ...): Unable to find driver for this platform:
+      "hisilicon,hi6250".   IOPlatformExpert.cpp:2330
+
+The kernel config table's `SweetPlatformExpert` entry only matches
+`samsung,a5xelte` / `samsung,dreamlte`, so the catch-all panic driver won the
+match. `0132-pra-platform-expert-name-match.patch` adds `hisilicon,hi6250` to
+the PRA `IONameMatch` list; the A5XELTE/S8 lists are unchanged.
+
+With no `rd=` argument, `IOFindBSDRoot` matches `IOMedia`/`Apple_HFS`, times
+out after `ROOTDEVICETIMEOUT`, prints `Still waiting for root device`, and the
+macOS-target branch calls `IOSetRecoveryBoot(..., reboot=true)`. There is no
+`PE_halt_restart` implementor on PRA, so that returns instead of resetting and
+the kernel repeats the wait. That is the expected landing point for the next
+boot: platform expert -> CPU -> BSD init -> root wait.
+
 ## Next actions
-1. Re-dispatch `MACHINE_CONFIG=PRA`, `MACOS_VERSION=13.5`,
-   `KERNEL_CONFIG=DEVELOPMENT`, `runner=macos-15`; if the link stage exposes
-   more PRA gaps, fix them the same way (patch 0130+).
-2. Download `xnu-kernel`, run `tools/pra_package.sh out/ci/kernel.development.pra`,
-   then flash the packaged image to `kernel` (p30).
-3. Boot the real payload to `rd=md0` with a small in-memory root and read
-   the first XNU console output on `pra-fbcon`.
-4. Only then bring up the PRA eMMC root driver (the shim's Arasan SDHCI
+1. Rebuild with `0132`, flash, and confirm the `hisilicon,hi6250` platform
+   expert starts and the kernel reaches the `IOFindBSDRoot` wait.
+2. Publish a RAMDisk: append the image as a payload segment and add
+   `/chosen/memory-map` `RAMDisk` = { phys, size } to the generated ADT, so
+   `IOFindBSDRoot` calls `mdevadd()` and `rd=md0` finds the device. Then build
+   a minimal root image.
+3. Only then bring up the PRA eMMC root driver (the shim's Arasan SDHCI
    read path already works).
-5. Keep the kexec path optional for faster iteration.
+4. Keep the kexec path optional for faster iteration.

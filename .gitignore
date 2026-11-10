@@ -19,3 +19,6 @@ shim/dreamlte/out/
 shim/pra/out/
 shim/pra/outxnu/
 logs/
+
+# CI artifacts and downloaded build trees
+out/

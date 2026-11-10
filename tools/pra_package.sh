@@ -18,12 +18,12 @@ mkdir -p "$OUT"
 
 python3 tools/mkadt_pra.py "$OUT/adt-pra.bin"
 
-if [ -n "$RAMDISK" ]; then
-    python3 tools/mkpayload.py "$KERNEL" "$OUT/adt-pra.bin" "$OUT/payload.bin" \
-        --ramdisk "$RAMDISK"
-else
-    python3 tools/mkpayload.py "$KERNEL" "$OUT/adt-pra.bin" "$OUT/payload.bin"
-fi
+: "${CMDLINE:=debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress}"
+
+set -- "$KERNEL" "$OUT/adt-pra.bin" "$OUT/payload.bin"
+[ -n "$CMDLINE" ] && set -- "$@" --cmdline "$CMDLINE"
+[ -n "$RAMDISK" ] && set -- "$@" --ramdisk "$RAMDISK"
+python3 tools/mkpayload.py "$@"
 
 PAYLOAD="$(pwd)/$OUT/payload.bin" shim/pra/build-xnu.sh
 
