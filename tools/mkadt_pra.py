@@ -62,8 +62,14 @@ def build():
     set_prop(buttons, 'home-button-type', mkadt.u32(1))
     set_prop(buttons, 'button-names', b''.join(mkadt.cstr(name) for name in
                                                ('volup', 'voldown', 'hold')))
-    set_prop(chosen, 'dram-base', mkadt.u64(0x80000000))
-    set_prop(chosen, 'dram-size', mkadt.u64(0x60000000))
+    # The upper bank is 0x80000000..0xdfffffff, but /proc/iomem shows a 32 KiB
+    # hole at 0x87b00000..0x87b07fff that is not System RAM. boot_args carries
+    # one contiguous physBase/memSize pair, and XNU would put the hole in its
+    # VM free list, so start the window above it. 0x88000000 is 2 MiB aligned
+    # and 0x88000000..0xa8000000 is contiguous (matches the donor's 512 MiB
+    # sizing, which already booted iOS userland on the A5).
+    set_prop(chosen, 'dram-base', mkadt.u64(0x88000000))
+    set_prop(chosen, 'dram-size', mkadt.u64(0x20000000))
     set_prop(chosen, 'firmware-version', mkadt.cstr('pra-hi6250-entry'))
     set_prop(chosen, 'system-firmware-version', mkadt.cstr('pra-hi6250-entry'))
     cpus = child(root, 'cpus')

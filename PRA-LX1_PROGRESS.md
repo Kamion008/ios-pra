@@ -319,9 +319,8 @@ Stage A artifacts:
   `0x87b00000..0x87b07fff`; timer PPI 11 -> GIC INTID 27 is the standard
   mapping, not an anomaly.
 - `tools/mkadt_pra.py` — PRA ADT generator (SoC base `0xE0000000`, GIC
-  offsets `0x82B1000/0x82B2000`, DRAM `0x80000000+0x60000000`,
-  timebase 1.92 MHz, 8 CPUs, `pra-fbcon`, `pra-emmc`). Produces a 9,680-byte
-  ADT.
+  offsets `0x82B1000/0x82B2000`, DRAM `0x88000000+0x20000000`, timebase
+  1.92 MHz, 8 CPUs, `pra-fbcon`, `pra-emmc`). Produces a 9,680-byte ADT.
 - `xnu/patches/0125-pra-board-target.patch` — `PRA.h`, `board_config.h`,
   `Makefile`, `MakeInc.def`, `config/MASTER.arm64.pra`. `PRA.h` defines
   `PRA`, `SWEET` **and** `A5XELTE` (shared Cortex-A53/GICv2 paths), 8 CPUs,
@@ -335,13 +334,71 @@ Build gate: no local macOS toolchain. Stage A needs a macOS runner
 (`.github/workflows/xnu.yml`, `MACHINE_CONFIG=PRA`, Cortex-A53 flags) or a
 Mac. `gh` is not installed on this host, so CI needs a repo/remote first.
 
+## Stage B: the XNU handoff is proven on hardware (2026-11-10)
+
+The PRA loader now exists and has run on the device. It is the donor's
+`SWEETXNU` v1 format and `boot_args` layout, with three PRA-specific
+decisions:
+
+1. **XNU window `0x88000000..0xA8000000` (512 MiB), not `0x80000000`.**
+   `/proc/iomem` has a 32 KiB hole at `0x87b00000..0x87b07fff`, and
+   `boot_args` carries one contiguous `physBase`/`memSize` pair, so the
+   hole must stay outside the window. `0x88000000` is 2 MiB aligned and
+   contiguous to `0xa8000000`; the ADT's `dram-base`/`dram-size` now match,
+   and `mkpayload` reads the window from the ADT, so loader and kernel
+   cannot disagree.
+
+2. **The payload is embedded at `0x500000`, not read from the initrd.**
+   `fastboot` only allows `kernel`/`ramdisk`/`recovery_ramdisk`, and the
+   stock `kernel` image has no ramdisk, so depending on the bootloader to
+   publish `linux,initrd-start` would be an untested assumption. The build
+   pads the loader to `0x500000`, appends the payload, and sets the arm64
+   header's `image_size` so the bootloader's `add_device_tree()` places the
+   DTB after the payload. `__payload_start` is an absolute link-time
+   constant; the exact payload length is patched into
+   `pra_payload_size` in the loader image, so bounds checks do not depend
+   on the DTB address.
+
+3. **Console is the framebuffer, not UART.** `boot_main.c` attaches the
+   `0x5D000000` splash buffer and prints each step. This is the first code
+   in the port to draw glyphs (the diagnostic shim only filled solid
+   colours); the console path and font work.
+
+New files:
+
+- `shim/pra/boot_main.c` — `pra_main()` for the loader build: validate the
+  payload, copy segments, zero `.bss`, clean caches, place the ADT and
+  `boot_args`, print the addresses, jump.
+- `shim/pra/xnu_jump.S` — `pra_jump_mmu_off()`: DAIF mask, clear
+  `SCTLR_EL1.M/.C/.I`, `br` to the entry with `x0 = boot_args`.
+- `shim/pra/xnu_boot.ld` — links at `0x480000`, `__payload_start = 0x500000`.
+- `shim/pra/test_payload.c`, `test_payload.ld` — a no-`.bss` stub linked at
+  `0x88000000` that paints a green band and draws `boot_args->physBase`
+  and `->memSize` as 32 bit bars (white = 1).
+- `shim/pra/build-xnu.sh` — builds loader + ADT + test payload and packages
+  `outxnu/pra-xnu.img`.
+- `tools/mkpayload_flat.py` — `SWEETXNU` v1 packer for a flat binary, same
+  header as `mkpayload.py`.
+
+**Hardware result.** Flashed `outxnu/pra-xnu.img` (10,240 bytes) to
+`kernel` (p30) with `fastboot flash kernel`, rebooted. The screen showed
+`PRA XNU loader`, the addresses, `jumping to XNU`, then a green band and
+the bit bars. The bars form a "Y": `physBase 0x88000000` lights bits 31
+and 27 (two top bars) and `memSize 0x20000000` lights bit 29 (one bottom
+bar between them). That is the ADT's window, read back from `boot_args` by
+the payload at `0x88000000` — the full EL1 loader → segment copy →
+`boot_args` → MMU-off jump path works.
+
+Device is now halted in the stub. Restore: `fastboot flash kernel` from
+`/mnt/giochi/pra-lx1-handoff/dump/mmcblk0p30.bin`.
+
 ## Next actions
-1. Set up the PRA build: workflow `machine_config=PRA` with the Cortex-A53
-   flags used for A5XELTE; produce `kernel.development.pra`.
-2. Flash the improved `out/pra-diag.img` to `kernel`, boot, and read the
-   screen (blue = `0x31000000`, red = `0x5D000000`, magenta = DSS-referenced).
-   Restore the stock kernel from the verified backup afterwards.
-3. Feed the confirmed scanout base into the PRA framebuffer override, then
-   start stage B (first XNU boot with the PRA ADT).
-4. Before trusting XNU with all 1.5 GiB, carve the `0x87b00000` 32 KiB hole
-   out of the VM free list (see `docs/pra-facts-review.md`).
+1. Build the real XNU payload: the `xnu` workflow with `MACHINE_CONFIG=PRA`
+   (needs a git remote or a Mac; `gh` is not installed here), then
+   `mkpayload.py kernel.development.pra adt-pra.bin payload.bin` and
+   `PAYLOAD=payload.bin shim/pra/build-xnu.sh`.
+2. Boot the real payload to `rd=md0` with a small in-memory root and read
+   the first XNU console output on `pra-fbcon`.
+3. Only then bring up the PRA eMMC root driver (the shim's Arasan SDHCI
+   read path already works).
+4. Keep the kexec path optional for faster iteration.

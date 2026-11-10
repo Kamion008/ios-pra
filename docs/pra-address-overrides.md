@@ -20,10 +20,11 @@ Every `arm-io` child `reg` is an **offset** from that base (`soc + reg[0]`).
 | GIC physical | `0x10C01000 / 0x10C02000` | `0xE82B1000 / 0xE82B2000` |
 | `uart0.reg` | n/a | `0x1DF02000, 0x1000` -> `0xFDF02000` |
 | `pra-emmc.reg` | `0x13540000, 0x2000` (Exynos) | `0x1F390000, 0x10000` -> `0xFF390000` |
-| `dram-base` | `0x80000000` | `0x80000000` |
-| `dram-size` | `0x20000000` | `0x60000000` (upper bank to `0xdfffffff`) |
+| `dram-base` | `0x80000000` | `0x88000000` (above the 32 KiB hole) |
+| `dram-size` | `0x20000000` | `0x20000000` (512 MiB, to `0xa7ffffff`) |
 
-**RAM hole (must fix).** `/proc/iomem` splits the upper bank:
+**RAM hole (handled by moving the window).** `/proc/iomem` splits the upper
+bank:
 
 ```
 80000000-87afffff : System RAM
@@ -31,10 +32,10 @@ Every `arm-io` child `reg` is an **offset** from that base (`soc + reg[0]`).
 ```
 
 `0x87b00000-0x87b07fff` (32 KiB, 8 pages) is **not** System RAM. XNU's
-`gDramBase`/`gDramSize` is a single contiguous window, so the hole must be
-carved out of the VM free list explicitly before the first PRA boot; otherwise
-XNU can allocate and overwrite whatever the bootloader keeps there (likely the
-hisi log/mntn area).
+`gDramBase`/`gDramSize` is a single contiguous window, so the PRA ADT starts
+the window at `0x88000000`, above the hole, instead of trying to carve it out
+of the VM free list. The loader's `RAM_BASE`/`RAM_END` and the ADT values must
+stay in lockstep; `mkpayload.py` reads them from the ADT, so they cannot drift.
 | `timebase-frequency` | `26000000` | `1920000` (live dmesg) |
 
 ## Hardcoded values to override
