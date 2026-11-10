@@ -86,3 +86,28 @@ tools/pra_ci.sh owner/ios-pra
 The first run is the risky one: `A5XELTE.h` hardcodes `DREAMLTE`, so PRA is the
 first build of the non-DREAMLTE `#else` branches. `0127` and `0128` are already
 applied in the workflow's patch directory.
+
+## Runner selection on this account
+
+`macos-14` is not available here: jobs fail immediately with
+`The configuration 'macos-14-arm64-us-xl' is not supported`. A matrix probe
+(`ubuntu-latest`, `macos-13`, `macos-14`, `macos-15`, `macos-latest`,
+`macos-14-arm64`, `macos-15-arm64`) showed only `ubuntu-latest` and
+`macos-15` actually start; the rest queued with no runner.
+
+`macos-15` is an **arm64** image (macOS 15.8.2) and ships Xcode 16.0-16.4 and
+26.x, with **no Xcode 15.x**. Rosetta is installed, so the x86_64 helper
+tools (`mig`, `ctfconvert`) can run. The build downloads KDK 13.5 itself from
+the public dortania manifest, so no Apple ID is needed.
+
+Pass the label explicitly:
+
+```sh
+gh workflow run xnu.yml --repo OWNER/REPO \
+    -f machine_config=PRA -f macos_version=13.5 \
+    -f kernel_config=DEVELOPMENT -f runner=macos-15 -f keep_going=false
+```
+
+macOS minutes bill at 10x on the Free tier, so use `keep_going=false` until
+the toolchain is proven; `keep_going=true` keeps compiling after errors and
+burns the full quota on a broken build.
