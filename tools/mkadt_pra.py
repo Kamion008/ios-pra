@@ -148,10 +148,14 @@ def build():
     ]))
     root.children = [n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]
-    # The logo window 0x5D000000..0x60000000 is the one the diagnostic shim
-    # paints; fbcon_probe() maps reg[0] absolutely, so keep the real address.
+    # fbcon_probe() maps exactly reg[1] bytes through ml_io_map_wcomb(), and
+    # io_map() before STARTUP_SUB_KMEM advances virtual_space_start by that
+    # size. arm_vm_init() only pre-allocates L3 tables for
+    # Video.v_height * v_rowBytes, so the node must declare one screen, not
+    # the whole 48 MiB logo window. The diagnostic shim can still flood the
+    # window; XNU only needs 1080*1920*4 = 0x7E9000 bytes.
     root.children.append(mkadt.node('pra-fbcon', [
-        ('reg', mkadt.u64(0x5D000000, 0x3000000)),
+        ('reg', mkadt.u64(0x5D000000, 1080 * 1920 * 4)),
         ('width', mkadt.u32(1080)),
         ('height', mkadt.u32(1920)),
         ('stride', mkadt.u32(4320)),

@@ -1,0 +1,27 @@
+From: PRA-LX1 bring-up
+Subject: [PATCH] pra: disable PAN on Cortex-A53
+
+0125's PRA.h sets __ARM_PAN_AVAILABLE__ to 1. Cortex-A53 is ARMv8.0 and
+does not implement the ARMv8.1 PAN extension, so the `msr pan, #1`
+emitted by arm_init()/arm_init_cpu() is an undefined instruction and
+faults before the early console can say anything.
+
+The donor hit the same fault on the A5XELTE Cortex-A53 and fixed it in
+0095-a5xelte-disable-pan.patch. PRA is the same core generation, so it
+needs the same value.
+
+Verified by reading the consumers: osfmk/arm/arm_init.c:527 and :686,
+osfmk/arm64/copyio.c:88/98 and osfmk/arm/pmap/pmap.c:13854/13873 all
+guard `__builtin_arm_wsr("pan", ...)` with this macro.
+
+--- a/pexpert/pexpert/arm64/PRA.h
++++ b/pexpert/pexpert/arm64/PRA.h
+@@ -30,7 +30,7 @@
+ #define __ARM_DEBUG__                 7
+ #define __ARM_ENABLE_SWAP__           1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__  1
+-#define __ARM_PAN_AVAILABLE__         1
++#define __ARM_PAN_AVAILABLE__         0
+ 
+ /* Kirin 655 has a GICv2 distributor and CPU interface, not GICv3. */
+ #define HAS_GIC_V3                    0

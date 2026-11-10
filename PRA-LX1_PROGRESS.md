@@ -153,6 +153,50 @@ Next audit (not done): PRA now compiles the A5XELTE-guarded Samsung drivers
 `bsd/dev/sweet_ufs.c`, `bsd/dev/sweet_sample.c`). Confirm each is
 boot-arg/ADT-gated and cannot auto-probe Huawei hardware at boot.
 
+#### Board-flag audit and two boot-breaking fixes (2026-11-10)
+
+PRA now compiles the A5XELTE C paths (0127), so the flags and the guarded
+drivers were audited against the known-good A5XELTE build.
+
+1. **PAN.** `0125` set `__ARM_PAN_AVAILABLE__` to 1. Cortex-A53 is ARMv8.0 and
+   has no PAN, so the `msr pan, #1` emitted by `arm_init()`/`arm_init_cpu()`
+   is an undefined instruction and faults before the console can print. The
+   donor fixed the same fault for A5XELTE in `0095-a5xelte-disable-pan.patch`.
+   Fixed by `0128-pra-disable-pan.patch` (value 0). Consumers checked:
+   `osfmk/arm/arm_init.c:527/686`, `osfmk/arm64/copyio.c:88/98`,
+   `osfmk/arm/pmap/pmap.c:13854/13873`.
+
+2. **Framebuffer map size.** `mkadt_pra.py` declared `pra-fbcon`
+   `reg = 0x5D000000 + 0x3000000` (48 MiB). `fbcon_probe()` calls
+   `ml_io_map_wcomb(reg[0], reg[1])`; before `STARTUP_SUB_KMEM`, `io_map()`
+   advances `virtual_space_start` by that size, while `arm_vm_init()`
+   pre-allocates L3 tables only for `Video.v_height * v_rowBytes` (~8.29 MiB).
+   The 48 MiB mapping would walk past the reserved page tables. The donor
+   declares exactly `1080 * 1920 * 4`; PRA now does the same (`0x7E9000`).
+   ADT regenerated, still 9,680 bytes.
+
+3. **Driver audit (all clear for first boot).**
+   - `a5xelte_emmc.c`: `a5xelte_emmc_probe` has no caller; `emmcroot`,
+     `emmcwrite`, `a5log` are boot args.
+   - `a5xelte_keys.c` / `a5xelte_touch.c`: `a5xelte_touch_probe` has no
+     caller; keys/touch are boot-arg gated, and 0127 sets
+     `A5_KEYS_DEFAULT`/`A5_TOUCH_DEFAULT` to 0.
+   - `sweet_ufs.c`: `sweet_ufs_init` is only reachable from
+     `sweet_ufs_rootdev`, inside the SWEET-only block.
+   - `sweet_sample.c`: boot-arg gated (`sweetsample`).
+   - `sweet_keys.c` / `sweet_touch.c` are `ARM64_BOARD_CONFIG_SWEET`-only, so
+     they are not compiled for PRA; the calls in `sweet_ufs.c` sit in the
+     SWEET-only block too.
+   - `pe_serial.c` klog is DREAMLTE-only, so PRA never maps `A5_KLOG_PHYS`.
+
+4. **DREAMLTE branch risk.** `A5XELTE.h` hardcodes `#define DREAMLTE 1`, so
+   the donor's current tree only builds the DREAMLTE branch. PRA (no DREAMLTE)
+   takes the `#else` branches, which the donor has not built recently. Checked
+   the boot-critical ones: `arm_vm_init.c:1908/1916/2320` fall back to the
+   generic physmap slide and the Video-based VA reservation; `pe_serial.c`
+   klog is skipped. The remaining `#else` branches are in the disabled
+   key/touch drivers. Watch this on the first CI run.
+
 ### Bootloader
 - `bootlock=unlocked`, `userlock=unlocked`, `verifiedbootstate=ORANGE`
 - fastboot allowlist includes `flash:kernel`, `flash:ramdisk`,
