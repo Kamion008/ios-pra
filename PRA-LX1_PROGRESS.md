@@ -392,13 +392,45 @@ the payload at `0x88000000` — the full EL1 loader → segment copy →
 Device is now halted in the stub. Restore: `fastboot flash kernel` from
 `/mnt/giochi/pra-lx1-handoff/dump/mmcblk0p30.bin`.
 
+## Stage B: CI build of the real XNU kernel (2026-11-10)
+
+The `xnu` workflow runs on `macos-15` (the only arm64 runner this account can
+start) with Xcode 16.0, the macOS 15 SDK and KDK 13.5 auto-downloaded from the
+dortania manifest. Builds are dispatched, not pushed:
+
+```sh
+RUNNER=macos-15 tools/pra_ci.sh Kamion008/ios-pra
+```
+
+First real build (run 42845100412) reached the very end of the kernel compile
+(4m27s) and failed only on two PRA port bugs; iig, mig, ctfconvert and the
+`0083` iig patch all worked under Xcode 16, so no Xcode 15 pin or older SDK is
+needed:
+
+- `iokit/Kernel/arm/SweetCPU.cpp` uses `A5_BOOT_MPIDR`, which only
+  `A5XELTE.h` defines. PRA does not include that header (it would pull in the
+  Exynos framebuffer), so `PRA.h` now defines it as 0, matching the ADT's
+  logical CPU 0 `reg = 0x000` (Kirin 655 boots on cluster 0/core 0).
+- `osfmk/arm/commpage/commpage_asm.s` picks its lock sequence with
+  `#if defined(ARM64_BOARD_CONFIG_A5XELTE)`. Assembly does not see
+  `board_config.h`, so PRA compiled `casa`, which needs ARMv8.1 LSE. The guard
+  now also accepts `ARM64_BOARD_CONFIG_PRA`, selecting the `ldaxr`/`stxr`
+  Cortex-A53 path.
+
+Both fixes are `xnu/patches/0129-pra-a5-boot-mpidr-and-armv8-commpage.patch`
+and verified to apply to the exact patched tree from the failed run.
+
+The full log was unreadable through `gh run view --log` (HTTP/2 reset); see
+`docs/pra-ci-access.md` for the `curl --http1.1` job-log workaround.
+
 ## Next actions
-1. Build the real XNU payload: the `xnu` workflow with `MACHINE_CONFIG=PRA`
-   (needs a git remote or a Mac; `gh` is not installed here), then
-   `mkpayload.py kernel.development.pra adt-pra.bin payload.bin` and
-   `PAYLOAD=payload.bin shim/pra/build-xnu.sh`.
-2. Boot the real payload to `rd=md0` with a small in-memory root and read
+1. Re-dispatch `MACHINE_CONFIG=PRA`, `MACOS_VERSION=13.5`,
+   `KERNEL_CONFIG=DEVELOPMENT`, `runner=macos-15`; if the link stage exposes
+   more PRA gaps, fix them the same way (patch 0130+).
+2. Download `xnu-kernel`, run `tools/pra_package.sh out/ci/kernel.development.pra`,
+   then flash the packaged image to `kernel` (p30).
+3. Boot the real payload to `rd=md0` with a small in-memory root and read
    the first XNU console output on `pra-fbcon`.
-3. Only then bring up the PRA eMMC root driver (the shim's Arasan SDHCI
+4. Only then bring up the PRA eMMC root driver (the shim's Arasan SDHCI
    read path already works).
-4. Keep the kexec path optional for faster iteration.
+5. Keep the kexec path optional for faster iteration.

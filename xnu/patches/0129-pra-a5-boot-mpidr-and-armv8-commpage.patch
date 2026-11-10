@@ -1,0 +1,53 @@
+From: PRA bring-up
+Subject: [PATCH 0129] pra: define A5_BOOT_MPIDR and use ARMv8.0 commpage atomics
+
+The first CI build of the PRA kernel failed with two compile errors, both
+caused by PRA reusing the A5XELTE code paths without the matching values:
+
+- iokit/Kernel/arm/SweetCPU.cpp uses A5_BOOT_MPIDR, which is defined in
+  A5XELTE.h.  PRA.h does not include that header (it would also drag in the
+  Exynos framebuffer addresses), so define the value locally.  Kirin 655
+  boots on cluster 0/core 0 and tools/mkadt_pra.py encodes logical CPU 0 as
+  reg 0x000, so the boot MPIDR is 0.
+
+- osfmk/arm/commpage/commpage_asm.s chooses its lock sequence with
+  `#if defined(ARM64_BOARD_CONFIG_A5XELTE)`.  Assembly files do not include
+  board_config.h, so PRA only sees -DARM64_BOARD_CONFIG_PRA and fell into the
+  `casa` path, which requires ARMv8.1 LSE.  Cortex-A53 is ARMv8.0, so extend
+  the guard to PRA.
+
+--- a/osfmk/arm/commpage/commpage_asm.s
++++ b/osfmk/arm/commpage/commpage_asm.s
+@@ -273,7 +273,7 @@ _pfz_trylock_and_enqueue:
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+ 	// Try to grab the lock
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_PRA)
+ 	ldaxr	w10, [x3]		 // ARMv8.0 acquire load
+ 	cbnz	w10, Ltrylock_enqueue_clear
+ 	stxr	w12, w11, [x3]	 // One non-blocking store attempt
+@@ -332,7 +332,7 @@ _pfz_trylock_and_dequeue:
+ 	mov		w10, wzr		 // unlock value = w10 = 0
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_PRA)
+ 	ldaxr	w10, [x2]		 // ARMv8.0 acquire load
+ 	cbnz	w10, Ltrylock_dequeue_clear
+ 	stxr	w12, w11, [x2]	 // One non-blocking store attempt
+--- a/pexpert/pexpert/arm64/PRA.h
++++ b/pexpert/pexpert/arm64/PRA.h
+@@ -51,6 +51,12 @@
+ #define A5_FB_2M_BLOCKS               5
+ #define A5_ENTRY_MARKER_PHYS          0x8FF00000
+ 
++/* MPIDR of the core that enters the kernel.  Kirin 655 boots on cluster 0,
++ * core 0, and tools/mkadt_pra.py describes logical CPU 0 as reg 0x000, so
++ * this must be 0 (the A5XELTE header uses 0x100 for the Exynos 8895 boot
++ * cluster, where logical CPU 0 lives in cluster 1). */
++#define A5_BOOT_MPIDR                 0
++
+ /* The donor's key and touch drivers are compiled for every
+  * ARM64_BOARD_CONFIG_A5XELTE board, but they poll Exynos7580 pins. Keep them
+  * off on PRA; a Huawei pinctrl driver is a separate bring-up item. */

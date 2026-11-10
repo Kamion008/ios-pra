@@ -111,3 +111,33 @@ gh workflow run xnu.yml --repo OWNER/REPO \
 macOS minutes bill at 10x on the Free tier, so use `keep_going=false` until
 the toolchain is proven; `keep_going=true` keeps compiling after errors and
 burns the full quota on a broken build.
+
+## Reading a failed build log
+
+`gh run view RUN --log`/`--log-failed` can fail on this connection with
+`stream error: stream ID 1; CANCEL; received from peer` (the log zip is large
+and GitHub resets the HTTP/2 stream). `--http1.1` avoids it:
+
+```sh
+JOB=$(gh run view RUN --json jobs --jq '.jobs[0].databaseId')
+gh auth token | xargs -I{} curl -sS --http1.1 -L \
+    -H "Authorization: Bearer {}" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/OWNER/REPO/actions/jobs/$JOB/logs" \
+    -o /tmp/opencode/job.log
+```
+
+The log is raw build output with timestamps; `grep -an 'error:'` is enough to
+find compiler failures. `xnu-buildtree` is the fallback: it holds the patched
+tree, and `tools/pra_package.sh` plus the log's compile lines can reproduce a
+single command locally.
+
+## Toolchain result (2026-11-10)
+
+The first PRA build used `/Applications/Xcode_16.app` (Xcode 16.0) with the
+macOS 15 SDK and got through iig, mig, ctfconvert and almost the whole kernel.
+The only failures were two PRA port bugs (`A5_BOOT_MPIDR` missing and the
+commpage `.s` taking the ARMv8.1 LSE path), not an SDK/Xcode mismatch. The
+`0083-xcode27-iig-kernel-content.patch` donor patch applied, so the old
+Xcode-16 `IORPC.kernelContent` warning is stale. Do not pin an older SDK or
+install Xcode 15 unless a new, specific error requires it.
