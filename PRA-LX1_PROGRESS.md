@@ -420,6 +420,25 @@ needed:
 Both fixes are `xnu/patches/0129-pra-a5-boot-mpidr-and-armv8-commpage.patch`
 and verified to apply to the exact patched tree from the failed run.
 
+The second build (run 42848656649) compiled the whole kernel and reached the
+final link, then failed with 14 undefined symbols in two families: the
+`a5xelte_*` / `sweet_*` driver hooks and BearSSL `br_sha384/512_*`. Both have
+the same cause: 23 sources gate their entire body on
+`#if defined(ARM64_BOARD_CONFIG_A5XELTE)` before including any header, and
+PRA only defined that macro inside `PRA.h`. Those files compiled to empty
+objects, so `sweet_sha2big.o` (the BearSSL SHA-512 implementation) and the
+eMMC/key/touch/AMFI/UFS drivers exported nothing.
+
+`xnu/patches/0130-pra-define-a5xelte-at-compile-time.patch` passes
+`-DARM64_BOARD_CONFIG_A5XELTE` in `MACHINE_FLAGS_ARM64_PRA` and guards the
+`A5XELTE.h` include in `board_config.h` with `!defined(ARM64_BOARD_CONFIG_PRA)`,
+so PRA gets the macro in every translation unit without inheriting
+`A5XELTE.h`'s hardcoded `DREAMLTE` / Exynos 8895 addresses.
+
+The eMMC probe is still opt-in (`emmcprobe=1`), keys and touch keep their
+`A5_*_DEFAULT 0`, and `rd=md0` never reaches the eMMC/UFS root paths, so the
+Exynos drivers are linked but inert on the first PRA boot.
+
 The full log was unreadable through `gh run view --log` (HTTP/2 reset); see
 `docs/pra-ci-access.md` for the `curl --http1.1` job-log workaround.
 
