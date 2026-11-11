@@ -652,11 +652,31 @@ Two things the 0136 data settles:
   `Waiting on <dict ... Apple_HFS ...>`, not the dlil phase (dlil lines are
   from the *previous* boot on the append-only framebuffer).
 - `lr`/`ELR_EL1`/`SPSR_EL1` are bit-identical to 0134, so the last kernel
-  eret in every boot returns to `pmap_remove_pv+0x13c` with `I` masked
-  (`SPSR=0x384`). That is a normal kernel fault/IRQ return, not the bug.
+  exception in every boot is the same instruction with the same PSTATE.
   `lr` is the interrupted context's LR (POP_FRAME restores it), so the
-  exception that matters was taken from **kernel** mode, very likely the
-  timer IRQ that wakes the idle WFI.
+  exception that matters was taken from **kernel** mode.
+
+  Careful: the digits in this log do not agree with each other. As written,
+  `0xfffffff007415d5c` is `cpu_idle+0x1ec` — the instruction *after* the
+  `wfi` in `cpu_idle` — and `0xfffffff007415d44` is `cpu_idle+0x1d4`, the
+  return address after the `platform_cache_idle_enter` call. That reads
+  naturally: the timer/FIQ that wakes the idle WFI is taken exactly at the
+  first instruction after `wfi`. `0xfffffff007411d5c` would instead be
+  `pmap_remove_pv+0x13c`, which is what an earlier reading of these same
+  photos recorded. The two candidates differ only in one hex digit
+  (`7411` vs `7415`), and the low half (`…d44`/`…d5c`, 0x18 apart) is the
+  same either way. The idle thread cannot execute `pmap_remove_pv`, so the
+  `cpu_idle` reading is the one that fits `thread == current == idle`; treat
+  `pmap_remove_pv` as unverified until the next photo re-reads these fields.
+
+  `SPSR_EL1 = 0x384` is `EL1t` with `D|A|I` masked and `F` unmasked. `D` is
+  set automatically on exception entry and XNU never masks it outside the
+  `DAIFSC_ALL` sites (return-to-user/kernel, `start.s`), so a `D=1`
+  interrupted state means the exception was taken **inside an exception
+  handler**, not on a plain kernel thread stack. That is consistent with the
+  preempt count: `BEGIN_INTERRUPT_HANDLER` adds one for the duration of an
+  IRQ/FIQ handler, so a nested exception inside a handler finds the count
+  already at 1.
 
 That leaves `saved_pc`/`saved_cpsr` (read from `[x21]`, the value the dispatch
 used to choose user vs kernel return) as the only corrupt-looking pair:
