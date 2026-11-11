@@ -3,7 +3,7 @@
 Audit date: 2026-11-09. Sources audited: `docs/pra-address-overrides.md`,
 `PRA-LX1_PROGRESS.md`, `live/iomem.txt`, `live/kernel-config.txt`,
 `live/dmesg.txt`, `../pra-ios-port/live/dts/pra-lx1-b412.dts`
-(note: the DTS lives at `/home/kamion008/Ai/pra-ios-port/live/dts/`, not
+(note: the DTS lives at `/home/kamion008/Ai/ios/pra-ios-port/live/dts/`, not
 under `ios-pra/`, despite what `pra-address-overrides.md` line 8 says).
 No file outside this review was modified.
 

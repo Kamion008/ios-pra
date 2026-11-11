@@ -66,7 +66,7 @@ Collected over ADB root in TWRP. Source files were temporary
 
 #### kexec on the newer hi6250 kernels (verified 2026-11-09, GitHub API only)
 
-The stock 4.4.23 tree (`/home/kamion008/Ai/hi6250-kernel`, and the LineageOS
+The stock 4.4.23 tree (`/home/kamion008/Ai/huawei/hi6250-kernel`, and the LineageOS
 source `kernel/huawei/hi6250-8`) cannot get kexec: it has the generic
 `kernel/kexec*.c` but **no `arch/arm64/kernel/machine_kexec.c`**, and arm64
 kexec support only landed in Linux 4.6. Flipping `CONFIG_KEXEC` there would
