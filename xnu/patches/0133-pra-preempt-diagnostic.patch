@@ -1,0 +1,96 @@
+diff --git a/osfmk/arm64/locore.s b/osfmk/arm64/locore.s
+index be1b12e..9f3719d 100644
+--- a/osfmk/arm64/locore.s
++++ b/osfmk/arm64/locore.s
+@@ -862,7 +862,23 @@ check_user_asts:
+ 
+ #if MACH_ASSERT
+ 	ldr		w0, [x3, ACT_PREEMPT_CNT]
+-	cbnz		w0, preempt_count_notzero			// Detect unbalanced enable/disable preemption
++	cbz		w0, Lpreempt_count_ok			// Detect unbalanced enable/disable preemption
++	// PRA: identify the thread and the return path before deciding what to do.
++	mov		x0, x3					// thread
++	ldr		w1, [x3, ACT_PREEMPT_CNT]		// preemption count
++	mov		x2, xzr					// saved pc
++	mov		x3, xzr					// saved cpsr
++	cbz		x21, 1f
++	ldr		x2, [x21, SS64_PC]
++	ldr		w3, [x21, SS64_CPSR]
++1:
++	mov		x4, x30					// caller's lr
++	mov		x5, x29					// frame pointer
++	CALL_EXTERN pra_preempt_notzero
++	cbnz		w0, preempt_count_notzero		// pra_panic=1: original panic
++	mrs		x3, TPIDR_EL1
++	str		wzr, [x3, ACT_PREEMPT_CNT]		// pra_panic=0: clear and continue
++Lpreempt_count_ok:
+ #endif
+ 
+ 	msr		DAIFSet, #DAIFSC_ALL				// Disable exceptions
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 6d56a33..56c528a 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2845,3 +2845,62 @@ ml_get_backtrace_pc(struct arm_saved_state *state)
+ 
+ 	return get_saved_state_pc(state);
+ }
++
++/* referenced from osfmk/arm64/locore.s (return_to_user preemption check) */
++int pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
++    unsigned int saved_cpsr, uint64_t caller_lr, uint64_t frame_pointer);
++
++/*
++ * PRA bring-up diagnostic (xnu/patches/0133).
++ *
++ * Called from return_to_user when the MACH_ASSERT preemption check fires and
++ * no root device has been mounted yet, where a nonzero count means the thread
++ * is about to enter (or resume) user mode with preemption still disabled.
++ * Printing the thread, task and both return paths distinguishes a real user
++ * return from a leaked preemption disable.  pra_panic=1 keeps the original
++ * panic; the default prints, clears the count and lets the boot continue so
++ * the next few console lines show where it goes.
++ *
++ * Other boards keep the old behaviour (return 1 -> panic).
++ */
++int
++pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
++    unsigned int saved_cpsr, uint64_t caller_lr, uint64_t frame_pointer)
++{
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	thread_t thread = (thread_t)thread_arg;
++	task_t task = TASK_NULL;
++	uint64_t elr = 0;
++	uint64_t spsr = 0;
++	unsigned int panic_mode = 0;
++
++	if ((thread != NULL) && (thread->t_tro != NULL)) {
++		task = thread->t_tro->tro_task;
++	}
++
++	__asm__ volatile("mrs %0, ELR_EL1" : "=r"(elr));
++	__asm__ volatile("mrs %0, SPSR_EL1" : "=r"(spsr));
++	/* return_to_user sets DAIF only after this check; do not print from an
++	 * interrupt context that could take the console lock. */
++	(void)ml_set_interrupts_enabled(FALSE);
++	(void)PE_parse_boot_argn("pra_panic", &panic_mode, sizeof(panic_mode));
++
++	printf("PRA-PREEMPT: count=%u thread=%p current=%p task=%p pid=%d\n",
++	    count, thread, current_thread(), task,
++	    (task != TASK_NULL) ? task_pid(task) : -1);
++	printf("PRA-PREEMPT: saved_pc=0x%llx saved_cpsr=0x%x lr=0x%llx fp=0x%llx "
++	    "ELR_EL1=0x%llx SPSR_EL1=0x%llx pra_panic=%u\n",
++	    saved_pc, saved_cpsr, caller_lr, frame_pointer, elr, spsr,
++	    panic_mode);
++
++	return panic_mode ? 1 : 0;
++#else
++	(void)thread_arg;
++	(void)count;
++	(void)saved_pc;
++	(void)saved_cpsr;
++	(void)caller_lr;
++	(void)frame_pointer;
++	return 1;
++#endif /* ARM64_BOARD_CONFIG_PRA */
++}
