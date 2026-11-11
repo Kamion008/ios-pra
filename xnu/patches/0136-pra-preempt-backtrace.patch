@@ -1,0 +1,49 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index d8fb56b..bbf23c9 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2884,6 +2884,28 @@ pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+ 	__asm__ volatile("mrs %0, ELR_EL1" : "=r"(elr));
+ 	__asm__ volatile("mrs %0, SPSR_EL1" : "=r"(spsr));
+ 
++	/*
++	 * Walk the handler's own frame chain: the interrupted x29 says where
++	 * pmap_remove_pv was, not how the exception vector reached
++	 * return_to_user, which is the part that needs explaining.
++	 */
++	uintptr_t bt[5] = { 0, 0, 0, 0, 0 };
++	uintptr_t *frame = __builtin_frame_address(0);
++	for (int i = 0; (i < 5) && (frame != NULL); i++) {
++		uintptr_t next = frame[0];
++		uintptr_t ret = frame[1];
++		if ((ret < 0xfffffff000000000ULL) ||
++		    ((uintptr_t)frame & 0xf) != 0) {
++			break;
++		}
++		bt[i] = ret;
++		if ((next <= (uintptr_t)frame) ||
++		    (next - (uintptr_t)frame) > 0x4000) {
++			break;
++		}
++		frame = (uintptr_t *)next;
++	}
++
+ 	/*
+ 	 * Panic instead of printf: the panic path suspends the console ring
+ 	 * buffer (console_suspended), so the string is printed even from an
+@@ -2891,11 +2913,13 @@ pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+ 	 */
+ 	panic("PRA-PREEMPT cnt=%u thread=%p current=%p idle=%p task=%p pid=%d "
+ 	    "state=0x%x saved_pc=0x%llx saved_cpsr=0x%x lr=0x%llx fp=0x%llx "
+-	    "ELR_EL1=0x%llx SPSR_EL1=0x%llx",
++	    "ELR_EL1=0x%llx SPSR_EL1=0x%llx bt=%p,%p,%p,%p,%p",
+ 	    count, thread, current_thread(), idle, task,
+ 	    (task != TASK_NULL) ? task_pid(task) : -1,
+ 	    (thread != NULL) ? (unsigned int)thread->state : 0u,
+-	    saved_pc, saved_cpsr, caller_lr, frame_pointer, elr, spsr);
++	    saved_pc, saved_cpsr, caller_lr, frame_pointer, elr, spsr,
++	    (void *)bt[0], (void *)bt[1], (void *)bt[2], (void *)bt[3],
++	    (void *)bt[4]);
+ 	return 1;
+ #else
+ 	(void)thread_arg;
