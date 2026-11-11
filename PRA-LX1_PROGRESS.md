@@ -597,6 +597,82 @@ now works off the CI artifact: `tools/xnu-cc.py` takes `XNU_CC_CLANG` and
 flags without a macOS run (`SweetBattery.cpp`: 0 failures). That is what makes
 a delegated driver patch compile-checkable here.
 
+### 0134 data: the idle thread pointer, but not the idle state bit
+
+The panic string came back on the first 0134 boot:
+
+    PRA-PREEMPT cnt=1 thread=0xfffffff33b8d0430 current=0xfffffff33b8d0430
+      idle=0xfffffff33b8d0430 task=0xfffffff33b8b49a8 pid=0 state=0x04
+      saved_pc=0xf4f01ad3 saved_cpsr=0x7b39460 lr=0xfffffff007415d44
+      fp=0xfffffff94a305ff0 ELR_EL1=0xfffffff007415d5c SPSR_EL1=0x000000384
+
+Correction to an earlier reading: `0x04` is **`TH_RUN`**, not `TH_IDLE`
+(`TH_IDLE` is `0x80`, `thread.h:421`, and it is set once in
+`idle_thread_create` and never cleared except by a whole-state assignment).
+So at this point `current_thread() == processor->idle_thread` by pointer, but
+the state word does not carry `TH_IDLE`. The panic happens after the
+`if_attach`/dlil phase of `bsd_init` (the last screen line is dlil's
+"scheduled at least once. Proceeding."), i.e. the bootstrap thread blocks
+there and the CPU idles.
+
+The register pair is internally inconsistent in an informative way: `lr` and
+`ELR_EL1` both land inside `_pmap_remove_pv` (+0x124 / +0x13c), and
+`SPSR_EL1 = 0x384` has `M = 0b0100` (`EL1t`), so the most recent exception
+came from **kernel** mode in pmap code; `fp = 0xfffffff94a305ff0` is a kernel
+stack address. But the saved state the check read (`saved_pc`/`saved_cpsr`,
+from `[x21]`, `x21` being the exception frame or `machine.contextData`) says
+EL0 (`M = 0`, user `0x7b39460`). A user-looking saved state against a
+kernel-mode exception is either a frame from an older exception on the same
+stack, or an idle thread whose `machine.contextData` is not what a kernel
+thread should have. `bt` frames in 0136 are meant to pick which.
+
+`cnt=1` at this site is not automatically a leak: `BEGIN_INTERRUPT_HANDLER`
+in `locore.s` adds 1 for the duration of an IRQ handler and
+`END_INTERRUPT_HANDLER` removes it, and the idle thread adds one permanently
+in `idle_thread()`. The question is why this check sees the count at all,
+which only happens when the saved CPSR selects EL0.
+
+0136 (run 43023175727, kernel `sha256 3eecefc8…`, image `sha256 ae872358…`)
+adds the guarded frame-chain walk (`bt=%p,%p,%p,%p,%p`) to the same panic
+string and is on the phone. Its photo:
+
+    PRA-PREEMPT cnt=1 thread=0xfffffff39fdaa820 current=0xfffffff39fdaa820
+      idle=0xfffffff39fdaa820 task=0xfffffff36ca04080 pid=0 state=0x04
+      saved_pc=0xf4f02e97 saved_cpsr=0x7b39460 lr=0xfffffff007415d44
+      fp=0xfffffffbfbd3af0 ELR_EL1=0xfffffff007415d5c SPSR_EL1=0x000000384
+      bt=0xfffffff00742084c,0,0,0,0 @machine_routines.c:2922
+
+`bt[0]` is `return_to_user+0x3c`, i.e. the helper's own return address; the
+walk stops because the next `fp` is the interrupted context's frame pointer,
+not a call chain. So 0136 did not answer the path question.
+
+Two things the 0136 data settles:
+
+- The panic is at the root wait itself: the last pre-panic line is
+  `Waiting on <dict ... Apple_HFS ...>`, not the dlil phase (dlil lines are
+  from the *previous* boot on the append-only framebuffer).
+- `lr`/`ELR_EL1`/`SPSR_EL1` are bit-identical to 0134, so the last kernel
+  eret in every boot returns to `pmap_remove_pv+0x13c` with `I` masked
+  (`SPSR=0x384`). That is a normal kernel fault/IRQ return, not the bug.
+  `lr` is the interrupted context's LR (POP_FRAME restores it), so the
+  exception that matters was taken from **kernel** mode, very likely the
+  timer IRQ that wakes the idle WFI.
+
+That leaves `saved_pc`/`saved_cpsr` (read from `[x21]`, the value the dispatch
+used to choose user vs kernel return) as the only corrupt-looking pair:
+`0x7b39460` has reserved SPSR bits set and no valid mode encoding, and
+`0xf4f02e97` is below the 4 GiB user base. Both differ per boot in the low
+bits while `0x7b39460` repeats exactly, which is stale stack data, not a
+saved user context. So the likely shape is: `exception_return_dispatch` read
+a CPSR that is not the current frame's, saw `M == 0`, and sent a kernel
+exception return down the user path.
+
+0137 passes `x21` itself to the helper and prints `tid`, `continuation`,
+`machine.contextData`, `machine.upcb`, the per-CPU `cpu_active_thread` and
+`cpu_int_state` (the frame pointer the IRQ prologue stored), plus ESR/FAR.
+If `x21 == cpu_int_state`, the frame pointer is intact and the frame contents
+are wrong; if not, `x21` was clobbered before the dispatch.
+
 ## Next actions
 1. Read the `PRA-PREEMPT:` lines from the current boot: thread/task/pid,
    `saved_pc`/`saved_cpsr`, `ELR_EL1`/`SPSR_EL1`, `lr` and `fp`. That decides
