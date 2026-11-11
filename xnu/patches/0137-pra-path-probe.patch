@@ -1,0 +1,139 @@
+diff --git a/osfmk/arm64/locore.s b/osfmk/arm64/locore.s
+index 9f3719d..f925f30 100644
+--- a/osfmk/arm64/locore.s
++++ b/osfmk/arm64/locore.s
+@@ -874,6 +874,7 @@ check_user_asts:
+ 1:
+ 	mov		x4, x30					// caller's lr
+ 	mov		x5, x29					// frame pointer
++	mov		x6, x21					// frame/context pointer
+ 	CALL_EXTERN pra_preempt_notzero
+ 	cbnz		w0, preempt_count_notzero		// pra_panic=1: original panic
+ 	mrs		x3, TPIDR_EL1
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index bbf23c9..9ad18ae 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2848,7 +2848,8 @@ ml_get_backtrace_pc(struct arm_saved_state *state)
+ 
+ /* referenced from osfmk/arm64/locore.s (return_to_user preemption check) */
+ int pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+-    unsigned int saved_cpsr, uint64_t caller_lr, uint64_t frame_pointer);
++    unsigned int saved_cpsr, uint64_t caller_lr, uint64_t frame_pointer,
++    uint64_t context_arg);
+ 
+ /*
+  * PRA bring-up diagnostic (xnu/patches/0133, extended by 0134).
+@@ -2864,62 +2865,72 @@ int pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+  */
+ int
+ pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+-    unsigned int saved_cpsr, uint64_t caller_lr, uint64_t frame_pointer)
++    unsigned int saved_cpsr, uint64_t caller_lr, uint64_t frame_pointer,
++    uint64_t context_arg)
+ {
+ #if defined(ARM64_BOARD_CONFIG_PRA)
+ 	thread_t thread = (thread_t)thread_arg;
+ 	thread_t idle = NULL;
+ 	task_t task = TASK_NULL;
+ 	processor_t cpu = current_processor();
++	cpu_data_t *cdp = getCpuDatap();
++	void *active = NULL;
++	void *int_state = NULL;
++	void *ctx = NULL;
++	void *upcb = NULL;
++	void *cont = NULL;
++	void *param = NULL;
++	uint64_t tid = 0;
+ 	uint64_t elr = 0;
+ 	uint64_t spsr = 0;
++	uint64_t esr = 0;
++	uint64_t far = 0;
+ 
+ 	if (cpu != NULL) {
+ 		idle = cpu->idle_thread;
+ 	}
+-	if ((thread != NULL) && (thread->t_tro != NULL)) {
+-		task = thread->t_tro->tro_task;
++	if (cdp != NULL) {
++		active = (void *)cdp->cpu_active_thread;
++		int_state = cdp->cpu_int_state;
++	}
++	if (thread != NULL) {
++		tid = thread_tid(thread);
++		ctx = thread->machine.contextData;
++		upcb = thread->machine.upcb;
++		cont = (void *)thread->continuation;
++		param = thread->parameter;
++		if (thread->t_tro != NULL) {
++			task = thread->t_tro->tro_task;
++		}
+ 	}
+ 
+ 	__asm__ volatile("mrs %0, ELR_EL1" : "=r"(elr));
+ 	__asm__ volatile("mrs %0, SPSR_EL1" : "=r"(spsr));
+-
+-	/*
+-	 * Walk the handler's own frame chain: the interrupted x29 says where
+-	 * pmap_remove_pv was, not how the exception vector reached
+-	 * return_to_user, which is the part that needs explaining.
+-	 */
+-	uintptr_t bt[5] = { 0, 0, 0, 0, 0 };
+-	uintptr_t *frame = __builtin_frame_address(0);
+-	for (int i = 0; (i < 5) && (frame != NULL); i++) {
+-		uintptr_t next = frame[0];
+-		uintptr_t ret = frame[1];
+-		if ((ret < 0xfffffff000000000ULL) ||
+-		    ((uintptr_t)frame & 0xf) != 0) {
+-			break;
+-		}
+-		bt[i] = ret;
+-		if ((next <= (uintptr_t)frame) ||
+-		    (next - (uintptr_t)frame) > 0x4000) {
+-			break;
+-		}
+-		frame = (uintptr_t *)next;
+-	}
++	__asm__ volatile("mrs %0, ESR_EL1" : "=r"(esr));
++	__asm__ volatile("mrs %0, FAR_EL1" : "=r"(far));
+ 
+ 	/*
+ 	 * Panic instead of printf: the panic path suspends the console ring
+ 	 * buffer (console_suspended), so the string is printed even from an
+ 	 * interrupt-disabled context, and it always reaches the framebuffer.
++	 *
++	 * context_arg is x21 at the check: either the exception frame on the
++	 * interrupt stack, or thread->machine.contextData on the
++	 * thread_exception_return path.  Comparing it with ctx/upcb picks the
++	 * path; tid and continuation say whether this is really the idle thread
++	 * by identity rather than by pointer.
+ 	 */
+-	panic("PRA-PREEMPT cnt=%u thread=%p current=%p idle=%p task=%p pid=%d "
+-	    "state=0x%x saved_pc=0x%llx saved_cpsr=0x%x lr=0x%llx fp=0x%llx "
+-	    "ELR_EL1=0x%llx SPSR_EL1=0x%llx bt=%p,%p,%p,%p,%p",
+-	    count, thread, current_thread(), idle, task,
++	panic("PRA-PREEMPT cnt=%u thread=%p current=%p cpu_active=%p idle=%p "
++	    "task=%p pid=%d state=0x%x tid=%llu cont=%p param=%p "
++	    "ctx=%p upcb=%p x21=%p int_state=%p "
++	    "saved_pc=0x%llx saved_cpsr=0x%x lr=0x%llx fp=0x%llx "
++	    "ELR_EL1=0x%llx SPSR_EL1=0x%llx ESR_EL1=0x%llx FAR_EL1=0x%llx",
++	    count, thread, current_thread(), active, idle, task,
+ 	    (task != TASK_NULL) ? task_pid(task) : -1,
+ 	    (thread != NULL) ? (unsigned int)thread->state : 0u,
+-	    saved_pc, saved_cpsr, caller_lr, frame_pointer, elr, spsr,
+-	    (void *)bt[0], (void *)bt[1], (void *)bt[2], (void *)bt[3],
+-	    (void *)bt[4]);
++	    (unsigned long long)tid, cont, param, ctx, upcb,
++	    (void *)context_arg, int_state,
++	    saved_pc, saved_cpsr, caller_lr, frame_pointer, elr, spsr, esr, far);
+ 	return 1;
+ #else
+ 	(void)thread_arg;
+@@ -2928,6 +2939,7 @@ pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+ 	(void)saved_cpsr;
+ 	(void)caller_lr;
+ 	(void)frame_pointer;
++	(void)context_arg;
+ 	return 1;
+ #endif /* ARM64_BOARD_CONFIG_PRA */
+ }
