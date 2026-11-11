@@ -113,13 +113,6 @@ jobs:
             -C .. sdk-kernel-platform
           ls -la buildtree.tgz
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: xnu-buildtree
-          path: buildtree.tgz
-          retention-days: 7
-
       - name: Inspect closed KDK support libs
         if: always()
         run: |
@@ -141,7 +134,7 @@ jobs:
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - name: Verify PRA preemption diagnostics are linked
-        if: ${{ success() && env.MACHINE_CONFIG == 'PRA' }}
+        if: ${{ always() && env.MACHINE_CONFIG == 'PRA' }}
         run: |
           set -euo pipefail
           kernel=out/kernel.development.pra
