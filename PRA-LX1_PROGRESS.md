@@ -480,13 +480,72 @@ macOS-target branch calls `IOSetRecoveryBoot(..., reboot=true)`. There is no
 the kernel repeats the wait. That is the expected landing point for the next
 boot: platform expert -> CPU -> BSD init -> root wait.
 
+## Boot 3: platform expert, stale image, preempt panic (2026-11-11)
+
+The image flashed on 2026-11-10 evening was not built from `0132`: its
+embedded match table carried only `hisilicon,hi6250-display` (the display
+probe name), so it reproduced boot 2's platform-expert panic. The reliable
+check is the match string inside the payload, not the file mtime:
+`out/ci/kernel.development.pra` contains `IONameMatch` ->
+`hisilicon,hi6250`, the flashed payload did not.
+
+Repackaged from that verified artifact (`tools/pra_package.sh
+out/ci/kernel.development.pra`) to 5,980,160 bytes, sha256
+`3c30d7f6e830a1d432469153f8bd9864a999ce9cbad5168b2001d15687a429c7`, cmdline
+`debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress`, and flashed to p30. The
+packager now prints the flash command with `$PRA_SERIAL` instead of a literal
+device serial; export it in the shell that flashes.
+
+Boot 3 (photo, 2026-11-11 ~10:48) reached the intended landing point:
+
+    A5XELTE: platform expert registered
+    A5XELTE: CPU 1/1 init, SGI1 verified
+    AMFI ... permissive sandbox
+    A5XELTE MFS: hfs=527.100.6 registered, meminit 164 MB
+    dill_init
+    ifnet_attach lo0 / gif0 / stf0
+    IOFindBSDRoot: Waiting on <dict ... Apple_HFS ...>
+
+With no `rd=` and no media registered, that is exactly where the kernel is
+expected to sit: platform expert -> CPU -> BSD init -> root wait.
+
+The same screen then shows a panic:
+
+    panic(cpu 0 caller 0xfffffff007420a1c): preemption count not 0 on thread
+      0xffffffe63b9f4380 (1)
+    Original panic string:
+    handshake structure not initialized
+    Please go to https://panic.apple.com to report this panic
+
+The caller address is the format-string address of
+`L_preempt_count_notzero_str` in `osfmk/arm64/locore.s` (file offset
+`0x41ca1c` + kernel base `0xfffffff007004000`), so the site is the
+`MACH_ASSERT` check at `return_to_user`/`check_user_asts` and the KASLR slide
+is 0. `Original panic string:` is empty and the KDP handshake line follows
+because `debug=0xc` leaves DB_NMI set: `panic_spin_forever()` keeps the CPU
+and the Huawei bootloader watchdog eventually resets the phone, which is the
+reboot cycle seen on screen.
+
+What is observed but not explained: no root device exists at this point, and
+`IOFindBSDRoot` loops in `waitForService` until a match appears, so
+`bsd_init` should not have reached `bsd_utaskbootstrap` and no first user
+thread should exist. Yet a thread is at `return_to_user` with preempt count
+1. Either the wait path leaks the count (a preemption disable not balanced
+across `thread_block`/`IOSleep`), or the thread is not the thread we expect.
+Guessing is not useful here; instrument the assert next.
+
 ## Next actions
-1. Rebuild with `0132`, flash, and confirm the `hisilicon,hi6250` platform
-   expert starts and the kernel reaches the `IOFindBSDRoot` wait.
-2. Publish a RAMDisk: append the image as a payload segment and add
+1. Instrument the preempt panic: make `preempt_count_notzero` in
+   `osfmk/arm64/locore.s` call a C helper that prints thread name/pid, ELR,
+   SPSR and the count (or clears the count and continues, to see whether a
+   user return really precedes any mounted root). One CI build + flash.
+2. Watch one full cycle on the phone: is it a watchdog reboot every few
+   minutes or a frozen screen, and what prints between `IOFindBSDRoot` and
+   the panic? A fresh photo of that gap is enough.
+3. Publish a RAMDisk: append the image as a payload segment and add
    `/chosen/memory-map` `RAMDisk` = { phys, size } to the generated ADT, so
    `IOFindBSDRoot` calls `mdevadd()` and `rd=md0` finds the device. Then build
    a minimal root image.
-3. Only then bring up the PRA eMMC root driver (the shim's Arasan SDHCI
+4. Only then bring up the PRA eMMC root driver (the shim's Arasan SDHCI
    read path already works).
-4. Keep the kexec path optional for faster iteration.
+5. Keep the kexec path optional for faster iteration.
