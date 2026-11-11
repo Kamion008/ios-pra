@@ -562,6 +562,41 @@ Boot 4 also matters for the hypothesis: its log ends at `ifnet_attach ... lo0
 already printed the `Apple_HFS` wait line. The assert is therefore not tied to
 the root wait itself, which weakens the "wait path leaks preemption" idea.
 
+### The second failure: ast_taken_user on an idle thread
+
+With `nointr_consio=1` the console guard stays quiet, but the boot still dies,
+now here:
+
+    panic(cpu 0 caller 0xfffffff007a7be80): ast.c:166 Assertion failed:
+      (thread->state & TH_IDLE) == 0
+
+`ast.c:166` is inside `ast_taken_user()`, the return-to-user AST path, and the
+assert is exactly "the thread being resumed to EL0 must not be the idle
+thread". So the two panics are one story: a thread the scheduler believes is
+`TH_IDLE` is being returned to user mode; the preemption assert was just the
+first guard to notice. That also weakens any "the root wait leaks a preemption
+count" theory: the thread identity, not the wait, is wrong.
+
+The `PRA-PREEMPT` `printf` itself still never appeared on the framebuffer, even
+with the tunable set, so the print path cannot be trusted from that context.
+Panic strings always print (the panic path sets `console_suspended`, which
+bypasses `console_io_allowed()`), so 0134 moves the data into the panic
+strings: `PRA-PREEMPT cnt=… thread=… current=… idle=… task=… pid=… state=…
+saved_pc=… saved_cpsr=… lr=… fp=… ELR_EL1=… SPSR_EL1=…`, and a matching
+`PRA-ASTIDLE` panic in `ast_taken_user()` for the branch that hits the assert.
+
+Photo pacing note: the framebuffer console is append-only and the screen keeps
+the previous boot's tail above the new log, so a photo can show one panic from
+the previous boot plus the current boot still running. Read the panic line's
+address and the boot banner, not the position on the glass.
+
+0134 (run 43018834356, `sha256 5b8127da…`, image `sha256 7929ab40…`) contains
+both strings and was flashed with the canonical cmdline. Local compile replay
+now works off the CI artifact: `tools/xnu-cc.py` takes `XNU_CC_CLANG` and
+`XNU_CC_DXB`, so `/usr/bin/clang` plus `/tmp/pra-buildtree` reproduce the CI
+flags without a macOS run (`SweetBattery.cpp`: 0 failures). That is what makes
+a delegated driver patch compile-checkable here.
+
 ## Next actions
 1. Read the `PRA-PREEMPT:` lines from the current boot: thread/task/pid,
    `saved_pc`/`saved_cpsr`, `ELR_EL1`/`SPSR_EL1`, `lr` and `fp`. That decides
