@@ -11,7 +11,9 @@ cd "$(dirname "$0")/.."
 REPO=${1:-}
 if [ -z "$REPO" ]; then
     URL=$(git remote get-url origin 2>/dev/null || true)
-    REPO=$(printf '%s\n' "$URL" | sed -nE 's#.*github\.com[:/]([^/]+/[^/]+?)(\.git)?$#\1#p')
+    # POSIX ERE has no lazy quantifier, so strip the .git suffix separately.
+    REPO=$(printf '%s\n' "$URL" | sed -nE 's#.*github\.com[:/]([^/]+/[^/]+)$#\1#p')
+    REPO=${REPO%.git}
 fi
 if [ -z "$REPO" ]; then
     echo "usage: pra_ci.sh owner/repo   (or add an origin remote first)" >&2

@@ -534,14 +534,49 @@ thread should exist. Yet a thread is at `return_to_user` with preempt count
 across `thread_block`/`IOSleep`), or the thread is not the thread we expect.
 Guessing is not useful here; instrument the assert next.
 
+### 0133: the check fires, then a self-inflicted console panic
+
+Run 43014519898 built 0133 (`sha256 b9c57205…`; the LSE scan again reports
+only the `K256` false positive). The `PRA-PREEMPT` strings are in the payload,
+and the packaged image (5,980,160 bytes, `sha256 9d62464a…`) kept the usual
+cmdline.
+
+The next boot produced a *different* panic:
+
+    panic(cpu 0 caller 0xfffffff007aaa418): Console I/O from interrupt-disabled
+      context @serial_console.c:168
+
+That is a bug in the instrumentation, not in the kernel: the helper disabled
+interrupts before printing, and `console_io_allowed()` in
+`osfmk/console/serial_console.c` panics on exactly that in DEVELOPMENT. What
+it does prove is that `preempt_count_notzero` is reached on every boot, so the
+preemption assert is a real, repeatable entry point.
+
+The guard is a tunable (`nointr_consio`), so the follow-up needed no rebuild:
+the same 0133 kernel was repacked with
+`debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress nointr_consio=1`, flashed
+and rebooted. The next `PRA-PREEMPT:` line is the data we want.
+
+Boot 4 also matters for the hypothesis: its log ends at `ifnet_attach ... lo0
+... Proceeding.` and panics there, slightly *before* boot 3's photo, which had
+already printed the `Apple_HFS` wait line. The assert is therefore not tied to
+the root wait itself, which weakens the "wait path leaks preemption" idea.
+
 ## Next actions
-1. Instrument the preempt panic: make `preempt_count_notzero` in
-   `osfmk/arm64/locore.s` call a C helper that prints thread name/pid, ELR,
-   SPSR and the count (or clears the count and continues, to see whether a
-   user return really precedes any mounted root). One CI build + flash.
-2. Watch one full cycle on the phone: is it a watchdog reboot every few
-   minutes or a frozen screen, and what prints between `IOFindBSDRoot` and
-   the panic? A fresh photo of that gap is enough.
+1. Read the `PRA-PREEMPT:` lines from the current boot: thread/task/pid,
+   `saved_pc`/`saved_cpsr`, `ELR_EL1`/`SPSR_EL1`, `lr` and `fp`. That decides
+   whether a user return really happens before any root is mounted.
+2. 0134: drop the interrupt disable from the helper (print in the context the
+   check is reached in), keep the `pra_panic=1` switch, and rely on the
+   tunable only if a boot with interrupts off is ever needed. One rebuild
+   once the data is in.
+3. Publish a RAMDisk: append the image as a payload segment and add
+   `/chosen/memory-map` `RAMDisk` = { phys, size } to the generated ADT, so
+   `IOFindBSDRoot` calls `mdevadd()` and `rd=md0` finds the device. Then build
+   a minimal root image.
+4. Only then bring up the PRA eMMC root driver (the shim's Arasan SDHCI
+   read path already works).
+5. Keep the kexec path optional for faster iteration.
 3. Publish a RAMDisk: append the image as a payload segment and add
    `/chosen/memory-map` `RAMDisk` = { phys, size } to the generated ADT, so
    `IOFindBSDRoot` calls `mdevadd()` and `rd=md0` finds the device. Then build
