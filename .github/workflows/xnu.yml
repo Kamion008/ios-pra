@@ -134,6 +134,19 @@ jobs:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
+      - name: Verify PRA preemption diagnostics are linked
+        if: ${{ success() && env.MACHINE_CONFIG == 'PRA' }}
+        run: |
+          set -euo pipefail
+          kernel=out/kernel.development.pra
+          test -f "$kernel"
+          xcrun llvm-nm -n "$kernel" | grep -q '_pra_preempt_notzero'
+          strings -a "$kernel" | grep -q 'PRA-PREEMPT cnt='
+          xcrun llvm-objdump -d "$kernel" > /tmp/pra-kernel.disasm
+          awk '/<return_to_user>:/ {inside=1} inside {print} inside && /<no_asts>:/ {exit}' /tmp/pra-kernel.disasm \
+            | grep -q '_pra_preempt_notzero'
+          echo 'PRA preemption diagnostic helper is linked and called from return_to_user.'
+
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
         if: always()
         run: |
