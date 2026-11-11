@@ -37,5 +37,7 @@ fi
 
 echo
 echo "ready: $OUT/pra-xnu.img ($SIZE bytes)"
-echo "flash: fastboot -s 57U7N17912003349 flash kernel $OUT/pra-xnu.img"
-echo "boot:  fastboot -s 57U7N17912003349 reboot"
+# AGENTS.md: keep device serials out of git; the flasher supplies one.
+SERIAL="${PRA_SERIAL:-SERIAL}"
+echo "flash: fastboot -s $SERIAL flash kernel $OUT/pra-xnu.img"
+echo "boot:  fastboot -s $SERIAL reboot"
