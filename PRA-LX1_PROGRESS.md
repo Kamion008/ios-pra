@@ -693,25 +693,63 @@ exception return down the user path.
 If `x21 == cpu_int_state`, the frame pointer is intact and the frame contents
 are wrong; if not, `x21` was clobbered before the dispatch.
 
+## 0138: idle stack fix and frame probes (2026-11-11)
+
+The 0137 photo and disassembly establish that `Idle_context` parked
+`cpu_idle()` on the interrupt stack at `intstack_top - 0x50`, while an EL1 SP0
+exception saved its frame below that stack pointer and the handler then
+switched back to `intstack_top`. The handler frame therefore overwrote both
+the idle call frame and the exception frame, including the saved PC/CPSR used
+by exception dispatch.
+
+0138 keeps the PRA idle thread on its kernel stack instead of switching
+`Idle_context` to `CPU_ISTACKPTR`. It also records DAIF at `cpu_idle()` entry
+and just before WFI, records SP before WFI, and adds the current SP/DAIF,
+interrupt/exception/kernel stack pointers, frame consistency, and idle probes
+to the panic string. This addresses the observed stack overlap and gives the
+next photo enough data to resolve why the saved exception state reported
+`SPSR_EL1.F == 0`.
+
+The patch is committed as outer-repository commit `2101ff9`. The matching
+working-tree edits remain in `xnu-src/` for compile replay. No 0138 build or
+hardware result is available yet: the prior `/tmp` compile log/buildtree are
+absent in this environment, and CI dispatch stopped before pushing because
+the GitHub CLI has no OAuth token. The existing `out/ci` kernel is the 0137
+artifact and is not evidence for 0138. No phone flash was attempted.
+
+The 0135 hi6250 pinctrl driver draft is at `/tmp/0135-pra-hi6250-pinctrl.patch.draft`,
+outside the active `xnu/patches/` directory because CI applies every patch
+there. It adds `PRAPinctrl.cpp` and a PRA-only IOKit match entry; the build-list
+entry remains absent. `git apply --check` passes against the local XNU HEAD,
+but it is uncompiled because the compile log and generated buildtree are not
+available in this environment. It is a draft, not ready to activate.
+
+## Future GPU reference
+
+The user pointed to [Nik300/viva-gpu](https://github.com/Nik300/viva-gpu) as
+a useful later reference. Its README describes an iOS 16.7.16 Metal stack
+using Mesa/Panfrost and AIR-to-NIR translation for Mali-G57, with userspace
+and mock testing in place while the XNU accelerator driver remains future
+work (README status dated 2026-11-03). The PRA kernel config identifies the
+hi6250 GPU as Midgard (`live/kernel-config.txt`); this suggests the project
+will be useful as a design reference for the userspace/IOKit boundary, while
+its G57 backend should not be treated as a drop-in for this different GPU
+family. This is separate from the current root-device boot blocker.
+
 ## Next actions
-1. Read the `PRA-PREEMPT:` lines from the current boot: thread/task/pid,
-   `saved_pc`/`saved_cpsr`, `ELR_EL1`/`SPSR_EL1`, `lr` and `fp`. That decides
-   whether a user return really happens before any root is mounted.
-2. 0134: drop the interrupt disable from the helper (print in the context the
-   check is reached in), keep the `pra_panic=1` switch, and rely on the
-   tunable only if a boot with interrupts off is ever needed. One rebuild
-   once the data is in.
-3. Publish a RAMDisk: append the image as a payload segment and add
-   `/chosen/memory-map` `RAMDisk` = { phys, size } to the generated ADT, so
-   `IOFindBSDRoot` calls `mdevadd()` and `rd=md0` finds the device. Then build
-   a minimal root image.
-4. Only then bring up the PRA eMMC root driver (the shim's Arasan SDHCI
-   read path already works).
-5. Keep the kexec path optional for faster iteration.
-3. Publish a RAMDisk: append the image as a payload segment and add
-   `/chosen/memory-map` `RAMDisk` = { phys, size } to the generated ADT, so
-   `IOFindBSDRoot` calls `mdevadd()` and `rd=md0` finds the device. Then build
-   a minimal root image.
-4. Only then bring up the PRA eMMC root driver (the shim's Arasan SDHCI
-   read path already works).
-5. Keep the kexec path optional for faster iteration.
+1. Restore GitHub CLI authentication or connect the GitHub integration, then
+   dispatch the PRA build for commit `2101ff9`. Replay the three changed XNU
+   files against the downloaded buildtree and record build success separately
+   from any device observation.
+2. If the build passes, package and directly flash only the authorized kernel
+   image while preserving bootloaders, recovery, modem, and persist. Then run
+   `tools/notify.sh` and request a photo from the phone owner. Record the
+   screen and runtime behavior as separate claims from the build result.
+3. Review the next photo's 0138 panic fields. If it still panics, use
+   `frame_ok`, DAIF, stack pointers, and the idle probes to choose the next
+   fix; if it clears the panic, record the exact root-wait or later boot state.
+4. Review the 0135 draft against `docs/pra-driver-contract.md`, integrate its
+   device-tree nodes in `tools/mkadt_pra.py`, and have the primary build and
+   boot that reviewed patch.
+5. Keep device serials and dumps out of git and retain the optional kexec
+   route only as a faster iteration path.
