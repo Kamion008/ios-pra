@@ -20,10 +20,10 @@ on:
         default: "macos-15"
   push:
     branches: [master, main, codex/a5xelte-bringup, s8-dreamlte]
-    # Only patch changes start a build. Editing this workflow must not spawn a
-    # full build on the push default (A5XELTE); dispatch it explicitly instead.
+    # Patch and workflow changes start a build. This bring-up targets PRA.
     paths:
       - "xnu/patches/**"
+      - ".github/workflows/xnu.yml"
 
 concurrency:
   group: xnu-${{ github.ref }}
@@ -34,7 +34,7 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'A5XELTE' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'PRA' }}
 
 jobs:
   build:
@@ -90,7 +90,13 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          # A previous PRA artifact did not contain the patched locore/cswitch
+          # code even though the packaged source tree did. Force the kernel
+          # objects and destination image to be rebuilt from the patched tree.
+          rm -rf build/xnu.obj
+          rm -f fakeroot/System/Library/Kernels/kernel.*
+          bash build.sh
 
       - name: Package build tree for local compiles
         if: always()
