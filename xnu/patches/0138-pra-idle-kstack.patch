@@ -1,0 +1,160 @@
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index b082a10..8015944 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -477,6 +477,21 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+ 	return ipending || (nirqc != irqc);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_PRA)
++/*
++ * PRA bring-up probes.
++ *
++ * The 0134-0137 panics show an exception taken at the WFI in cpu_idle with
++ * SPSR_EL1.F == 0, yet no path between cpu_idle entry and the WFI touches
++ * DAIF in this tree.  Rather than keep inferring the state, record it at
++ * entry and immediately before the WFI, then print it from the panic.  Also
++ * record SP so we can tell whether cpu_idle is still on the interrupt stack.
++ */
++uint64_t pra_idle_daif_entry;
++uint64_t pra_idle_daif_wfi;
++uint64_t pra_idle_sp_wfi;
++#endif
++
+ /*
+  *	Routine:	cpu_idle
+  *	Function:
+@@ -488,6 +503,9 @@ cpu_idle(void)
+ 	uint64_t        new_idle_timeout_ticks = 0x0ULL, lastPop;
+ 	bool idle_disallowed = false;
+ 
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	__asm__ volatile("mrs %0, DAIF" : "=r"(pra_idle_daif_entry));
++#endif
+ 	if (__improbable((!idle_enable))) {
+ 		idle_disallowed = true;
+ 	} else if (__improbable(cpu_data_ptr->cpu_signal & SIGPdisabled)) {
+@@ -567,6 +585,11 @@ cpu_idle(void)
+ 	mt_cpu_idle(cpu_data_ptr);
+ #endif /* MONOTONIC */
+ 
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	__asm__ volatile("mrs %0, DAIF" : "=r"(pra_idle_daif_wfi));
++	__asm__ volatile("mov %0, sp" : "=r"(pra_idle_sp_wfi));
++#endif
++
+ 	if (wfi) {
+ #if !defined(APPLE_ARM64_ARCH_FAMILY)
+ 		platform_cache_idle_enter();
+diff --git a/osfmk/arm64/cswitch.s b/osfmk/arm64/cswitch.s
+index c08a994..f387005 100644
+--- a/osfmk/arm64/cswitch.s
++++ b/osfmk/arm64/cswitch.s
+@@ -369,9 +369,29 @@ LEXT(Idle_context)
+ 	mrs		x0, TPIDR_EL1						// Get thread pointer
+ 	ldr		x1, [x0, TH_KSTACKPTR]				// Get the top of the kernel stack
+ 	save_general_registers	x1, 2
++#if !defined(ARM64_BOARD_CONFIG_PRA)
+ 	ldr		x1, [x0, ACT_CPUDATAP]				// Get current cpu
+ 	ldr		x2, [x1, CPU_ISTACKPTR]				// Switch to interrupt stack
+ 	mov		sp, x2
++#else
++	/*
++	 * PRA bring-up: keep cpu_idle on the idle thread's kernel stack.
++	 *
++	 * A kernel exception is delivered with SP0 selected and builds its
++	 * arm_context_t at the current SP_EL0; the EL1_SP0 IRQ/FIQ vector then
++	 * does SWITCH_TO_INT_STACK and runs the handler from intstack_top
++	 * downwards.  With cpu_idle parked on the interrupt stack at
++	 * intstack_top - 0x50, the handler's own frame grows over both
++	 * cpu_idle's frame and the exception frame (arm_context_t is 0x350,
++	 * so the saved PC/CPSR at +0x108/+0x110 sit only 0x298 below the top).
++	 * That is exactly the 0134-0137 PRA-PREEMPT corruption: dispatch read
++	 * a clobbered CPSR and took the user return path from idle.
++	 *
++	 * On the kernel stack the exception frame and the interrupt-stack
++	 * handler cannot overlap, so the corruption is impossible even if an
++	 * asynchronous exception is somehow unmasked here.
++	 */
++#endif
+ 	b		EXT(cpu_idle)
+ 
+ /*
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 9ad18ae..3a8a167 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2851,6 +2851,11 @@ int pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+     unsigned int saved_cpsr, uint64_t caller_lr, uint64_t frame_pointer,
+     uint64_t context_arg);
+ 
++/* set in cpu_idle() (osfmk/arm64/cpu.c), PRA only */
++extern uint64_t pra_idle_daif_entry;
++extern uint64_t pra_idle_daif_wfi;
++extern uint64_t pra_idle_sp_wfi;
++
+ /*
+  * PRA bring-up diagnostic (xnu/patches/0133, extended by 0134).
+  *
+@@ -2885,6 +2890,12 @@ pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+ 	uint64_t spsr = 0;
+ 	uint64_t esr = 0;
+ 	uint64_t far = 0;
++	uint64_t daif = 0;
++	uint64_t sp = 0;
++	uint64_t istack = 0;
++	uint64_t estack = 0;
++	uint64_t kstack = 0;
++	int frame_ok;
+ 
+ 	if (cpu != NULL) {
+ 		idle = cpu->idle_thread;
+@@ -2892,6 +2903,8 @@ pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+ 	if (cdp != NULL) {
+ 		active = (void *)cdp->cpu_active_thread;
+ 		int_state = cdp->cpu_int_state;
++		istack = cdp->istackptr;
++		estack = cdp->excepstack_top;
+ 	}
+ 	if (thread != NULL) {
+ 		tid = thread_tid(thread);
+@@ -2899,6 +2912,7 @@ pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+ 		upcb = thread->machine.upcb;
+ 		cont = (void *)thread->continuation;
+ 		param = thread->parameter;
++		kstack = thread->machine.kstackptr;
+ 		if (thread->t_tro != NULL) {
+ 			task = thread->t_tro->tro_task;
+ 		}
+@@ -2908,6 +2922,10 @@ pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+ 	__asm__ volatile("mrs %0, SPSR_EL1" : "=r"(spsr));
+ 	__asm__ volatile("mrs %0, ESR_EL1" : "=r"(esr));
+ 	__asm__ volatile("mrs %0, FAR_EL1" : "=r"(far));
++	__asm__ volatile("mrs %0, DAIF" : "=r"(daif));
++	__asm__ volatile("mov %0, sp" : "=r"(sp));
++	frame_ok = (context_arg != 0) && (saved_pc == elr) &&
++	    ((uint64_t)saved_cpsr == spsr);
+ 
+ 	/*
+ 	 * Panic instead of printf: the panic path suspends the console ring
+@@ -2924,13 +2942,18 @@ pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+ 	    "task=%p pid=%d state=0x%x tid=%llu cont=%p param=%p "
+ 	    "ctx=%p upcb=%p x21=%p int_state=%p "
+ 	    "saved_pc=0x%llx saved_cpsr=0x%x lr=0x%llx fp=0x%llx "
+-	    "ELR_EL1=0x%llx SPSR_EL1=0x%llx ESR_EL1=0x%llx FAR_EL1=0x%llx",
++	    "ELR_EL1=0x%llx SPSR_EL1=0x%llx ESR_EL1=0x%llx FAR_EL1=0x%llx "
++	    "frame_ok=%d sp=0x%llx DAIF=0x%llx istack=0x%llx "
++	    "estack=0x%llx kstack=0x%llx idle_daif_entry=0x%llx "
++	    "idle_daif_wfi=0x%llx idle_sp_wfi=0x%llx",
+ 	    count, thread, current_thread(), active, idle, task,
+ 	    (task != TASK_NULL) ? task_pid(task) : -1,
+ 	    (thread != NULL) ? (unsigned int)thread->state : 0u,
+ 	    (unsigned long long)tid, cont, param, ctx, upcb,
+ 	    (void *)context_arg, int_state,
+-	    saved_pc, saved_cpsr, caller_lr, frame_pointer, elr, spsr, esr, far);
++	    saved_pc, saved_cpsr, caller_lr, frame_pointer, elr, spsr, esr, far,
++	    frame_ok, sp, daif, istack, estack, kstack,
++	    pra_idle_daif_entry, pra_idle_daif_wfi, pra_idle_sp_wfi);
+ 	return 1;
+ #else
+ 	(void)thread_arg;
