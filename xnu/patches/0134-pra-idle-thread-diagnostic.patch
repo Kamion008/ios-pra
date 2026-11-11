@@ -1,0 +1,99 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 56c528a..d8fb56b 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2851,15 +2851,14 @@ int pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+     unsigned int saved_cpsr, uint64_t caller_lr, uint64_t frame_pointer);
+ 
+ /*
+- * PRA bring-up diagnostic (xnu/patches/0133).
++ * PRA bring-up diagnostic (xnu/patches/0133, extended by 0134).
+  *
+- * Called from return_to_user when the MACH_ASSERT preemption check fires and
+- * no root device has been mounted yet, where a nonzero count means the thread
+- * is about to enter (or resume) user mode with preemption still disabled.
+- * Printing the thread, task and both return paths distinguishes a real user
+- * return from a leaked preemption disable.  pra_panic=1 keeps the original
+- * panic; the default prints, clears the count and lets the boot continue so
+- * the next few console lines show where it goes.
++ * Called from return_to_user when the MACH_ASSERT preemption check fires.
++ * The thread, the processor's idle thread, the task/pid, TH_IDLE and both
++ * saved contexts go into the panic string, which always reaches the
++ * framebuffer.  A zero exit would clear the count and continue, but the
++ * panic is deliberate: the next failure (ast_taken_user on an idle thread)
++ * is not survivable either, and a single photo should carry both answers.
+  *
+  * Other boards keep the old behaviour (return 1 -> panic).
+  */
+@@ -2869,31 +2868,35 @@ pra_preempt_notzero(void *thread_arg, unsigned int count, uint64_t saved_pc,
+ {
+ #if defined(ARM64_BOARD_CONFIG_PRA)
+ 	thread_t thread = (thread_t)thread_arg;
++	thread_t idle = NULL;
+ 	task_t task = TASK_NULL;
++	processor_t cpu = current_processor();
+ 	uint64_t elr = 0;
+ 	uint64_t spsr = 0;
+-	unsigned int panic_mode = 0;
+ 
++	if (cpu != NULL) {
++		idle = cpu->idle_thread;
++	}
+ 	if ((thread != NULL) && (thread->t_tro != NULL)) {
+ 		task = thread->t_tro->tro_task;
+ 	}
+ 
+ 	__asm__ volatile("mrs %0, ELR_EL1" : "=r"(elr));
+ 	__asm__ volatile("mrs %0, SPSR_EL1" : "=r"(spsr));
+-	/* return_to_user sets DAIF only after this check; do not print from an
+-	 * interrupt context that could take the console lock. */
+-	(void)ml_set_interrupts_enabled(FALSE);
+-	(void)PE_parse_boot_argn("pra_panic", &panic_mode, sizeof(panic_mode));
+-
+-	printf("PRA-PREEMPT: count=%u thread=%p current=%p task=%p pid=%d\n",
+-	    count, thread, current_thread(), task,
+-	    (task != TASK_NULL) ? task_pid(task) : -1);
+-	printf("PRA-PREEMPT: saved_pc=0x%llx saved_cpsr=0x%x lr=0x%llx fp=0x%llx "
+-	    "ELR_EL1=0x%llx SPSR_EL1=0x%llx pra_panic=%u\n",
+-	    saved_pc, saved_cpsr, caller_lr, frame_pointer, elr, spsr,
+-	    panic_mode);
+-
+-	return panic_mode ? 1 : 0;
++
++	/*
++	 * Panic instead of printf: the panic path suspends the console ring
++	 * buffer (console_suspended), so the string is printed even from an
++	 * interrupt-disabled context, and it always reaches the framebuffer.
++	 */
++	panic("PRA-PREEMPT cnt=%u thread=%p current=%p idle=%p task=%p pid=%d "
++	    "state=0x%x saved_pc=0x%llx saved_cpsr=0x%x lr=0x%llx fp=0x%llx "
++	    "ELR_EL1=0x%llx SPSR_EL1=0x%llx",
++	    count, thread, current_thread(), idle, task,
++	    (task != TASK_NULL) ? task_pid(task) : -1,
++	    (thread != NULL) ? (unsigned int)thread->state : 0u,
++	    saved_pc, saved_cpsr, caller_lr, frame_pointer, elr, spsr);
++	return 1;
+ #else
+ 	(void)thread_arg;
+ 	(void)count;
+diff --git a/osfmk/kern/ast.c b/osfmk/kern/ast.c
+index ba26da2..ba98a50 100644
+--- a/osfmk/kern/ast.c
++++ b/osfmk/kern/ast.c
+@@ -163,6 +163,16 @@ ast_taken_user(void)
+ 
+ 	/* We are about to return to userspace, there must not be a pending wait */
+ 	assert(waitq_wait_possible(thread));
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	/* PRA diagnostic (xnu/patches/0134): which thread is being resumed? */
++	if (thread->state & TH_IDLE) {
++		panic("PRA-ASTIDLE thread=%p current=%p idle=%p task=%p pid=%d "
++		    "state=0x%x", thread, current_thread(),
++		    current_processor()->idle_thread, task,
++		    (task != TASK_NULL) ? task_pid(task) : -1,
++		    (unsigned int)thread->state);
++	}
++#endif
+ 	assert((thread->state & TH_IDLE) == 0);
+ 
+ 	/* TODO: Add more 'return to userspace' assertions here */
