@@ -65,8 +65,10 @@ done
 [ -n "$RUN" ] || { echo "error: no dispatch run appeared" >&2; exit 1; }
 echo "run: https://github.com/$REPO/actions/runs/$RUN"
 
-# Download even on failure: the workflow uploads xnu-kernel and buildtree with
-# if: always(), and the buildtree is what makes a failed compile debuggable.
+# Download even on failure: the workflow uploads xnu-kernel with if: always(),
+# so a failed build still shows what was produced. The 135 MB link tree is a
+# separate artifact; only fetch it when debugging a link, because it dwarfs
+# the 6.6 MB the kernel itself costs over the wire.
 gh run watch "$RUN" --repo "$REPO" || true
 CONCLUSION=$(gh run view "$RUN" --repo "$REPO" --json conclusion --jq .conclusion)
 echo "conclusion: $CONCLUSION"
@@ -74,7 +76,9 @@ echo "conclusion: $CONCLUSION"
 rm -rf out/ci
 mkdir -p out/ci
 gh run download "$RUN" --repo "$REPO" -n xnu-kernel -D out/ci || true
-gh run download "$RUN" --repo "$REPO" -n xnu-buildtree -D out/ci || true
+if [ "${PRA_BUILDTREE:-0}" = 1 ]; then
+    gh run download "$RUN" --repo "$REPO" -n xnu-buildtree -D out/ci || true
+fi
 ls -l out/ci
 
 if [ "$CONCLUSION" = "success" ]; then

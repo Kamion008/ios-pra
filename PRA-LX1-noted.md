@@ -844,3 +844,17 @@ once the system starts paging in a 512 MiB window.
 
 The other two limits, in order of payoff: the 512 MiB RAM window (jetsam and
 page pressure) and cluster 1 (4 more cores), both still open.
+
+### CI artifact was 62 MB for a 17 MB kernel
+
+`xnu-kernel` uploaded all of `out/`, which includes
+`kernel.development.pra.link` (135 MB on disk). The Mach-O alone is 17 MB and
+zips to ~6.6 MB, but the artifact arrived at 61.7 MB.
+
+- `xnu-kernel` now carries only `kernel.development.pra`,
+  `…pra.lse.txt` and `SHA256SUMS`.
+- `xnu-buildtree` (link tree + `kdk-libs`) is a separate artifact, kept 3
+  days, and `tools/pra_ci.sh` downloads it only with `PRA_BUILDTREE=1`.
+- Result: the default download is ~6.6 MB instead of ~62 MB. The raw p27
+  image is still 17 MB because LK cannot decompress; that transfer is over
+  adb (44 MB/s), not the internet.

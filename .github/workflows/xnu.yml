@@ -162,9 +162,27 @@ jobs:
             rm -f "$k.disasm"
           done
 
+      # The Mach-O alone is 17 MB and zips to ~6.6 MB. Uploading all of out/
+      # pulled in kernel.development.pra.link, a 135 MB build tree that zips
+      # to ~55 MB, so every consumer downloaded ~62 MB to get one file.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: xnu-kernel
-          path: out/
+          path: |
+            out/kernel.development.pra
+            out/kernel.development.pra.lse.txt
+            out/SHA256SUMS
           if-no-files-found: warn
+
+      # Only for debugging a failed link or building locally; tools/pra_ci.sh
+      # downloads it only when PRA_BUILDTREE=1.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-buildtree
+          path: |
+            out/kernel.development.pra.link
+            out/kdk-libs
+          if-no-files-found: ignore
+          retention-days: 3
