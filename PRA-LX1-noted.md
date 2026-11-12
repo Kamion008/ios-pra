@@ -73,3 +73,32 @@ These establish CI build success and local packaging only. They do not establish
   `apfs-fuse` and `hfsprogs` are installed, so `tools/mkiosroot.sh` can build
   the HFS+ root once the files land. `research/ipsw-x/d22ap.adt` is then
   produced from `DeviceTree.d22ap.im4p` for the `/product` node.
+
+## 0139 hardware result: eMMC read path proven (2026-11-12)
+
+Photo `research/boot-photos/0139-hfs-mount-fail.jpg` (user-supplied, kept out of
+git). On-screen lines, in order:
+
+```
+PRA eMMC: host base=ff390000 vers=0x1002 clock=7 present=ff7f8080
+PRA eMMC: GPT userdata first=10715136 sectors=20062208 read-only
+BSD root: sdhcroot0, major 1, minor 0
+PRA eMMC: /dev/sdhcroot0 ready
+hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : 1020
+hfs_mount: hfs_mountfs returned error=22 for device unknown-dev
+cannot mount root, errno = 19
+```
+
+The boot got through the kernel-thread scheduling messages and then retried the
+root mount four times with the same result. This is the expected probe result
+and a full success for the driver: the polled PIO path read the GPT, selected
+`userdata`, registered the bdevsw, and handed real sectors to HFS+. The volume
+header at sector 2 is Android data (`0x1020`, not HFS+'s `HX`/`H+`), so HFS
+rejected the volume and the root mount failed with ENODEV. Nothing was
+written (`read-only` in the probe line).
+
+Next hardware step is therefore not a driver fix: it is to put a real HFS+
+image on `userdata` and boot again. That needs the iPhone X root image
+(`tools/pra-fetch-ipsw.sh` is mirroring the 16.7.16 IPSW with aria2c, then
+`tools/pra-build-iosroot.sh`, which needs root on the PC), staged with
+`tools/pra-stage-iosroot.sh` from TWRP.
