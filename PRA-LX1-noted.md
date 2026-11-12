@@ -102,3 +102,47 @@ image on `userdata` and boot again. That needs the iPhone X root image
 (`tools/pra-fetch-ipsw.sh` is mirroring the 16.7.16 IPSW with aria2c, then
 `tools/pra-build-iosroot.sh`, which needs root on the PC), staged with
 `tools/pra-stage-iosroot.sh` from TWRP.
+
+## Root image sizing decision: trim, keep the stock GPT (2026-11-12)
+
+The whole IPSW is mirrored (`research/ipsw-x/`, 6,171,035,648 B) and the three
+DMGs are mounted locally with apfs-fuse. Measured uncompressed payload:
+
+```
+OS root   8,291,487,156 B
+SystemOS  3,360,034,133 B   (cryptex, hard-linked into the root)
+AppOS         7,936,372 B
+total    11,659,457,661 B = 10.86 GiB   vs p58 userdata 10,271,850,496 B
+```
+
+The stock GPT stays. `tools/pra-gpt-resize.py` / `tools/pra-flash-gpt.sh` exist
+and were verified against the dump with sfdisk (drop preas/preavs/system/cust/
+version/vendor/product, userdata becomes 13.68 GiB), but they are not used;
+`research/gpt/stock-primary.bin` is a byte-identical copy of the current table.
+
+`tools/mkiosroot.sh` now drops only data no first-boot UI loads (`MKROOT_TRIM=1`,
+the default), keeping Setup.app, `OnBoardingBundles`, `/private/var/
+staged_system_apps` (installd's first-boot app pass), Assistant, Health,
+ScreenReader, Fonts and the en/it dictation bundles:
+
+```
+System/Library/PreinstalledAssetsV2   692 MB  voice/Siri/AirDrop/geo assets
+System/Library/LinguisticData         880 MB  59 languages, en+it kept
+usr/standalone/update                 170 MB  restore/update payloads
+System/Library/NanoTimeKit            139 MB  watch faces
+usr/share/tokenizer                    57 MB  CJK keyboard dictionaries
+SystemOS *.symbols                    592 MB  dyld never maps them
+```
+
+Image is built to the whole partition (SIZE=9796M), so /private/var gets about
+1 GiB (checked at build time: the pipeline fails below 200 MiB free).
+
+Two targets, neither overwrites the other:
+
+```
+sudo tools/pra-build-iosroot.sh            # research/iosroot/ios16-root.img       (staged today)
+sudo tools/pra-build-iosroot.sh --full     # research/iosroot/ios16-root-full.img (kept for a GPT resize)
+```
+
+Blocked on: root on the PC for the build (`sudo -n` is refused here), and the
+phone has to be put in TWRP (stock kernel p30) for staging.

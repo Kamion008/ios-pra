@@ -4,6 +4,10 @@
 #
 #   mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]     (SIZE default 16G)
 #
+# MKROOT_TRIM=0 builds the complete payload (11.66 GB, does not fit the
+# 9.57 GiB userdata partition); the default MKROOT_TRIM=1 drops the payload
+# nothing on the boot path loads so the image fits (see the list below).
+#
 # The IPSW images are raw APFS with LZBITMAP-compressed files: they are read
 # through apfs-fuse (decompressing), so the HFS+ copy is uncompressed. On a
 # device /private/preboot is its own volume holding the cryptexes, which
@@ -82,12 +86,36 @@ copy() {
 	sudo mkdir -p "$2"
 	sudo rsync -aH --numeric-ids "${extra_excludes[@]}" "$1/" "$2/"
 }
-extra_excludes=()
+
+# The complete root is 11.66 GB and the userdata partition is 9.57 GiB, so the
+# default build drops payload that nothing on the boot path loads. Sizes
+# measured on the 16.7.16 d22ap images with du -sb. MKROOT_TRIM=0 keeps
+# everything (the image then needs a bigger partition than stock userdata).
+trim=${MKROOT_TRIM:-1}
+if [[ $trim == 1 ]]; then
+	# Everything Setup.app, OnBoardingBundles, the first-boot installd pass
+	# (/private/var/staged_system_apps), Siri, Health, VoiceOver and the
+	# English/Italian dictation bundles need is kept: only data that no
+	# first-boot UI loads is dropped.
+	extra_excludes=(
+		--exclude='/System/Library/PreinstalledAssetsV2'  # 692 MB, preinstalled voice/Siri/AirDrop/geo assets
+		--include='/System/Library/LinguisticData/'
+		--include='/System/Library/LinguisticData/RequiredAssets_en.bundle/***'
+		--include='/System/Library/LinguisticData/RequiredAssets_it.bundle/***'
+		--exclude='/System/Library/LinguisticData/***'    # ~880 MB, the other 59 dictation languages
+		--exclude='/usr/standalone/update'                # 170 MB, restore/update payloads
+		--exclude='/System/Library/NanoTimeKit'           # 139 MB, watch faces
+		--exclude='/usr/share/tokenizer'                  # 57 MB, CJK keyboard dictionaries
+	)
+else
+	extra_excludes=()
+fi
 copy "$work/os/root" "$work/root"
-# The SystemOS cryptex carries dyld's .symbols file (592 MB on 16.7.16): it is
-# only for offline symbolication, dyld never maps it, and dropping it buys
-# that much free space in /private/var on the same volume.
-extra_excludes=(--exclude='*.symbols' --exclude='*.symbols.*')
+if [[ $trim == 1 ]]; then
+	# The SystemOS cryptex carries dyld's .symbols file (592 MB): dyld never
+	# maps it, it is only for offline symbolication of a shared cache.
+	extra_excludes+=(--exclude='*.symbols' --exclude='*.symbols.*')
+fi
 copy "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
 extra_excludes=()
 copy "$work/appos/root" "$work/root/private/preboot/Cryptexes/App"
@@ -134,6 +162,12 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
 
 df -h "$work/root"
+avail=$(df -B1 --output=avail "$work/root" | tail -1)
+if (( avail < 200 * 1024 * 1024 )); then
+	echo "error: only $((avail / 1048576)) MiB left in the image for /private/var" >&2
+	exit 1
+fi
+echo "free space in the image: $((avail / 1048576)) MiB"
 sudo umount "$work/root"
 # Linux hfsplus decomposes some non-ASCII names (localized Shortcuts examples)
 # differently from Apple's tables; let fsck_hfs rewrite them, then verify.

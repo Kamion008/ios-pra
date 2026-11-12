@@ -145,6 +145,7 @@ def main():
     total = g.backup_lba + 1
     before = g.partitions()
     old_entries = bytes(g.entries)
+    stock_primary = g.serialize(primary=True)
 
     userdata = next((p for p in before if p["name"] == "userdata"), None)
     if userdata is None:
@@ -212,6 +213,10 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "gpt-primary.bin"), "wb") as f:
         f.write(primary)
+    # Byte-for-byte copy of the table we started from, so the stock layout can
+    # be written back with: dd if=stock-primary.bin of=/dev/block/mmcblk0 bs=512 seek=1
+    with open(os.path.join(args.out, "stock-primary.bin"), "wb") as f:
+        f.write(stock_primary)
     if backup:
         with open(os.path.join(args.out, "gpt-backup.bin"), "wb") as f:
             f.write(backup)
