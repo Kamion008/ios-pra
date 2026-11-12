@@ -1,6 +1,6 @@
 # PRA-LX1 bring-up notes
 
-Updated 2026-11-11.
+Updated 2026-11-12.
 
 ## 0138 CI and package
 
@@ -10,6 +10,11 @@ Updated 2026-11-11.
 - Packaged `shim/pra/outxnu/pra-xnu.img`: 5,980,160 bytes; SHA-256 `93599fee798eb0b36e68611b894570bc26f827519a5ba47a34bfc1e2c2b6af91`.
 
 These establish CI build success and local packaging only. They do not establish that the image has been flashed or booted on the PRA-LX1.
+
+## Follow-up CI verification
+
+- Run [43094838455](https://github.com/Kamion008/ios-pra/actions/runs/43094838455) rebuilt from a clean object directory. The Build and LSE-check steps succeeded, but both artifact uploads failed. The linked-kernel guard was skipped because the earlier buildtree upload failure made its `success()` condition false; no kernel artifact was available from this run.
+- Run [43097286698](https://github.com/Kamion008/ios-pra/actions/runs/43097286698) uses a workflow update that skips the large buildtree upload and makes the PRA guard run independently of optional artifact failures. As of 2026-11-12, GitHub reports the run queued with no job assigned. No kernel artifact or additional hardware flash is confirmed from this run.
 
 ## Hardware result
 
@@ -22,4 +27,3 @@ These establish CI build success and local packaging only. They do not establish
 ## Later GPU research
 
 - User supplied [Nik300/viva-gpu](https://github.com/Nik300/viva-gpu) as a useful reference for a later GPU investigation.
-
