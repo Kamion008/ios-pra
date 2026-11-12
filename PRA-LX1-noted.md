@@ -39,3 +39,37 @@ These establish CI build success and local packaging only. They do not establish
 
 - User supplied [Nik300/viva-gpu](https://github.com/Nik300/viva-gpu) as a useful reference for a later GPU investigation.
 
+
+## 0139: Arasan SDHCI eMMC root driver (2026-11-12)
+
+- New `xnu/patches/0139-pra-sdhci-emmc-root.patch` adds `bsd/dev/pra_sdhci.c`
+  (PRA-only bdevsw, polled 512-byte PIO through the SDHCI buffer port, no DMA
+  and no interrupts), registers it in `bsd/conf/files`, adds a
+  `rd=sdhcroot0` branch to `IOFindBSDRoot`, and moves the `pra-emmc` ADT node
+  to the absolute `0xFF390000` window. Writes stay gated on `emmcwrite=1`
+  plus a `userdata` target; this trial is read-only.
+- The register sequence is the one the EL1 diagnostic shim already proved on
+  the phone when it read the GPT and wrote `misc`. The bootloader leaves the
+  host clocked and the card in transfer state, so no card init is attempted.
+- CI run [43219546138](https://github.com/Kamion008/ios-pra/actions/runs/43219546138)
+  completed successfully. Artifact `kernel.development.pra` SHA-256
+  `196c7db898474346790f9e2ebedbe5fb29857a91268f7b1b1e0383b1590a24ce`;
+  it links `_pra_emmc_probe`, `_pra_emmc_rootdev`, `_pra_emmc_read_sector`,
+  `_pra_emmc_strategy` and all 28 `PRA eMMC:` format strings.
+- Packaged `shim/pra/outxnu/pra-xnu.img`: 5,986,304 bytes, SHA-256
+  `1b8216f935d4c9df56313f454bfac8ff219372b764b40c3577fabf4baf6bc0a7`.
+  Pre-flash checks: ADT `pra-emmc` reg `0xFF390000`, cmdline
+  `debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=sdhcroot0
+  emmcroot=userdata emmcprobe=1`, embedded platform match `hisilicon,hi6250`.
+- Flashed to the `kernel` partition only; `Sending`/`Writing`/`Rebooting` all
+  returned `OKAY`. The user was AFK, so the screen result was not observed at
+  flash time. Expected landing: `PRA eMMC:` host line, `GPT userdata
+  first=10715136 sectors=...`, `/dev/sdhcroot0 ready`, `BSD root: sdhcroot0`,
+  then an HFS+ mount failure on the existing Android data (read-only trial,
+  nothing written). A photo is needed before claiming any runtime result.
+- iPhone X (d22ap) iOS 16.7.16 20H392 root components are being fetched with
+  `tools/pra-fetch-ipsw.sh` into the gitignored `research/ipsw-x/`
+  (OS 4.73 GB, SystemOS 2.74 GB, AppOS 10 MB, DeviceTree.d22ap.im4p).
+  `apfs-fuse` and `hfsprogs` are installed, so `tools/mkiosroot.sh` can build
+  the HFS+ root once the files land. `research/ipsw-x/d22ap.adt` is then
+  produced from `DeviceTree.d22ap.im4p` for the `/product` node.
