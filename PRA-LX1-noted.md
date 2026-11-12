@@ -27,6 +27,7 @@ These establish CI build success and local packaging only. They do not establish
 
 ## Hardware result
 
+- Latest run-17 trial: `shim/pra/outxnu/pra-xnu.img` (5,980,160 bytes; SHA-256 `9addb712e1a924cf8c3e91e234a82b2d089b62f4bd2de829795692ca8a994171`) was flashed only to the `kernel` partition. Fastboot returned `OKAY` for both sending and writing, printed its AVB-footer warning that partition size was zero, and returned `OKAY` for reboot. Post-reboot screen and runtime behavior are not yet observed.
 - A sandboxed fastboot attempt could not initialize libusb (`-99`). Retrying in elevated `bash` detected exactly one fastboot device.
 - Hardware flash: `shim/pra/outxnu/pra-xnu.img` was written to the `kernel` partition; `Sending` and `Writing` both returned `OKAY`. Fastboot printed an AVB-footer warning that the partition size was reported as zero, but the write completed successfully.
 - `fastboot reboot` returned `OKAY` after the flash.
