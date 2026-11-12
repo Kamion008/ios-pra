@@ -13,8 +13,11 @@ import os, struct, subprocess, sys, zlib
 
 # curl rather than urllib: urllib hangs on this host's broken IPv6 route to
 # Apple's CDN, curl falls back to IPv4.
+# CURL_MAX_TIME overrides the per-range timeout (seconds). A 64 MiB chunk on a
+# slow link needs more than the 300 s default, or the download cannot finish.
 def curl(*args):
-    return subprocess.run(['curl', '-sfL', '--max-time', '300', *args],
+    max_time = os.environ.get('CURL_MAX_TIME', '300')
+    return subprocess.run(['curl', '-sfL', '--max-time', max_time, *args],
                           check=True, capture_output=True).stdout
 
 
