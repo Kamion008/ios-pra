@@ -24,6 +24,7 @@ set -euo pipefail
 
 [[ $# -ge 4 ]] || { sed -n '2,12p' "$0"; exit 2; }
 os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-16G}
+trim=${MKROOT_TRIM:-1}
 [[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 
 # Pre-flight tool check
@@ -59,7 +60,33 @@ cleanup() {
 		echo "still mounted under $work: left in place" >&2
 	fi
 }
-trap cleanup EXIT
+mon=
+trap '[[ -n $mon ]] && kill "$mon" 2>/dev/null; cleanup' EXIT
+
+say() { printf '\n=== [%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+# rsync prints nothing for twenty minutes, so sample the mounted image and
+# report how much of the expected payload has landed, with a rate and ETA.
+# The total is a rough figure (du -sb of the DMGs minus the trim list); the
+# final df -h below is the authoritative number.
+monitor() {
+	local last=0 used delta eta
+	while :; do
+		sleep 15 || return 0
+		used=$(df -B1 --output=used "$work/root" 2>/dev/null | tail -1 | tr -d ' ')
+		[[ -n ${used:-} ]] || continue
+		used=$((used / 1048576))
+		delta=$((used - last)); last=$used
+		if (( delta > 0 )); then
+			eta=$(( (payload_mib - used) * 15 / delta / 60 ))
+			(( eta < 0 )) && eta=0
+			printf '  ... %5d / ~%d MiB (%3d%%), %d MiB/min, eta ~%d min\n' \
+				"$used" "$payload_mib" $((used * 100 / payload_mib)) $((delta * 4)) "$eta"
+		else
+			printf '  ... %5d / ~%d MiB\n' "$used" "$payload_mib"
+		fi
+	done
+}
 
 # apfs-fuse splits its options on ',' (e.g. in iPhone10,3 paths): use links.
 # Keep the .dmg name: apfs-fuse only parses UDIF images (the OS one is UDIF,
@@ -75,14 +102,18 @@ apfs_mount "$os" os
 apfs_mount "$sysos" sysos
 apfs_mount "$appos" appos
 
+say "formatting $size case-sensitive journaled HFS+"
 truncate -s "$size" "$out"
 mkfs.hfsplus -s -J -v iOSRoot "$out"
 mkdir "$work/root"
+say "mounting $out on $work/root"
 sudo mount -t hfsplus -o loop,force "$out" "$work/root"
 mounts=("$work/root" "${mounts[@]}")
+payload_mib=$(( trim == 1 ? 8656 : 11894 ))
+monitor & mon=$!
 
 copy() {
-	echo "copying $1 -> ${2#"$work/root"}"
+	say "copying $1 -> ${2#"$work/root"}"
 	sudo mkdir -p "$2"
 	sudo rsync -aH --numeric-ids "${extra_excludes[@]}" "$1/" "$2/"
 }
@@ -91,7 +122,6 @@ copy() {
 # default build drops payload that nothing on the boot path loads. Sizes
 # measured on the 16.7.16 d22ap images with du -sb. MKROOT_TRIM=0 keeps
 # everything (the image then needs a bigger partition than stock userdata).
-trim=${MKROOT_TRIM:-1}
 if [[ $trim == 1 ]]; then
 	# Everything Setup.app, OnBoardingBundles, the first-boot installd pass
 	# (/private/var/staged_system_apps), Siri, Health, VoiceOver and the
@@ -123,6 +153,7 @@ copy "$work/appos/root" "$work/root/private/preboot/Cryptexes/App"
 # Shared cache where dyld looks at ignition level 1: hard links, no extra space.
 dsc=private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld
 sudo mkdir -p "$work/root/System/Library/Caches/com.apple.dyld"
+say "hard-linking the shared cache into /System/Library/Caches"
 for f in "$work/root/$dsc"/*; do
 	sudo ln "$f" "$work/root/System/Library/Caches/com.apple.dyld/${f##*/}"
 done
@@ -130,6 +161,7 @@ done
 # dyld does not search the cryptexes at ignition level 1: hard-link every
 # cryptex file that has no counterpart in the OS root (libobjc-trampolines,
 # libffi-trampolines, libstdc++, ...) to its root path.
+say "hard-linking cryptex-only files into the root"
 for c in OS App; do
 	(cd "$work/root/private/preboot/Cryptexes/$c" && sudo find . ! -type d ! -path './System/Library/Caches/com.apple.dyld/*') |
 	while IFS= read -r f; do
@@ -147,6 +179,7 @@ done
 # logd's log stores, normally made at restore: it checks owner _logd (272)
 # and mode, plus a .migrated marker, else asks a helper and crashes
 # ("BUG IN LIBTRACE: Failed to migrate directory").
+say "creating logd stores and the system keybag"
 db="$work/root/private/var/db"
 sudo install -d -o 272 -g 272 -m 0751 "$db/diagnostics"
 sudo install -d -o 272 -g 272 -m 0755 "$db/uuidtext" "$db/diagnostics/timesync"
@@ -161,6 +194,7 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
 	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
 
+say "copy finished; free space"
 df -h "$work/root"
 avail=$(df -B1 --output=avail "$work/root" | tail -1)
 if (( avail < 200 * 1024 * 1024 )); then
@@ -168,6 +202,7 @@ if (( avail < 200 * 1024 * 1024 )); then
 	exit 1
 fi
 echo "free space in the image: $((avail / 1048576)) MiB"
+say "unmounting and verifying with fsck"
 sudo umount "$work/root"
 # Linux hfsplus decomposes some non-ASCII names (localized Shortcuts examples)
 # differently from Apple's tables; let fsck_hfs rewrite them, then verify.
