@@ -15,7 +15,9 @@ These establish CI build success and local packaging only. They do not establish
 
 - Run [43094838455](https://github.com/Kamion008/ios-pra/actions/runs/43094838455) rebuilt from a clean object directory. The Build and LSE-check steps succeeded, but both artifact uploads failed. The linked-kernel guard was skipped because the earlier buildtree upload failure made its `success()` condition false; no kernel artifact was available from this run.
 - Run [43097286698](https://github.com/Kamion008/ios-pra/actions/runs/43097286698) uses a workflow update that skips the large buildtree upload and makes the PRA guard run independently of optional artifact failures. As of 2026-11-12, GitHub reports the run queued with no job assigned. No kernel artifact or additional hardware flash is confirmed from this run.
-- A cancellation attempt for run 43097286698 was rejected by GitHub twice with “Failed to cancel workflow.” Run [43210924043](https://github.com/Kamion008/ios-pra/actions/runs/43210924043) was manually started with runner `macos-15`, PRA, XNU 13.5, DEVELOPMENT, and keep-going enabled; it is in progress. Run 15 still appears queued.
+- A cancellation attempt for run 43097286698 was rejected by GitHub twice with “Failed to cancel workflow.” Run [43210924043](https://github.com/Kamion008/ios-pra/actions/runs/43210924043) was manually started with runner `macos-15`, PRA, XNU 13.5, DEVELOPMENT, and keep-going enabled. Run 15 still appears queued.
+- Run 43210924043 completed with build and artifact upload successful, but the linked-kernel guard failed because `llvm-nm | grep -q` closed the pipe early under `pipefail` (`LLVM ERROR: ... Broken pipe`). This was a verifier pipeline bug, not evidence that the symbol is absent.
+- Updated the guard to let its producer streams finish, then run [43211905251](https://github.com/Kamion008/ios-pra/actions/runs/43211905251) completed successfully, including the linked-kernel guard, LSE check, and artifact upload. Artifact archive SHA-256: `cc96708d23f4b0c33534572028ea7744647d5922c5fb0861cc226f186e23c08c`. The artifact has not been locally packaged or flashed.
 
 ## 0135 pinctrl driver status
 
