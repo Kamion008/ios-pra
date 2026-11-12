@@ -912,3 +912,46 @@ Images built from CI kernel `42d4f1c8…` (0141 + 0142 + fixed linux gate),
 
 Both write to p27 at LBA 753664 (368 MiB, `bs=1048576 seek=368`). The quiet
 image clobbers the boot image with its ring and must be reflashed afterwards.
+
+## mount(11) failed: the root block device never appeared (2026-11-12)
+
+Boot of `pra-xnu-1g-quiet-raw.img` (`395702c5…`, 1 GiB + 0142 + `cpus=4` +
+`emmcstats=1 sweetfb_noconsole=1 pralog=1`) ended with `mount(11) failed` on
+the panel.
+
+- That string is `IOKitBSDInit.cpp:703`, `IOLog("mount(%d) failed\n",
+  mountAttempts)` behind a 5 s `IOSleep`. `mountAttempts` is post-incremented,
+  so `11` is the **12th** attempt: mountroot retried for about a minute and
+  never got a device. It is not an errno.
+- p27's first sector still read `ANDROID!` afterwards, i.e. the `pralog=1`
+  ring **never wrote a byte**, even though it flushes every 10 s.
+- `pra_log_start()` is only called at the end of `pra_emmc_rootdev()`, after
+  `pra_emmc_map_host()`, `pra_emmc_find_root_partition()` and the
+  `bdevsw_add`/`devfs_make_node` calls. No log therefore means `rootdev`
+  failed before line 1271 — the same failure that left mountroot without a
+  device. 0140 could not log a failure in its own subsystem.
+- Consequence: this is **not** the filesystem. A dirty HFS+ volume after the
+  force-off would have failed *after* `pra_log_start()`, so there would be a
+  log. The failure is in mapping the SDHCI host, reading the GPT, or
+  registering the node.
+- Verified against the live GPT: p27 `erecovery_kernel` starts at LBA 753664
+  (368 MiB), 49152 sectors; the `dd seek=368` write lands exactly there and
+  read back as `395702c5…`, so the image itself is where it should be.
+
+### 0144: ring at the partition tail, started before the GPT
+
+`0144-pra-log-early-and-tail.patch`:
+
+- The ring target is now `first + sectors - PRA_LOG_SECTORS` = LBA 794623,
+  which is 7,700 sectors past the end of the 33,220-sector image. Logging no
+  longer destroys the next power-on, so a boot can be diagnosed and then
+  simply repeated instead of reflashed.
+- `praloglba=<LBA>` pins the target and starts the ring right after the host
+  is mapped, before the GPT read, so a failure inside that read is captured.
+  Without the boot arg the normal path is unchanged.
+- `tools/pra_readlog.sh` dumps that ring over adb from TWRP and prints the
+  newest text: `PRA_SERIAL=… tools/pra_readlog.sh` (default LBA 794623).
+
+Between the last good boot (0141, 512 MiB) and this one only two things
+changed: the 1 GiB window and 0142's CMD18 reads. The ring should name the
+culprit on the next boot; no guessing.
