@@ -4,9 +4,9 @@
  
  		mp = vfs_rootmountalloc_internal(vfsp, "root_device");
  		mp->mnt_devvp = rootvp;
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_PRA)
 +		/*
-+		 * SWEET has no data volume: /private/var lives on the root, so
++		 * SWEET and PRA have no data volume: /private/var lives on the root, so
 +		 * boot-arg rootrw=1 mounts it read-write from the start.
 +		 */
 +		{
