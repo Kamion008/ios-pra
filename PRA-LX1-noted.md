@@ -146,3 +146,44 @@ sudo tools/pra-build-iosroot.sh --full     # research/iosroot/ios16-root-full.im
 
 Blocked on: root on the PC for the build (`sudo -n` is refused here), and the
 phone has to be put in TWRP (stock kernel p30) for staging.
+
+## fsck gate and the built trimmed image (2026-11-12)
+
+The first complete build ran the whole pipeline: 8.6 GB copied in 83 s,
+180,298 files and 132,967 folders, then the cryptex hard-links. `/private/var`
+ended with **383 MiB free** (the 200 MiB guard passed). That is lower than the
+earlier estimate because 4 KiB allocation-block rounding costs about 3 KiB on
+average across 180k small files; nothing extra was copied.
+
+The build then aborted on `fsck.hfsplus -f -n`:
+
+```
+   Volume header needs minor repair
+(1, 0)
+** The volume iOSRoot was found corrupt and needs to be repaired.
+```
+
+`(1, 0)` is `WriteError(E_VolumeHeaderDamaged, 1, 0)` ("invalid primary VHB"),
+and `-d` says `result 35`, which is `EDEADLK` from hfsprogs' cache layer
+("CacheRead: Deadlock"). It fires whenever the journaled attribute is set and
+is reproducible on an **empty** `mkfs.hfsplus -s -J` image:
+
+```
+attributes 0x80002100 (cleanly unmounted | journaled | unused-node-fix)
+fsck.hfsplus -f -y   -> "** The volume J appears to be OK."   exit 0
+fsck.hfsplus -f -n   -> "Volume header needs minor repair (1, 0)"  exit 8
+```
+
+So it is a checker bug, not a filesystem defect. `tools/mkiosroot.sh` now
+ignores exactly that pair in the read-only pass, fails on every other
+complaint, and requires the `-y` pass to print "appears to be OK" or
+"was repaired successfully" rather than trusting its exit code.
+
+Verified on a copy of the real image: `-y` prints "appears to be OK" and the
+only `-n` complaint is the artefact. Both volume headers are byte-identical,
+the journal is empty, and the attributes are `0x80002100`.
+
+Remaining free space is 383 MiB, which is the price of keeping
+`staged_system_apps` (511 MB) and the first-boot UI. If setup hits ENOSPC the
+next levers are the staged apps or `System/Library/Fonts/LanguageSupport`
+(78 MB); the GPT resize (13.68 GiB) remains the clean fix.
