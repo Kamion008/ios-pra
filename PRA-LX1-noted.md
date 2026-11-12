@@ -858,3 +858,57 @@ zips to ~6.6 MB, but the artifact arrived at 61.7 MB.
 - Result: the default download is ~6.6 MB instead of ~62 MB. The raw p27
   image is still 17 MB because LK cannot decompress; that transfer is over
   adb (44 MB/s), not the internet.
+
+## After the progress bar: text only, and services re-exec in a loop (2026-11-12)
+
+Photo of the panel after the Apple logo + progress bar finished: the screen is
+100% framebuffer console text, no GUI visible. The tail shows `exec xpcproxy`
+interleaved with a small set of services repeating every few lines —
+`fairplayd.H2`, `bluetoothd`, `usernetworkingd`, `CallDirectoryM`,
+`CallReportingService`, `CallHistorySyncHelper`, `media` — plus
+`SWEET FKS: securityd sel 10 arg0 0 in 2/32 out 1/40 -> 0xe00002c7`
+(`kIOReturnUnsupported`) on every occurrence.
+
+Two different readings, and this photo cannot separate them:
+
+- **Console overdraw.** The framebuffer console scrolls, so after a few
+  hundred lines it covers the whole panel no matter what CoreAnimation drew.
+  Earlier boots showed GUI fragments *under* new text; a later photo only
+  shows the newest text. GUI state is unobservable this way.
+- **Crash-looping daemons.** `fairplayd.H2`, `bluetoothd` and
+  `CallHistorySyncHelper` have no SEP, no Bluetooth controller and no
+  telephony behind them here, so an immediate exit and OnDemand relaunch is
+  plausible. Each relaunch is a fresh `exec` of a multi-MB Mach-O read over the
+  polled SDHCI PIO path, on top of ReportCrash writing crash logs to disk; that
+  would explain a good part of "mega slow" independently of block size.
+
+Next image separates the two: `sweetfb_noconsole=1` stops the console drawing
+the moment AppleCLCD first presents (a panic still draws, see
+`serial_console.c`), and `pralog=1` keeps the log on p27 so a hang is still
+recoverable from TWRP with `dd`. If a GUI appears the daemons are alive; if the
+screen stays black the ring has the reason.
+
+Caveat: with a present, muting `_cnputs` also stops feeding the 4 MiB ring, so
+the disk log ends at the first present. That is the interesting boundary for
+this test, but a later patch should append to the ring before the mute check so
+post-GUI text survives too.
+
+### RAM 512 MiB -> 1 GiB (a58f3f5)
+
+`live/iomem.txt` has `87b08000-dfffffff : System RAM` as one contiguous range,
+so the single `physBase`/`memSize` pair can grow from `0xa8000000` to
+`0xc8000000`. Only two files define the window and both moved:
+`tools/mkadt_pra.py` (`dram-size`) and `shim/pra/boot_main.c` (`RAM_END`); the
+payload copies the ADT value, so nothing else had to change. The bootstrap
+page tables already size for 2 GiB, and the real ceiling for one window stays
+0xe0000000 (1.375 GiB).
+
+Images built from CI kernel `42d4f1c8…` (0141 + 0142 + fixed linux gate),
+`cpus=4`, `emmcstats=1`:
+
+- `pra-xnu-smp4-raw.img` 1 GiB, console on — `ca81681e70b5a920…`
+- `pra-xnu-1g-quiet-raw.img` 1 GiB, `sweetfb_noconsole=1 pralog=1` —
+  `395702c5f19f4d66…`
+
+Both write to p27 at LBA 753664 (368 MiB, `bs=1048576 seek=368`). The quiet
+image clobbers the boot image with its ring and must be reflashed afterwards.
