@@ -16,9 +16,13 @@ img=${1:?usage: pra-stage-iosroot.sh IMAGE [--yes]}
 yes=${2:-}
 [[ -f $img ]] || { echo "no such image: $img" >&2; exit 1; }
 
-# p58 userdata from the stock GPT: first LBA 10715136, 10031104 KiB.
-userdata_kib=10031104
-userdata_bytes=$((userdata_kib * 1024))
+geom=research/gpt/geometry.env
+[[ -f $geom ]] || {
+    echo "missing $geom; run tools/pra-gpt-resize.py and tools/pra-flash-gpt.sh first" >&2
+    exit 1
+}
+userdata_bytes=$(sed -n 's/^USERDATA_BYTES=//p' "$geom")
+[[ -n $userdata_bytes ]] || { echo "no USERDATA_BYTES in $geom" >&2; exit 1; }
 img_bytes=$(stat -c %s "$img")
 (( img_bytes <= userdata_bytes )) || {
     echo "error: image is $img_bytes bytes, userdata is $userdata_bytes" >&2

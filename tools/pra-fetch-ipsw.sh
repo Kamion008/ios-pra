@@ -45,8 +45,16 @@ have=$(stat -c %s "$IPSW" 2>/dev/null || echo 0)
 if (( have != want )) || [[ -f $IPSW.aria2 ]]; then
     echo "=== mirroring $(basename "$URL") ($have/$want bytes)"
     for attempt in $(seq 1 20); do
+        # Apple's CDN throttles and randomly stalls each connection: the
+        # default 60 s timeout killed 14 of 16 connections on 2026-11-12 and
+        # the mirror fell to 0.1 MB/s. Keep the timeout long, retry forever,
+        # and never abort a connection for being slow; aria2c resumes from
+        # its .aria2 control file across restarts.
         aria2c --disable-ipv6=true -x16 -s16 -k1M \
-            --file-allocation=none --allow-overwrite=true \
+            --max-connection-per-server=16 --min-split-size=1M \
+            --file-allocation=none --allow-overwrite=true --auto-file-renaming=false \
+            --timeout=180 --connect-timeout=20 --max-tries=0 --retry-wait=3 \
+            --lowest-speed-limit=0 \
             --console-log-level=warn --summary-interval=60 \
             -d "$OUT" -o "$(basename "$IPSW")" "$URL" && break
         echo "--- aria2c attempt $attempt failed; resuming in 20 s"

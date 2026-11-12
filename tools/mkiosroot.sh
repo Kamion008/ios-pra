@@ -80,10 +80,16 @@ mounts=("$work/root" "${mounts[@]}")
 copy() {
 	echo "copying $1 -> ${2#"$work/root"}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "$1/" "$2/"
+	sudo rsync -aH --numeric-ids "${extra_excludes[@]}" "$1/" "$2/"
 }
+extra_excludes=()
 copy "$work/os/root" "$work/root"
+# The SystemOS cryptex carries dyld's .symbols file (592 MB on 16.7.16): it is
+# only for offline symbolication, dyld never maps it, and dropping it buys
+# that much free space in /private/var on the same volume.
+extra_excludes=(--exclude='*.symbols' --exclude='*.symbols.*')
 copy "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
+extra_excludes=()
 copy "$work/appos/root" "$work/root/private/preboot/Cryptexes/App"
 
 # Shared cache where dyld looks at ignition level 1: hard links, no extra space.
