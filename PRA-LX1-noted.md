@@ -16,6 +16,11 @@ These establish CI build success and local packaging only. They do not establish
 - Run [43094838455](https://github.com/Kamion008/ios-pra/actions/runs/43094838455) rebuilt from a clean object directory. The Build and LSE-check steps succeeded, but both artifact uploads failed. The linked-kernel guard was skipped because the earlier buildtree upload failure made its `success()` condition false; no kernel artifact was available from this run.
 - Run [43097286698](https://github.com/Kamion008/ios-pra/actions/runs/43097286698) uses a workflow update that skips the large buildtree upload and makes the PRA guard run independently of optional artifact failures. As of 2026-11-12, GitHub reports the run queued with no job assigned. No kernel artifact or additional hardware flash is confirmed from this run.
 
+## 0135 pinctrl driver status
+
+- Review of the local `PRAPinctrl.cpp` and PRA config-table entry found read-only mapping of the four audited register windows, with no register writes. The delegated review made no changes.
+- Compile replay is blocked because `/tmp/xnu-43018834356.log` and `/tmp/pra-buildtree` are absent. No `files.arm64` build-list entry or 0135 patch has been produced; the driver is not yet compiled or linked.
+
 ## Hardware result
 
 - A sandboxed fastboot attempt could not initialize libusb (`-99`). Retrying in elevated `bash` detected exactly one fastboot device.
@@ -27,3 +32,4 @@ These establish CI build success and local packaging only. They do not establish
 ## Later GPU research
 
 - User supplied [Nik300/viva-gpu](https://github.com/Nik300/viva-gpu) as a useful reference for a later GPU investigation.
+
