@@ -241,5 +241,42 @@ say "unmounting and verifying with fsck"
 sudo umount "$work/root"
 # Linux hfsplus decomposes some non-ASCII names (localized Shortcuts examples)
 # differently from Apple's tables; let fsck_hfs rewrite them, then verify.
-fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
-fsck.hfsplus -f -n "$out"
+repair_log="$work/fsck-repair.log"
+rc=0
+fsck.hfsplus -f -y "$out" 2>&1 | grep -v 'Illegal name' >"$repair_log" || rc=$?
+# An "Illegal name" rename can make fsck exit non-zero even though the volume is
+# fine, so require the verdict it prints, not just the exit status.
+if ! grep -qE 'appears to be OK|was repaired successfully' "$repair_log"; then
+	cat "$repair_log" >&2
+	echo "error: fsck could not repair $out (exit $rc)" >&2
+	exit 1
+fi
+tail -1 "$repair_log"
+
+# hfsprogs 540.1-Linux reports "Volume header needs minor repair (1, 0)" on every
+# journaled volume: its cache layer refuses an overlapping read with EDEADLK and
+# blames the primary volume header. An empty mkfs.hfsplus -J image produces the
+# same message, so it is a bug in the checker, not a defect in this image.
+# Ignore exactly that pair, and fail on any other complaint.
+verify_log="$work/fsck-verify.log"
+rc=0
+fsck.hfsplus -f -n "$out" >"$verify_log" 2>&1 || rc=$?
+unexpected=$(grep -v -e '^\*\* ' \
+	-e '^[[:space:]]*Executing fsck_hfs' \
+	-e '^[[:space:]]*The volume name is ' \
+	-e '^[[:space:]]*Volume header needs minor repair$' \
+	-e '^[[:space:]]*(1, 0)$' "$verify_log" || true)
+if [[ -n $unexpected ]]; then
+	cat "$verify_log" >&2
+	echo "error: fsck found problems in $out" >&2
+	exit 1
+fi
+if (( rc != 0 && rc != 8 )); then
+	cat "$verify_log" >&2
+	echo "error: fsck exited $rc" >&2
+	exit 1
+fi
+if grep -q 'Volume header needs minor repair' "$verify_log"; then
+	echo "  (ignored hfsprogs' false positive: Volume header needs minor repair (1, 0))"
+fi
+echo "ready: $out"
