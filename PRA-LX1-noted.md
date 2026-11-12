@@ -955,3 +955,44 @@ the panel.
 Between the last good boot (0141, 512 MiB) and this one only two things
 changed: the 1 GiB window and 0142's CMD18 reads. The ring should name the
 culprit on the next boot; no guessing.
+
+## The mount loop was self-inflicted: a failed re-probe erased the geometry (2026-11-12)
+
+`pralogat=60` dumped the in-memory tail on the panel and named the failure:
+
+    hfs_mountfs: buf_meta_bread failed with 22
+    hfs_mount: hfs_mountfs returned error=22 for device unknown-dev
+    cannot mount root, errno = 19
+    mount(12) failed
+    PRA eMMC: card busy, skip read lba=1
+    BSD root: sdhcroot0, major 1, minor 0
+    PRA LOG: write failed 30 after 5 ticks
+
+Reading it in order:
+
+- `BSD root: sdhcroot0` means the GPT **did** parse and the block device
+  exists. The earlier guess that rootdev never ran was wrong.
+- `buf_meta_bread failed with 22` is EINVAL out of `pra_emmc_strategy`'s
+  `off > bytes` check, i.e. the partition geometry was zero.
+- `card busy, skip read lba=1` is the GPT header read (the only caller with
+  absolute LBA 1), so `pra_emmc_find_root_partition()` was running again.
+- `IOKitBSDInit` calls `pra_emmc_probe()` on **every** mount attempt, and
+  `find_root_partition()` clears `pra_emmc_first_lba/nsectors` and the log
+  target on entry. One transient EBUSY on that re-read therefore wiped a
+  partition table the device had already parsed, and every later read
+  returned EINVAL. The log target was wiped the same way, which is why the
+  ring reported EROFS (30) and never landed.
+- So mountroot was fighting a geometry that its own probe destroyed 12 times
+  in a row. Nothing was wrong with HFS+ and nothing was wrong with the RAM.
+
+### 0146: idempotent probe, non-destructive failure, emmcmulti=0
+
+- `pra_emmc_probe()` returns at once once `pra_emmc_ready` is set.
+- A failed parse restores the previous root **and** log geometry.
+- `emmcmulti=0` turns off the CMD18 path at boot, so the still-unexplained
+  "card busy" can be attributed to a multi-block transfer without a rebuild.
+
+What made the card busy in the first place is not established yet. The
+suspicion is a CMD18 that stops early (the per-block loop gives up) and is
+aborted with a CMD/DAT reset but no CMD12, leaving the card mid-stream with
+DAT asserted forever. `emmcmulti=0` is the experiment that settles it.
