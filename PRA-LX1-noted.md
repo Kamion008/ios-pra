@@ -393,3 +393,288 @@ Boot args:
 Trade-off: p27 holds the stock eRecovery kernel, so eRecovery stops working
 once the log is enabled. That is acceptable here - eRecovery must never be
 used on this device (it can wipe userdata) - and nothing else reads p27.
+
+### 0140 rev 2: capture every console path, survive a busy card (2026-11-12)
+
+`0140-pra-console-ring-log.patch` was rewritten in place, same number, because
+CI copies `xnu/patches/*.patch` into the donor tree and applies them in
+numeric order against the tree the previous patch produced: a new number
+would have to re-derive 0140's hunks on top of the old ones. Rev 2 was made
+by reverse-applying rev 1 into a scratch copy to get the post-0139 tree,
+editing, and diffing back; forward and reverse both reproduce the trees
+byte-exactly, and the brace balance of both touched files is (0, 0) as in the
+base.
+
+- The ring hook moved from `_cnputs` to `_cnputc`, declared above `_cnputc`
+  instead of where rev 1 put it. Rev 1 stopped at `exec mount` with `seq=1`
+  even though the tty path reaches the ring through
+  `console_ring_try_empty` -> `_cnputs`, so the capture was not the only
+  suspect. `_cnputc` is the one place every path lands: `_cnputs` loops
+  through it once per character, `console_write_char` and the ring flush
+  reach it without `_cnputs`, and the hook sits after the `\r` expansion so
+  the ring holds the sequence the framebuffer drew rather than the logical
+  one. `pra_log_append(&c, 1)` per character keeps that path free of locks
+  and of device I/O. `disableConsoleOutput` is only TRUE while the graphics
+  console is paused, and console text is on the screen throughout these
+  boots, so nothing observable is lost by dropping the chunk hook.
+- `pra_log_thread` no longer `return`s on a failed write. With `rootrw=1` the
+  HFS driver writes through the same SDHCI channel without taking
+  `pra_emmc_lock`, so the flusher can meet a card that is busy mid transfer
+  (EBUSY). `flushed` now stays where it is and the next 10 s tick rewrites
+  those blocks, so one transient busy cannot end the loop and hide the
+  `pralogidle` and `pralogat` dumps that make a hang readable at all.
+  Complaints are bounded to the first 8 plus every 64th tick.
+- Source state only: CI has not built this revision yet, so nothing about
+  this revision has been verified on hardware.
+
+## Dual boot flash of the rev-1 loader image (2026-11-12)
+
+- p30 was stock at the start of this session: `sha256`/`md5` of
+  `/dev/block/mmcblk0p30` read over TWRP matched the read-only stock dump
+  (`82e4855fd0f04b9b2ede301b0ec7452f`). Consequence, checked rather than
+  assumed: power-on ran the stock Linux kernel, so only recovery gave TWRP
+  and XNU did not load on a plain reboot.
+- `shim/pra/outxnu/pra-xnu.img`, 5,992,448 bytes, SHA-256
+  `6f4a1581b83d8eb0bd0649c4ae892f639c94b78917e626f5215c0105345e5d97`, is the
+  rev-1 build: the dual-boot loader (`loader.bin` 12,056 bytes, with
+  `linux_boot.o`, `linux_jump.o` and `sdhci_read.o`) plus 0140 rev 1. Checked
+  before flashing: `ANDROID!` v0 header, kernel gzip at 2048, and
+  decompressing that gzip yields the 17,006,592-byte payload holding the
+  whole boot-arg line, `rd=sdhcroot0` through `pralog=1 pralogat=120`.
+- Flashed to the `kernel` partition with the PRA serial selected (the Pixel
+  attached alongside it stayed untouched). `Sending` and `Writing` both
+  returned `OKAY`, with the usual AVB-footer warning that reports the
+  partition size as 0, and `fastboot reboot` returned `OKAY`.
+- That boot did not reach XNU: the phone showed ERROR MODE, and holding `vol+`
+  did not reach TWRP either. The cause is in the next section: the loader
+  treated any boot with an attached initrd as recovery, and the ordinary
+  power-on has one too, so it took the untested Linux branch. The read-only
+  stock dump `mmcblk0p30.bin` (24 MiB, md5
+  `82e4855fd0f04b9b2ede301b0ec7452f`) was written back to `kernel`; TWRP
+  `3.5.2_9-0` came back and `md5sum /dev/block/mmcblk0p30` then matched the
+  dump exactly, so the restore path from fastboot is proven.
+- The one device-side variable that changed between the last XNU boot of this
+  same image and this failure is the staged Linux Image in p51 (written at
+  17:54, after the boot that produced the p27 log). That makes the Linux
+  branch reachable for the first time, and that branch was never exercised:
+  its 70,000-sector polled read and the stock 4.4.23 handoff at 0x30080000
+  are untested. A hang there would also explain ERROR MODE on a plain reboot,
+  because Huawei's bootloader counts failed boots and latches ERROR MODE once
+  the count runs out. Not established yet: whether it hung in the header
+  read, the Image transfer, the CRC, or the jump. The loader prints
+  `PRA XNU loader`, `linux: recovery initrd present`, `linux MiB <n>`,
+  `linux: CRC mismatch` and `jumping to Linux` on the framebuffer, so the
+  last line visible on the failed attempt discriminates those cases.
+- Do not flash this loader image to p30 again until the Linux branch is
+  either shown to return to XNU or made to fail closed before the jump.
+
+## Recovery gate: the initrd is not recovery-specific (2026-11-12)
+
+Read from the live DTB in TWRP, `/proc/device-tree/chosen/bootargs`, on a
+card-attached `vol+` boot:
+
+```
+enter_recovery=1 enter_erecovery=0 androidboot.mode=normal
+recovery_update=1 normal_reset_type=VolUsbUpdate
+linux,initrd-start = 0x08000000
+linux,initrd-end   = 0x0c9c9d00   (~76.8 MB)
+```
+
+- `androidboot.mode` is `normal` in a recovery boot, so it cannot select the
+  branch. The token that does is `enter_recovery=1`.
+- The measured initrd range differs from what the loader comment assumed
+  (0x11000000..0x11e80000, ~15.2 MB). The loader only requires the range to
+  sit inside the first RAM bank, so it accepts both.
+- The loader selected Linux on the initrd alone, and an ordinary boot
+  attaches the Android ramdisk the same way. That is why staging `preas`
+  (p51) acted as the real trigger: with p51 blank the branch declined and
+  XNU ran, and with a valid staged Image it jumped to a Linux handoff that
+  has never worked.
+
+Fix: `pra_linux_try` now requires the exact space-delimited token
+`enter_recovery=1` in `/chosen/bootargs` before it even looks at the initrd,
+and declines otherwise, so a boot that is not recovery cannot take the
+staged Image even when the header and CRC are valid.
+
+- Host unit test: the FDT helpers and `bootarg_has` are extracted verbatim
+  from `linux_boot.c` into a test that builds synthetic DTB blobs. All 8
+  cases pass, including `enter_recovery=0`, `xenter_recovery=1`,
+  `enter_recovery=10`, a missing `bootargs` property, and
+  `androidboot.mode=normal` on its own.
+- Rebuilt loader 12,504 bytes; `pra-xnu.img` 5,994,496 bytes, SHA-256
+  `dc06157485481053f752776364f0234b86c26c9c9c7989f076300a21c6865fae`. The
+  appended XNU payload is byte-identical to the previous build
+  (`sha256(payload[0x500000:])` `8b0f2302...`), so only the loader changed
+  and the kernel under test is the same one that reached launchd.
+- Written to p30 from TWRP with `dd bs=1048576`, then read back over 11,708
+  sectors and compared: exact match to the local file.
+- `adb reboot` from TWRP with this build then showed ERROR MODE again. That
+  is not yet a normal cold boot: the earlier XNU boots were power-ons from
+  off, and a reboot issued inside recovery may carry recovery state through,
+  in which case the gate is legitimately satisfied and the Linux branch is
+  what fails. The discriminating evidence is the loader's own framebuffer
+  text (`jumping to XNU` versus `linux: recovery initrd present` /
+  `jumping to Linux`) plus a cold power-off/power-on with the same image.
+
+## ERROR MODE is the boot-failure latch in p48, not misc (2026-11-12)
+
+Every custom image in `kernel` (p30) started returning ERROR MODE, including
+the pre-`linux_boot` image that had booted XNU earlier the same day, while the
+stock p30 dump still booted TWRP every time. Device state, not loader code.
+
+What the phone reports in a TWRP boot at that point:
+
+```
+enter_recovery=1 enter_erecovery=0 androidboot.mode=normal
+recovery_update=1 normal_reset_type=VolUsbUpdate format_data=1
+reboot_reason=coldboot   last_bootup_keypoint=34   boot_slice=0x0008c82f
+```
+
+- `enter_recovery=1` is present with **no keys held** and after a plain
+  `fastboot reboot`, so the bootloader is entering recovery on its own. That
+  is the failure path, not a key-combo artefact.
+- `misc` (p20) is **entirely zero** — no `bootloader_message`, no
+  `boot-recovery` command, no boot counter. Dumped and checked byte by byte.
+  So the usual Android `misc` latch does not exist on this port.
+- `p47 patch` is empty (first 64 KiB zeros), so `boot_slice` is not applying
+  kernel patches.
+
+The state lives in **p48 `bootfail_info`** (2 MiB, LBA 1998848):
+
+```
+magic "XIFB" (BFIX)  u32[1]=0x14=20 records  u32[2]=0x1000=4096 slot size
+slot n at n*4096: u32 timestamp, then a per-boot status word pair
+```
+
+20 records, one per boot, timestamps from 2026-11-11 09:53 through
+2026-11-12 16:16 UTC. Seventeen of them share the signature
+`0x03000003 / 0x02000004 / 0 / 1 / 7`, i.e. one per XNU boot: **XNU never
+reports boot success**, so LK keeps counting failures, eventually forces
+recovery, and with `erecovery_kernel` (p27) overwritten by the 0140 console
+ring the forced-recovery handoff has no valid kernel — ERROR MODE.
+
+Evidence that the latch is a counter and not per-image: the stock p30 image
+is the same bytes in both cases `md5 82e4855fd0f04b9b2ede301b0ec7452f`, and
+it boots TWRP even with the counter full, because the recovery boot itself
+is the latch's escape hatch.
+
+- Backed up p48 and p49 before touching them:
+  `/mnt/giochi/pra-lx1-handoff/dump/mmcblk0p48.bootfail_info.2026-11-12.bin`
+  and `mmcblk0p49.rrecord.2026-11-12.bin`. p49 `rrecord` is the reset log and
+  its newest entry is `boot-erecovery`, consistent with the forced path.
+- Zeroed p48 (`dd if=/dev/zero bs=4096`, whole 2 MiB) from TWRP; readback md5
+  equals 2 MiB of zeros. This is Huawei's standard bootloop reset and only
+  loses failure bookkeeping.
+- Then, still inside TWRP, wrote the no-Linux-branch image to p30
+  (`pra-xnu-launchd.img`, sha256 `1a65b12a…`, readback over 11,692 sectors
+  exact) and powered off, so the next start is a real cold boot and no
+  Android boot can consume the HFS+ userdata.
+
+Consequence for the design: XNU has to clear this latch if it is going to be
+the default boot, otherwise every boot burns a failure slot until LK forces
+recovery again. `bootfail_info` is a plain GPT partition (p48, LBA 1998848),
+so the loader can zero its first sector or rewrite the magic before handing
+off to XNU — the same `sdhci` write path 0139 already uses for p30/p27. A
+minimal version is enough: write zeros over the 4 KiB header sector so LK
+reinitialises the counter on each XNU boot.
+
+## The bootloader is in its eRecovery failsafe, and that reads p27 (2026-11-12)
+
+The ERROR MODE screen finally named itself:
+
+```
+Error!
+Func NO: 11 (recovery image)
+Error NO: 2  (load failed)
+```
+
+Meaning of the evidence collected since:
+
+- `misc` (p20) is all zeros, p47 `patch` is empty, and nothing in p7 `nvme`
+  (three identical NV copies, 95 items, `BOOTINF`/`POWSTA`/`WVLOCK`/`FBLOCK`
+  only) carries a boot-fail counter. Clearing p48 `bootfail_info` changed
+  nothing.
+- LK still boots with `enter_recovery=1` and no keys held, i.e. it is latched
+  into the recovery path and this is not a key-combo state.
+- Writing a known-good image into p27 (`pra-diag.img`) turned the ERROR MODE
+  into that image's own red fill on the next power-on, which proves the
+  failsafe *loads and jumps to p27*, not to `kernel` (p30). The diag then
+  hangs in its register probes (it paints `0x5D000000` red before anything
+  else), which is why the screen stayed red instead of resetting to TWRP.
+- With the stock p30 dump in p30 and our diag in p27, a cold power-on still
+  showed the diag: so when p27 is loadable, LK never reaches p30. When p27
+  held the `PRALOG1` ring log, the same path produced `Error NO: 2` instead.
+- Conclusion: the ERROR MODE was never about the XNU kernel at all. Our
+  console-ring log destroyed the image LK actually boots on every power-on,
+  and every custom p30 image since then was never even read.
+
+Recovery of the chain: `pra-xnu-rw-raw.img` (the proven `639af15e` payload,
+repacked with a raw arm64 Image instead of gzip, 17,008,640 bytes, sha256
+`76190b67…`) was written to p27 (`dd bs=1048576`, readback over 33,220
+sectors exact) with stock p30 still in `kernel`. A cold power-on then boots
+XNU: the loader draws its text and the kernel starts.
+
+Two consequences that shape the next steps:
+
+- The XNU root stays bootable during bring-up even while LK is latched, and
+  p27 is a valid scratch target as long as the payload boots from it does
+  not write p27 itself (no `pralog=1` in the cmdline).
+- The intended layout (XNU in p30, Linux/TWRP as the recovery branch) needs
+  the latch cleared, otherwise p30 is dead weight. The latch is not in p16
+  persist, p20 misc, p48 bootfail_info or p7 nvme; the remaining candidates
+  are the `oeminfo`/`reserved*`/`dfx` partitions and `boot_slice`.
+- p27 now holds the XNU image, so the eRecovery log target is gone from that
+  partition. 0140 must not be pointed at p27 again while p27 is the boot
+  image; move the ring into `preas` p51 or a dedicated area first.
+
+## launchd gets past code signing with the launchd payload (2026-11-12)
+
+Booting `pra-xnu-rw` (payload `639af15e`, cmdline without the launchd args)
+from p27 reached launchd and then panicked:
+
+```
+load_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+load_init_program: attempting to load /sbin/launchd
+panic(cpu 0 caller ...): unexpected SIGKILL of launchd (CS_KILLED)
+  reason -- namespace 9 code 0x8e description none
+```
+
+- Namespace 9 is `OS_REASON_EXEC` (`bsd/sys/reason.h`). The kill comes from
+  the exec/codesigning path in `kern_exec.c`: on signature failure it sets
+  `CS_KILLED` and sends SIGKILL, and `kern_sig.c` treats a SIGKILL of
+  `initproc` as fatal by design. `A5XELTE: root volume is not authenticated
+  (error 25); continuing unsealed` is the preceding line, i.e. the volume has
+  no authenticated root hash, so launchd has no trusted cdhash.
+- The fix is the payload, not a new kernel change: `pra-xnu-launchd.img`
+  (payload `9d40b2d3`, cmdline with `unentitled_ios_sim_launch=1
+  launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin
+  wdt=-1`) boots from p27 and walks past launchd into userspace. Observed:
+  `exec mount`, then `exec softwareupdated`. So the earlier "silence after
+  exec mount" was this kill/panic, and the later `0140` build (`8b0f2302`)
+  reached the same point because it also carries those args.
+- `unentitled_ios_sim_launch` is a `TUNABLE` in `bsd/kern/kern_exec.c`
+  (`#if XNU_TARGET_OS_OSX`), so the kernel under test is a DEVELOPMENT build
+  as expected. `launchd_unsecure_cache` and `ignition_level` are not in this
+  tree; they are consumed outside kernel/bsd.
+- Image used: `pra-xnu-launchd-raw.img` (raw repack of the same flat image,
+  17,008,640 bytes, sha256 `ff856fc1…`), written to p27 and verified over
+  33,220 sectors. Raw is used because LK in this path loads p27 directly and
+  no decompression step is needed.
+- Boot arrangement while the latch is unresolved: p30 = stock dump,
+  p27 = XNU image, plain power-on boots XNU through LK's failsafe, and
+  holding vol+ at power-on (cable unplugged) still reaches TWRP for writes.
+
+### 0140 and the p27 boot image conflict
+
+Since LK's failsafe now boots p27, the 0140 ring log must not point at p27:
+a kernel with `pralog=1` flushes over its own boot image, which kills the
+next power-on (LK would read half a ring buffer where the image was). Until
+the ring is moved, boot XNU from p27 only with payloads whose cmdline has no
+`pralog=1` — `pra-xnu-launchd` (`9d40b2d3`) is the known-good one and
+`pra-xnu-rw` (`639af15e`) lacks the launchd args and panics.
+
+Moving the ring into free space in `preas` (p51) is the clean fix: the
+staged Linux header and Image occupy LBA 2097152 and 2101248 plus ~71,000
+sectors, so a ring at, say, LBA 2199552 does not overlap them. That is a
+0140 code change (`pra_log_erecovery_lba`) plus a rebuild, not a runtime
+setting.

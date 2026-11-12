@@ -3,9 +3,11 @@
  *
  * The bootloader always takes the kernel from `kernel` (p30) and, when the
  * recovery keys are held, takes only the ramdisk from `recovery_ramdisk`
- * (p32), describing it in /chosen as linux,initrd-start/end. The loader can
- * therefore branch on that initrd and boot a Linux Image staged in the
- * otherwise unused `preas` partition (p51).
+ * (p32), describing it in /chosen as linux,initrd-start/end. Those
+ * properties also appear on an ordinary boot, so the initrd is not the
+ * trigger: the loader requires /chosen/bootargs to carry the token
+ * `enter_recovery=1` and only then boots the Linux Image staged in the
+ * otherwise unused `preas` partition (p51). Absence fails closed to XNU.
  *
  * Scratch layout (absolute LBA, 512-byte sectors):
  *
@@ -22,9 +24,9 @@
  * protocol aligns that 2 MiB base, not text_offset itself: the stock 4.4.23
  * Image on this phone carries text_offset 0x80000, so it lands at 0x30080000,
  * while a modern Image with text_offset 0 lands at 0x30000000. Either way the
- * image and its BSS stay above everything the recovery boot uses: the TWRP
- * ramdisk sits at 0x11000000 and is about 15.2 MB, the live DTB is around
- * 0x07e00000, and this loader plus a XNU payload occupies 0x480000 up to
+ * image and its BSS stay above everything the recovery boot uses: a measured
+ * recovery boot put the ramdisk at 0x08000000..0x0c9c9d00, the live DTB is
+ * around 0x07e00000, and this loader plus a XNU payload occupies 0x480000 up to
  * roughly 0x1500000. All of those are below 0x30000000, and the 2 MiB base
  * window plus 128 MiB is still far below the 0x60000000 end of the first RAM
  * bank.

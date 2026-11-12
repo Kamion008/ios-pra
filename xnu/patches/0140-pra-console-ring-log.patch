@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
 --- a/bsd/dev/pra_sdhci.c
 +++ b/bsd/dev/pra_sdhci.c
-@@ -11,6 +11,14 @@
+@@ -11,6 +11,19 @@
   * Root reads need no boot argument beyond rd=sdhcroot0; the selected GPT
   * partition defaults to "userdata" and can be changed with emmcroot=<name>.
   * Writes stay disabled unless emmcwrite=1 and the partition is "userdata".
@@ -13,10 +13,15 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
 + * at probe and halts, pralogat=<seconds> prints the in-memory tail and halts
 + * that long after the log starts, and pralogidle=<seconds> does the same
 + * after that much console silence, so a hang stays on the screen.
++ *
++ * Once the root is mounted writable the filesystem driver and this log
++ * driver share one SDHCI channel, so a flush can find the card busy. That
++ * is transient, so the flusher retries on the next tick instead of stopping,
++ * and only a bounded number of complaints reach the console.
   */
  #if defined(ARM64_BOARD_CONFIG_PRA)
  #include <sys/param.h>
-@@ -67,6 +75,12 @@
+@@ -67,6 +80,12 @@
  #define TRANSFER_SINGLE_READ   0x12u   /* block count enable, read, single */
  #define TRANSFER_SINGLE_WRITE  0x02u   /* block count enable, write, single */
  
@@ -29,7 +34,7 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
  static vm_offset_t pra_emmc_regs;
  static uint64_t pra_emmc_first_lba, pra_emmc_nsectors;
  static char pra_emmc_partition_name[32] = "userdata";
-@@ -76,6 +90,26 @@
+@@ -76,6 +95,26 @@
  static LCK_GRP_DECLARE(pra_emmc_grp, "pra_emmc");
  static LCK_MTX_DECLARE(pra_emmc_lock, &pra_emmc_grp);
  
@@ -56,7 +61,7 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
  static inline uint32_t
  pra_emmc_rd32(uint32_t off)
  {
-@@ -254,16 +288,12 @@
+@@ -254,16 +293,12 @@
  }
  
  static int
@@ -74,7 +79,7 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
  	if (pra_emmc_wait_ready()) {
  		printf("PRA eMMC: card busy, skip write lba=%u\n", lba);
  		return EBUSY;
-@@ -362,6 +392,251 @@
+@@ -362,6 +397,261 @@
  	return error;
  }
  
@@ -106,7 +111,7 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
 +	return error;
 +}
 +
-+/* _cnputs may execute in any context. Keep this path free of locks and I/O. */
++/* _cnputc may execute in any context. Keep this path free of locks and I/O. */
 +void pra_log_append(const char *c, int size);
 +void
 +pra_log_append(const char *c, int size)
@@ -202,7 +207,7 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
 +pra_log_thread(__unused void *arg, __unused wait_result_t wr)
 +{
 +	uint64_t flushed = 0, seq = 0, last_total = 0;
-+	int idle = 0, ticks = 0;
++	int idle = 0, ticks = 0, write_fails = 0;
 +	uint8_t sector[512];
 +
 +	for (;;) {
@@ -246,11 +251,21 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
 +				    (uint32_t)pra_log_erecovery_lba, sector);
 +			}
 +			if (error) {
-+				printf("PRA LOG: write failed (%d), stopping\n",
-+				    error);
-+				return;
++				/* The root is mounted writable, so a filesystem write
++				 * may own the SDHCI channel while this flush runs: EBUSY
++				 * is expected and transient. Keep flushed where it is so
++				 * the next tick rewrites the same blocks, and bound how
++				 * many complaints reach the console: a stuck flusher must
++				 * never end the log loop, or the idle and at-limit dumps,
++				 * which are what makes a hang readable at all. */
++				if (++write_fails <= 8 || write_fails % 64 == 0) {
++					printf("PRA LOG: write failed %d after %d ticks\n",
++					    error, write_fails);
++				}
++			} else {
++				write_fails = 0;
++				flushed = total;
 +			}
-+			flushed = total;
 +		}
 +		if (pra_log_idle_limit > 0) {
 +			if (total == last_total) {
@@ -326,7 +341,7 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
  static uint32_t
  pra_emmc_le32(const uint8_t *p)
  {
-@@ -441,6 +716,8 @@
+@@ -441,6 +731,8 @@
  
  	pra_emmc_first_lba = 0;
  	pra_emmc_nsectors = 0;
@@ -335,7 +350,7 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
  	error = pra_emmc_read_sector(1, hdr);
  	if (error) {
  		return error;
-@@ -478,21 +755,33 @@
+@@ -478,21 +770,33 @@
  		crc = pra_emmc_crc32(crc, entry, 512);
  		for (uint32_t j = 0; j < 4; j++) {
  			const uint8_t *p = entry + j * 128;
@@ -375,7 +390,7 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
  		}
  	}
  	if ((crc ^ ~0u) != pra_emmc_le32(hdr + 88)) {
-@@ -510,6 +799,7 @@
+@@ -510,6 +814,7 @@
  	printf("PRA eMMC: GPT %s first=%llu sectors=%llu %s\n",
  	    pra_emmc_partition_name, pra_emmc_first_lba, pra_emmc_nsectors,
  	    pra_emmc_writable ? "writable" : "read-only");
@@ -383,7 +398,7 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
  	return 0;
  }
  
-@@ -750,6 +1040,7 @@
+@@ -750,6 +1055,7 @@
  		printf("PRA eMMC: /dev/sdhcroot0 ready, GPT %s %s\n",
  		    pra_emmc_partition_name,
  		    pra_emmc_writable ? "writable" : "read-only");
@@ -394,23 +409,34 @@ diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
 diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
 --- a/osfmk/console/serial_console.c
 +++ b/osfmk/console/serial_console.c
-@@ -272,6 +272,9 @@
- #if defined(ARM64_BOARD_CONFIG_A5XELTE)
- extern void a5xelte_log_append(const char *c, int size); /* bsd/dev/a5xelte_emmc.c */
- #endif
+@@ -231,6 +231,19 @@
+ 	return idx;
+ }
+ 
 +#if defined(ARM64_BOARD_CONFIG_PRA)
++/*
++ * Boot-arg pralog=1 keeps console text in a RAM ring in
++ * bsd/dev/pra_sdhci.c and flushes it to the erecovery_kernel partition.
++ * Hook the single character path rather than _cnputs: _cnputs ends up
++ * here once per character so nothing is counted twice, but only this
++ * hook sees the callers that go straight to one character, and it runs
++ * after the newline expansion below has queued its carriage return,
++ * so the persistent log is the sequence the screen really showed.
++ */
 +extern void pra_log_append(const char *c, int size); /* bsd/dev/pra_sdhci.c */
 +#endif
- #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
- /*
-  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
-@@ -292,6 +295,9 @@
- #if defined(ARM64_BOARD_CONFIG_A5XELTE)
- 	a5xelte_log_append(c, size);
- #endif
++
+ /**
+  * Helper function for outputting a character to the underlying console
+  * (either video or serial) with the possibility of sleeping waiting for
+@@ -254,6 +267,10 @@
+ 		_cnputc('\r', poll);
+ 	}
+ 
 +#if defined(ARM64_BOARD_CONFIG_PRA)
-+	pra_log_append(c, size);
++	pra_log_append(&c, 1);
 +#endif
- #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
- 	if (sweet_console_muted && !panic_active()) {
- 		return;
++
+ 	cons_ops[idx].putc(c, poll);
+ }
+ 

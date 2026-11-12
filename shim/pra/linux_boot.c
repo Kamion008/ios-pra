@@ -1,17 +1,29 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * PRA-LX1 (hi6250 / Kirin 655) dual-boot branch: boot a staged Linux Image
- * when the bootloader attached a recovery initrd.
+ * only on a recovery boot.
  *
  * The Huawei bootloader takes the kernel from `kernel` (p30) and, for a
- * recovery boot, only the ramdisk from `recovery_ramdisk` (p32). It then puts
- * that ramdisk in the live DTB. On this phone the two properties are:
+ * recovery boot, only the ramdisk from `recovery_ramdisk` (p32). It then
+ * describes that ramdisk in the live DTB, and a card-attached recovery boot
+ * measured on the phone reports:
  *
- *   /chosen/linux,initrd-start = 0x11000000
- *   /chosen/linux,initrd-end   = 0x11e80000   (~15.2 MB)
+ *   /chosen/linux,initrd-start = 0x08000000
+ *   /chosen/linux,initrd-end   = 0x0c9c9d00   (~76.8 MB, p32 ramdisk area)
  *
- * So holding vol+ makes the DTB say "here is a Linux initrd", and holding
- * nothing leaves the properties absent. That is the whole trigger; no key
- * polling or GPT write is involved.
+ * Those properties do not say "recovery" by themselves: an ordinary boot
+ * attaches the Android ramdisk the same way, so branching on the initrd
+ * alone sent plain power-ons down this path. What does distinguish the two
+ * is /chosen/bootargs, which the bootloader builds per boot:
+ *
+ *   recovery  enter_recovery=1 enter_erecovery=0 ... recovery_update=1
+ *             androidboot.mode=normal   normal_reset_type=VolUsbUpdate
+ *   normal    enter_recovery=0   (expected, not read from a normal-boot DTB)
+ *
+ * androidboot.mode is `normal` in both, so it cannot be the trigger. This
+ * branch therefore requires the exact space-delimited token
+ * `enter_recovery=1` and declines otherwise. Absence means "not recovery",
+ * so the branch fails closed to XNU and a plain power-on can never take the
+ * staged Image even when its header and CRC are valid.
  *
  * The Image itself is staged in `preas` (p51) by
  * tools/pra-stage-twrp-kernel.sh. The header and CRC let a blank partition
@@ -226,6 +238,39 @@ static int initrd_range(uintptr_t dtb, uintptr_t *start, uintptr_t *end)
 	return 1;
 }
 
+/* True when /chosen/bootargs carries `token` as a whole space-delimited
+ * token. A missing bootargs property, or a string with no such token, is
+ * simply false; nothing is assumed about the rest of the line. */
+static int bootarg_has(uintptr_t dtb, const char *token)
+{
+	uintptr_t node, val;
+	uint32_t len, tlen = 0;
+
+	while (token[tlen])
+		tlen++;
+	if (!fdt_ok(dtb))
+		return 0;
+	node = fdt_find_node(dtb, "/chosen");
+	if (!node)
+		return 0;
+	if (!fdt_get_prop(dtb, node, "bootargs", &val, &len))
+		return 0;
+	for (uint32_t i = 0; i + tlen <= len; i++) {
+		const char *p = (const char *)(val + i);
+		uint32_t j = 0;
+
+		if (i > 0 && p[-1] != ' ')
+			continue;
+		while (j < tlen && p[j] == token[j])
+			j++;
+		if (j != tlen)
+			continue;
+		if (i + tlen == len || p[tlen] == ' ' || p[tlen] == '\0')
+			return 1;
+	}
+	return 0;
+}
+
 /* ---- arm64 Image and staging header validation ------------------------ */
 
 static uint32_t le32(const uint8_t *p)
@@ -347,6 +392,10 @@ void pra_linux_try(uintptr_t dtb)
 	uintptr_t initrd_start, initrd_end, image_pa;
 	uint64_t dtb_size, image_size, sectors, text_offset;
 
+	/* Only a real recovery boot may take the staged Image; the initrd
+	 * properties exist on ordinary boots too. */
+	if (!bootarg_has(dtb, "enter_recovery=1"))
+		return;
 	if (!initrd_range(dtb, &initrd_start, &initrd_end))
 		return;
 
