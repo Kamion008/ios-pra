@@ -18,7 +18,7 @@ These establish CI build success and local packaging only. They do not establish
 - A cancellation attempt for run 43097286698 was rejected by GitHub twice with “Failed to cancel workflow.” Run [43210924043](https://github.com/Kamion008/ios-pra/actions/runs/43210924043) was manually started with runner `macos-15`, PRA, XNU 13.5, DEVELOPMENT, and keep-going enabled. Run 15 still appears queued.
 - Run 43210924043 completed with build and artifact upload successful, but the linked-kernel guard failed because `llvm-nm | grep -q` closed the pipe early under `pipefail` (`LLVM ERROR: ... Broken pipe`). This was a verifier pipeline bug, not evidence that the symbol is absent.
 - Updated the guard to let its producer streams finish, then run [43211905251](https://github.com/Kamion008/ios-pra/actions/runs/43211905251) completed successfully, including the linked-kernel guard, LSE check, and artifact upload. Artifact archive SHA-256: `cc96708d23f4b0c33534572028ea7744647d5922c5fb0861cc226f186e23c08c`.
-- The downloaded archive matched that digest. Its extracted `kernel.development.pra` passed `SHA256SUMS` with SHA-256 `8d76ee0eb1d60739e9767b9bd38bf2456161aa9e4a8af46899574c75d63d898b`; it contains the `PRA-PREEMPT` diagnostic string. Packaging produced `shim/pra/outxnu/pra-xnu.img`, 5,980,160 bytes, SHA-256 `9addb712e1a924cf8c3e91e234a82b2d089b62f4bd2de829795692ca8a994171`. Fastboot did not detect the target when checked, so this image has not been flashed.
+- The downloaded archive matched that digest. Its extracted `kernel.development.pra` passed `SHA256SUMS` with SHA-256 `8d76ee0eb1d60739e9767b9bd38bf2456161aa9e4a8af46899574c75d63d898b`; it contains the `PRA-PREEMPT` diagnostic string. Packaging produced `shim/pra/outxnu/pra-xnu.img`, 5,980,160 bytes, SHA-256 `9addb712e1a924cf8c3e91e234a82b2d089b62f4bd2de829795692ca8a994171`.
 
 ## 0135 pinctrl driver status
 
@@ -27,7 +27,8 @@ These establish CI build success and local packaging only. They do not establish
 
 ## Hardware result
 
-- Latest run-17 trial: `shim/pra/outxnu/pra-xnu.img` (5,980,160 bytes; SHA-256 `9addb712e1a924cf8c3e91e234a82b2d089b62f4bd2de829795692ca8a994171`) was flashed only to the `kernel` partition. Fastboot returned `OKAY` for both sending and writing, printed its AVB-footer warning that partition size was zero, and returned `OKAY` for reboot. Post-reboot screen and runtime behavior are not yet observed.
+- Latest run-17 trial: `shim/pra/outxnu/pra-xnu.img` (5,980,160 bytes; SHA-256 `9addb712e1a924cf8c3e91e234a82b2d089b62f4bd2de829795692ca8a994171`) was flashed only to the `kernel` partition. Fastboot returned `OKAY` for both sending and writing, printed its AVB-footer warning that partition size was zero, and returned `OKAY` for reboot.
+- Post-reboot photo `PXL_20261112_120801399.jpg` shows the `Waiting on <dict ... IOMedia ... Apple_HFS ...>` line and early interface/driver initialization text. No panic is visible in the photo; no root mount or userspace boot is confirmed. The apparent ordering may include retained screen output, so do not infer that all visible lines belong to one boot sequence.
 - A sandboxed fastboot attempt could not initialize libusb (`-99`). Retrying in elevated `bash` detected exactly one fastboot device.
 - Hardware flash: `shim/pra/outxnu/pra-xnu.img` was written to the `kernel` partition; `Sending` and `Writing` both returned `OKAY`. Fastboot printed an AVB-footer warning that the partition size was reported as zero, but the write completed successfully.
 - `fastboot reboot` returned `OKAY` after the flash.
