@@ -112,10 +112,35 @@ mounts=("$work/root" "${mounts[@]}")
 payload_mib=$(( trim == 1 ? 8656 : 11894 ))
 monitor & mon=$!
 
+# Linux has no way to set a symlink's mode (fchmodat with AT_SYMLINK_NOFOLLOW
+# returns EOPNOTSUPP), so rsync reports one "failed to set permissions" per
+# symlink and exits 23. Symlink modes carry no meaning on HFS+ or to XNU, so
+# those are filtered, but only after checking that every failing path really is
+# a symlink in the destination and that rsync said nothing else.
 copy() {
 	say "copying $1 -> ${2#"$work/root"}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "${extra_excludes[@]}" "$1/" "$2/"
+	local err="$work/rsync.err" rc=0 perm other
+	sudo rsync -aH --numeric-ids "${extra_excludes[@]}" "$1/" "$2/" 2>"$err" || rc=$?
+	perm=$(grep -c 'failed to set permissions on .*Operation not supported (95)' "$err" 2>/dev/null || true)
+	other=$(grep -v 'failed to set permissions on .*Operation not supported (95)' "$err" 2>/dev/null | grep -c . || true)
+	if (( other > 0 )); then
+		cat "$err" >&2
+		echo "error: rsync reported $other unexpected messages" >&2
+		exit 1
+	fi
+	if (( perm > 0 )); then
+		local notlink=0
+		while IFS= read -r p; do
+			sudo test -L "$p" || { echo "error: chmod failed on a non-symlink: $p" >&2; notlink=1; }
+		done < <(sed -n 's/.*failed to set permissions on "\(.*\)": Operation not supported (95)$/\1/p' "$err")
+		(( notlink == 0 )) || exit 1
+		echo "  ($perm symlink chmod warnings ignored; every one is a symlink)"
+	fi
+	if (( rc != 0 && rc != 23 )); then
+		echo "error: rsync exited $rc" >&2
+		exit 1
+	fi
 }
 
 # The complete root is 11.66 GB and the userdata partition is 9.57 GiB, so the
