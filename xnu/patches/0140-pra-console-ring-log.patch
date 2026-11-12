@@ -1,0 +1,416 @@
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -11,6 +11,14 @@
+  * Root reads need no boot argument beyond rd=sdhcroot0; the selected GPT
+  * partition defaults to "userdata" and can be changed with emmcroot=<name>.
+  * Writes stay disabled unless emmcwrite=1 and the partition is "userdata".
++ *
++ * The UART is gated by EL3 and the framebuffer console wraps around, so the
++ * last lines of a hung boot are lost. Boot-arg pralog=1 keeps console output
++ * in a 4 MiB ring and flushes it every 10 s to the unused erecovery_kernel
++ * partition (p27, LBA 753664). praloghalt=1 prints the previous boot's tail
++ * at probe and halts, pralogat=<seconds> prints the in-memory tail and halts
++ * that long after the log starts, and pralogidle=<seconds> does the same
++ * after that much console silence, so a hang stays on the screen.
+  */
+ #if defined(ARM64_BOARD_CONFIG_PRA)
+ #include <sys/param.h>
+@@ -67,6 +75,12 @@
+ #define TRANSFER_SINGLE_READ   0x12u   /* block count enable, read, single */
+ #define TRANSFER_SINGLE_WRITE  0x02u   /* block count enable, write, single */
+ 
++/* Console log: 4 MiB ring plus one header sector at the start of p27. */
++#define PRA_LOG_SIZE           (4u << 20)
++#define PRA_LOG_SECTORS        (1u + PRA_LOG_SIZE / 512u)
++#define PRA_LOG_TAIL           3072u
++#define PRA_LOG_MAGIC          "PRALOG1"
++
+ static vm_offset_t pra_emmc_regs;
+ static uint64_t pra_emmc_first_lba, pra_emmc_nsectors;
+ static char pra_emmc_partition_name[32] = "userdata";
+@@ -76,6 +90,26 @@
+ static LCK_GRP_DECLARE(pra_emmc_grp, "pra_emmc");
+ static LCK_MTX_DECLARE(pra_emmc_lock, &pra_emmc_grp);
+ 
++struct pra_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static char pra_log_ring[PRA_LOG_SIZE] __attribute__((aligned(64)));
++static uint64_t _Atomic pra_log_total;
++static uint64_t pra_log_erecovery_lba, pra_log_erecovery_sectors;
++static bool pra_log_enabled;
++static bool pra_log_probed;
++static int pra_log_idle_limit;          /* 10 s ticks; 0 disables the check */
++static int pra_log_at_limit;            /* 10 s ticks; 0 disables the dump */
++static char pra_log_chan;
++static char pra_log_buf[PRA_LOG_TAIL + 1];
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++
+ static inline uint32_t
+ pra_emmc_rd32(uint32_t off)
+ {
+@@ -254,16 +288,12 @@
+ }
+ 
+ static int
+-pra_emmc_write_sector(uint32_t lba, const uint8_t *sector)
++pra_emmc_write_raw(uint32_t lba, const uint8_t *sector)
+ {
+ 	struct pra_sdhci_saved s;
+ 	uint32_t status = 0;
+ 	int error = 0;
+ 
+-	if (!pra_emmc_writable || lba < pra_emmc_first_lba ||
+-	    (uint64_t)lba - pra_emmc_first_lba >= pra_emmc_nsectors) {
+-		return EROFS;
+-	}
+ 	if (pra_emmc_wait_ready()) {
+ 		printf("PRA eMMC: card busy, skip write lba=%u\n", lba);
+ 		return EBUSY;
+@@ -362,6 +392,251 @@
+ 	return error;
+ }
+ 
++/* Filesystem writes stay inside the selected root partition. */
++static int
++pra_emmc_write_sector(uint32_t lba, const uint8_t *sector)
++{
++	if (!pra_emmc_writable || lba < pra_emmc_first_lba ||
++	    (uint64_t)lba - pra_emmc_first_lba >= pra_emmc_nsectors) {
++		return EROFS;
++	}
++	return pra_emmc_write_raw(lba, sector);
++}
++
++/* Only the first PRA_LOG_SECTORS of erecovery_kernel are ever written. The
++ * lock is per sector: a 4 MiB flush must not stall filesystem I/O. */
++static int
++pra_log_write_sector(uint32_t lba, const uint8_t *sector)
++{
++	int error;
++	if (!pra_log_erecovery_sectors ||
++	    lba < pra_log_erecovery_lba ||
++	    (uint64_t)lba - pra_log_erecovery_lba >= PRA_LOG_SECTORS) {
++		return EROFS;
++	}
++	lck_mtx_lock(&pra_emmc_lock);
++	error = pra_emmc_write_raw(lba, sector);
++	lck_mtx_unlock(&pra_emmc_lock);
++	return error;
++}
++
++/* _cnputs may execute in any context. Keep this path free of locks and I/O. */
++void pra_log_append(const char *c, int size);
++void
++pra_log_append(const char *c, int size)
++{
++	if (!pra_log_enabled || size <= 0) {
++		return;
++	}
++	uint64_t at = os_atomic_add_orig(&pra_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		pra_log_ring[(at + (uint64_t)i) % PRA_LOG_SIZE] = c[i];
++	}
++}
++
++static void
++pra_log_halt(void)
++{
++	printf("PRA LOG: halted; power off and reflash to continue\n");
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
++}
++
++static void
++pra_log_print(const char *buf, uint32_t len, uint64_t total, uint32_t seq)
++{
++	if (len == 0) {
++		printf("PRA LOG: empty\n");
++		return;
++	}
++	printf("\n==== PRA LOG seq=%u total=%llu last=%u ====\n",
++	    seq, total, len);
++	printf("%s", buf);
++	printf("\n==== PRA LOG end ====\n");
++}
++
++/* Read the tail of the log left behind by the previous boot. */
++static void
++pra_log_disk_tail(void)
++{
++	struct pra_log_header h;
++	uint8_t sector[512];
++	uint32_t out = 0;
++	uint64_t avail, len, start, block;
++	uint32_t skip;
++
++	if (pra_emmc_read_sector((uint32_t)pra_log_erecovery_lba, sector)) {
++		printf("PRA LOG: header read failed\n");
++		return;
++	}
++	memcpy(&h, sector, sizeof(h));
++	if (memcmp(h.magic, PRA_LOG_MAGIC, 7) || h.version != 1 ||
++	    h.size != PRA_LOG_SIZE) {
++		printf("PRA LOG: no previous log\n");
++		return;
++	}
++	avail = MIN(h.total, (uint64_t)PRA_LOG_SIZE);
++	len = MIN(avail, (uint64_t)PRA_LOG_TAIL);
++	start = h.total - len;
++	block = (start % PRA_LOG_SIZE) / 512u;
++	skip = (uint32_t)(start & 511u);
++	while (out < len) {
++		uint32_t take;
++		if (pra_emmc_read_sector(
++		    (uint32_t)(pra_log_erecovery_lba + 1u + block), sector)) {
++			printf("PRA LOG: read failed at block %llu\n", block);
++			break;
++		}
++		take = MIN(512u - skip, len - out);
++		memcpy(pra_log_buf + out, sector + skip, take);
++		out += take;
++		skip = 0;
++		block = (block + 1) % (PRA_LOG_SIZE / 512u);
++	}
++	pra_log_buf[out] = '\0';
++	pra_log_print(pra_log_buf, out, h.total, (uint32_t)h.seq);
++}
++
++/* Print the tail of the ring this boot has been filling. */
++static void
++pra_log_memory_tail(void)
++{
++	uint64_t total = os_atomic_load(&pra_log_total, relaxed);
++	uint64_t len = MIN(total, (uint64_t)PRA_LOG_TAIL);
++	uint64_t start = total - len;
++	for (uint64_t i = 0; i < len; i++) {
++		pra_log_buf[i] = pra_log_ring[(start + i) % PRA_LOG_SIZE];
++	}
++	pra_log_buf[len] = '\0';
++	pra_log_print(pra_log_buf, (uint32_t)len, total, 0);
++}
++
++static void
++pra_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t flushed = 0, seq = 0, last_total = 0;
++	int idle = 0, ticks = 0;
++	uint8_t sector[512];
++
++	for (;;) {
++		(void)tsleep(&pra_log_chan, PZERO, "pralog", hz * 10);
++		ticks++;
++		uint64_t total = os_atomic_load(&pra_log_total, relaxed);
++		if (total != flushed) {
++			/* A full ring means only the newest PRA_LOG_SIZE bytes
++			 * still matter; skip whatever was overwritten. */
++			uint64_t pos = total - flushed >= PRA_LOG_SIZE ?
++			    total - PRA_LOG_SIZE : flushed;
++			int error = 0;
++			while (pos < total && !error) {
++				uint32_t block =
++				    (uint32_t)((pos % PRA_LOG_SIZE) / 512u);
++				uint64_t lba = pra_log_erecovery_lba + 1u + block;
++				if (lba >= pra_log_erecovery_lba +
++				    PRA_LOG_SECTORS || lba > UINT32_MAX) {
++					error = EINVAL;
++					break;
++				}
++				memcpy(sector,
++				    pra_log_ring + (size_t)block * 512u,
++				    sizeof(sector));
++				error = pra_log_write_sector((uint32_t)lba,
++				    sector);
++				pos += 512u - (pos & 511u);
++			}
++			if (!error) {
++				struct pra_log_header h = {
++					.magic = { 'P', 'R', 'A', 'L', 'O', 'G',
++						   '1', '\0' },
++					.version = 1,
++					.size = PRA_LOG_SIZE,
++					.total = total,
++					.seq = ++seq,
++				};
++				memset(sector, 0, sizeof(sector));
++				memcpy(sector, &h, sizeof(h));
++				error = pra_log_write_sector(
++				    (uint32_t)pra_log_erecovery_lba, sector);
++			}
++			if (error) {
++				printf("PRA LOG: write failed (%d), stopping\n",
++				    error);
++				return;
++			}
++			flushed = total;
++		}
++		if (pra_log_idle_limit > 0) {
++			if (total == last_total) {
++				if (++idle >= pra_log_idle_limit) {
++					pra_log_memory_tail();
++					pra_log_halt();
++				}
++			} else {
++				idle = 0;
++				last_total = total;
++			}
++		}
++		if (pra_log_at_limit > 0 && ticks >= pra_log_at_limit) {
++			pra_log_memory_tail();
++			pra_log_halt();
++		}
++	}
++}
++
++static void
++pra_log_start(void)
++{
++	int enabled = 0, halt = 0, idle = 0, at = 0;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("pralog", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("praloghalt", &halt, sizeof(halt));
++	(void)PE_parse_boot_argn("pralogidle", &idle, sizeof(idle));
++	(void)PE_parse_boot_argn("pralogat", &at, sizeof(at));
++	if (enabled != 1 && halt != 1) {
++		return;
++	}
++	if (pra_log_enabled || !pra_log_erecovery_sectors ||
++	    pra_log_erecovery_sectors < PRA_LOG_SECTORS ||
++	    pra_log_erecovery_lba + PRA_LOG_SECTORS - 1 > UINT32_MAX) {
++		return;
++	}
++	pra_log_idle_limit = idle > 0 ? (idle + 9) / 10 : 0;
++	pra_log_at_limit = at > 0 ? (at + 9) / 10 : 0;
++	pra_log_enabled = true;
++	printf("PRA LOG: erecovery_kernel first=%llu, %u sectors, idle=%d at=%d\n",
++	    pra_log_erecovery_lba, PRA_LOG_SECTORS, pra_log_idle_limit * 10,
++	    pra_log_at_limit * 10);
++	if (kernel_thread_start(pra_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		pra_log_enabled = false;
++	}
++}
++
++/* Print the previous boot's tail and stop before anything else can scroll
++ * it away. Called once the GPT lookup has found erecovery_kernel. */
++static void
++pra_log_probe(void)
++{
++	int halt = 0;
++	if (pra_log_probed) {
++		return;
++	}
++	pra_log_probed = true;
++	(void)PE_parse_boot_argn("praloghalt", &halt, sizeof(halt));
++	if (halt != 1) {
++		return;
++	}
++	if (!pra_log_erecovery_sectors) {
++		printf("PRA LOG: erecovery_kernel not found\n");
++		pra_log_halt();
++	}
++	pra_log_disk_tail();
++	pra_log_halt();
++}
++
+ static uint32_t
+ pra_emmc_le32(const uint8_t *p)
+ {
+@@ -441,6 +716,8 @@
+ 
+ 	pra_emmc_first_lba = 0;
+ 	pra_emmc_nsectors = 0;
++	pra_log_erecovery_lba = 0;
++	pra_log_erecovery_sectors = 0;
+ 	error = pra_emmc_read_sector(1, hdr);
+ 	if (error) {
+ 		return error;
+@@ -478,21 +755,33 @@
+ 		crc = pra_emmc_crc32(crc, entry, 512);
+ 		for (uint32_t j = 0; j < 4; j++) {
+ 			const uint8_t *p = entry + j * 128;
++			bool root_match, log_match;
++			uint64_t first, last;
+ 			if (p[0] == 0) {
+ 				continue;
+ 			}
+-			if (!pra_emmc_name_matches(p, pra_emmc_partition_name)) {
++			root_match = pra_emmc_name_matches(p,
++			    pra_emmc_partition_name);
++			log_match = pra_emmc_name_matches(p, "erecovery_kernel");
++			if (!root_match && !log_match) {
+ 				continue;
+ 			}
+-			uint64_t first = pra_emmc_le64(p + 32);
+-			uint64_t last = pra_emmc_le64(p + 40);
++			first = pra_emmc_le64(p + 32);
++			last = pra_emmc_le64(p + 40);
+ 			if (first < first_usable || last > last_usable || first > last) {
+ 				printf("PRA eMMC: %s out of GPT bounds\n",
+-				    pra_emmc_partition_name);
++				    root_match ? pra_emmc_partition_name :
++				    "erecovery_kernel");
+ 				return EINVAL;
+ 			}
+-			pra_emmc_first_lba = first;
+-			pra_emmc_nsectors = last - first + 1;
++			if (root_match) {
++				pra_emmc_first_lba = first;
++				pra_emmc_nsectors = last - first + 1;
++			}
++			if (log_match) {
++				pra_log_erecovery_lba = first;
++				pra_log_erecovery_sectors = last - first + 1;
++			}
+ 		}
+ 	}
+ 	if ((crc ^ ~0u) != pra_emmc_le32(hdr + 88)) {
+@@ -510,6 +799,7 @@
+ 	printf("PRA eMMC: GPT %s first=%llu sectors=%llu %s\n",
+ 	    pra_emmc_partition_name, pra_emmc_first_lba, pra_emmc_nsectors,
+ 	    pra_emmc_writable ? "writable" : "read-only");
++	pra_log_probe();
+ 	return 0;
+ }
+ 
+@@ -750,6 +1040,7 @@
+ 		printf("PRA eMMC: /dev/sdhcroot0 ready, GPT %s %s\n",
+ 		    pra_emmc_partition_name,
+ 		    pra_emmc_writable ? "writable" : "read-only");
++		pra_log_start();
+ 	}
+ 	*dev = pra_emmc_bdev;
+ 	return 0;
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -272,6 +272,9 @@
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ extern void a5xelte_log_append(const char *c, int size); /* bsd/dev/a5xelte_emmc.c */
+ #endif
++#if defined(ARM64_BOARD_CONFIG_PRA)
++extern void pra_log_append(const char *c, int size); /* bsd/dev/pra_sdhci.c */
++#endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+@@ -292,6 +295,9 @@
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	a5xelte_log_append(c, size);
+ #endif
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	pra_log_append(c, size);
++#endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;

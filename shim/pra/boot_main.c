@@ -19,6 +19,7 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "linux_boot.h"
 
 #define RAM_BASE 0x88000000UL
 #define RAM_END  0xA8000000UL
@@ -133,6 +134,11 @@ void pra_main(uintptr_t dtb)
 	__asm__ volatile("mrs %0, SCTLR_EL1" : "=r" (sctlr));
 	con_hex("EL      ", el);
 	con_hex("SCTLR   ", sctlr);
+
+	/* A recovery boot describes the TWRP ramdisk in /chosen. If a Linux
+	 * Image is staged in preas, take that branch; otherwise this returns
+	 * immediately and the XNU path below is unchanged. */
+	pra_linux_try(dtb);
 
 	uintptr_t payload_pa = (uintptr_t)__payload_start;
 	uint64_t length;

@@ -187,3 +187,209 @@ Remaining free space is 383 MiB, which is the price of keeping
 `staged_system_apps` (511 MB) and the first-boot UI. If setup hits ENOSPC the
 next levers are the staged apps or `System/Library/Fonts/LanguageSupport`
 (78 MB); the GPT resize (13.68 GiB) remains the clean fix.
+
+## The recovery kernel always comes from p30 (2026-11-12)
+
+hi6250 splits the boot image: `kernel` (p30, 24 MiB) holds the Linux kernel and
+`recovery_ramdisk` (p32, 32 MiB) holds only a ramdisk. Every TWRP build for
+Prague is therefore ramdisk-only (`kernel_size = 0`), including 3.5.2 and
+7.0.0, which is why TWRP reports the stock kernel:
+
+```
+Linux localhost 4.4.23+ #1 SMP PREEMPT Mon Nov 2 17:32:05 CST 2020 aarch64
+```
+
+Confirmed two ways rather than assumed:
+
+- The running `/proc/cmdline` is exactly p30's boot-image cmdline. TWRP's own
+  header declares `cmdline=buildvariant=eng`, and that string appears nowhere.
+- A probe image in p32 built from the **stock kernel gzip** (UTS_RELEASE
+  patched to `4.4.23X`, TWRP ramdisk, p30's load addresses) dropped the
+  bootloader into `ERROR MODE`. Restoring the p32 backup brought TWRP back
+  byte-identically. With a kernel present in p32 the bootloader rejects the
+  slot; with `kernel_size = 0` it takes kernel+cmdline from p30 and only the
+  ramdisk from p32.
+
+Consequence: a dual boot cannot come from p32. Either p30 carries a kernel
+that can kexec XNU, or the p30 loader itself boots Linux on demand. The second
+is attractive because the loader already reads the GPT and the bootloader
+attaches the p32 TWRP ramdisk + `/chosen/linux,initrd-*` when the recovery
+keys are held, so the loader can simply branch on the presence of an initrd.
+`erecovery_kernel` (p27, 24 MiB) is unused and is the natural home for the
+11.2 MiB stock `Image.gz`; it is dd-able from TWRP even though `fastboot flash`
+blocks it.
+
+PRA GPT for reference: `misc` p20, `erecovery_kernel` p27, `kernel` p30,
+`ramdisk` p31, `recovery_ramdisk` p32, `system` p53, `vendor` p56,
+`userdata` p58.
+
+## 0139 first XNU boot: HFS+ read path works (2026-11-12)
+
+`debug=0xc ... rd=sdhcroot0 emmcroot=userdata emmcprobe=1` (no `emmcwrite`)
+reaches XNU and the certificate path, then mounts the volume far enough to
+read the volume header:
+
+```
+PRA eMMC: GPT userdata first=10715136 sectors=20062208 read-only
+BSD root: sdhcroot0, major 1, minor 0
+hfs: Initializing the journal (joffset 0x4f000 sz 0x800000)...
+jnl: b(1, 0): do_jnl_io: strategy err 0x16
+jnl: b(1, 0): journal_create: failed to write journal header.
+hfs: late jnl init: failed to open/create the journal (retval 0)
+hfs_mountfsplus: hfs_late_journal_init returned (22)
+hfs_mountfs: hfs_mountfs returned error=22 for device unknown-dev
+cannot mount root, errno = 19
+```
+
+So eMMC, GPT, the HFS+ volume header, block size, journal offset and size are
+all correct. The mount stops because `hfs_vfsutils.c` deliberately exempts the
+root filesystem from the read-only journal skip:
+
+```c
+if ((hfsmp->hfs_flags & HFS_READ_ONLY) &&
+    (vfs_flags(hfsmp->hfs_mp) & MNT_ROOTFS) == 0) { ... journal_is_clean ... }
+```
+
+A read-only root therefore goes on to `journal_create()`, which writes one
+512-byte header through the **raw device** (`jnl: b(1, 0)`), not through the
+filesystem, so the write gate in the bdevsw driver is what rejects it. The
+volume itself has `kJIJournalNeedInitMask` set, which is normal for a volume
+built by `mkfs.hfsplus`: macOS initialises the journal on first mount.
+
+Next step is `emmcwrite=1 rootrw=1`, which lets that header write through and
+mounts the root read-write (`/private/var` lives on the root, see 0031).
+`tools/pra_package.sh` re-packages the CI kernel with a new `CMDLINE`; the
+boot args live in the payload, not in the Android boot header.
+
+### Result: root mounts read-write, launchd dies on code signing
+
+`cmds emmcwrite=1 rootrw=1` completes the whole storage stack:
+
+```
+PRA eMMC: host base=ff390000 version=1002 clock=7 present=1fff0000 power=0
+PRA eMMC: GPT userdata first=10715136 sectors=20062208 writable
+hfs: Initializing the journal (joffset 0x4f000 sz 0x800000)...
+hfs: mounted iOSRoot on device b(1, 0)
+hfs: set VeryLowDisk: freeblks:98201, dangerlimit:125365
+A5XELTE: root volume is not authenticated (error 25); continuing unsealed
+load_init_program: attempting to load /sbin/launchd
+panic(cpu 0 ...): unexpected SIGKILL of launchd (CS_KILLED)
+    namespace 9 code 0x8e description none
+```
+
+So the 512-byte journal header write through the polled single-sector path
+works, HFS+ mounts the 9.79 GiB volume read-write, and launchd is found and
+exec'd. The panic is the same one the donor port documented in `NOTES.md:174`,
+where `namespace 9 code 0xe` is `OS_REASON_EXEC / EXEC_EXIT_REASON_WRONG_PLATFORM`:
+the kernel is built `XNU_TARGET_OS_OSX`, so an iOS-platform binary with no
+`posix_spawnattr` platform is treated as alien and refused, killing init.
+
+The fix is a boot arg, not a code change - `unentitled_ios_sim_launch=1`
+(`TUNABLE(bool, unentitled_ios_sim_launch, ...)` in `bsd/kern/kern_exec.c:196`,
+DEBUG/DEVELOPMENT only, and the CI kernel is `kernel.development.pra`). The
+donor's working set also carries `launchd_unsecure_cache=1 ignition_level=1
+wdt_test=no_user_checkin wdt=-1` (`NOTES.md:41`), so PRA uses:
+
+```
+debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress
+rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1
+unentitled_ios_sim_launch=1 launchd_unsecure_cache=1
+ignition_level=1 wdt_test=no_user_checkin wdt=-1
+```
+
+Note the `0x8e` vs the donor's `0xe`: same low byte, so the same
+`EXEC_EXIT_REASON_WRONG_PLATFORM`; treat the source enum, not the printed
+value, as authoritative.
+
+## Loader-based dual boot
+
+The p30 loader now branches on the recovery initrd instead of always entering
+XNU. `vol+` at power-on makes the Huawei bootloader attach the TWRP ramdisk
+and add `/chosen/linux,initrd-start` = `0x11000000` / `linux,initrd-end` =
+`0x11e80000` to the live DTB. `pra_linux_try()` walks the FDT (4- or 8-byte
+cells) and, when both properties are present and sane, tries the staged
+Image. A normal boot has no such properties and reaches the XNU path with no
+extra reads and no console output from the new code.
+
+Scratch layout in `preas` (p51, first absolute LBA 2097152, 880 MiB):
+
+| Offset | Content |
+| --- | --- |
+| LBA 2097152, 512 B | `struct pra_linux_header` (`PRALNX01`, version 1) |
+| +512 .. +2 MiB | zero; keeps the Image start on a 2 MiB boundary |
+| LBA 2101248 (= 0x40200000) | uncompressed arm64 `Image` |
+
+The header carries `header_size` 512, `image_lba` 2101248 (checked against the
+compile-time constant), `image_size`, a zlib CRC-32 of exactly those bytes,
+`flags` 0 and `load_addr` 0x30000000. Any mismatch, a blank page or a failed
+CRC returns to XNU; the loader never writes storage and never reads p30 or
+p58. The constants and the struct live in `shim/pra/linux_boot.h`, and
+`tools/pra-stage-twrp-kernel.sh [P30_DUMP]` extracts the Image from p30's
+Android boot image v0 (`kernel_size` at 8, page 2048, gzip at 2048),
+gunzips it, writes header + Image to p51 with toybox `dd bs=1048576`, and
+compares a SHA-256 readback. It refuses to run outside TWRP and refuses to
+write unless p51 still starts at LBA 2097152 (and, when it has to read p30
+itself, unless p30 still starts at 901120 and is 24 MiB).
+
+Load placement follows the arm64 boot protocol, which aligns the base
+address, not `text_offset`: the Image goes to `0x30000000 + text_offset` and
+the entry is that same address (the Image's first instruction is a branch).
+Modern kernels have `text_offset` 0 and land at 0x30000000; the stock 4.4.23
+Image is expected to report 0x80000 because Huawei's released 4.4 source sets
+`TEXT_OFFSET := 0x00080000`, so it would land at 0x30080000. (That header
+value was not read from a p30 dump in this session.) A literal
+`text_offset % 2 MiB == 0` check would reject that stock Image, so the loader
+instead requires `text_offset < 2 MiB` and checks the resulting placement. It
+also validates the `ARM\x64` magic at byte 56, that the effective
+`image_size` is at least the file size and fits the low bank, and that neither
+the image nor its BSS overlaps the initrd or the DTB.
+
+The window cannot collide with recovery state: the ramdisk is at 0x11000000
+and ends near 0x11e80000, the live DTB is around 0x07e00000, the loader and
+its appended XNU payload occupy 0x480000..~0x1500000, and the display
+scanout is at 0x5D000000. Even 128 MiB above 0x30080000 ends at 0x38080000,
+leaving a ~0x25000000 gap to the framebuffer and staying below the
+0x60000000 end of the first RAM bank.
+
+Reads reuse the proven polled SDHCI CMD17 path (`shim/pra/sdhci_read.c`,
+mirroring `probe.c`), one 512-byte sector at a time, read-only. A 35 MB Image
+is about 70,000 commands, so the loader stops the bootloader watchdog first
+(the same WDT sequence `probe.c` uses) and prints a progress line every
+4 MiB. The bulk transfer happens only after the first sector validates, so a
+wrong image fails after one command. The Image and DTB are cleaned to the
+point of coherency, then `linux_jump.S` enters with x0 = DTB, x1..x3 = 0, and
+SCTLR_EL1.M/C/I cleared.
+
+Verified locally: the loader builds with the existing
+`shim/pra/build-xnu.sh` (clang, `-Werror`), `loader.bin` is 12,056 bytes and
+`pra-xnu.img` is 5,992,448 bytes. Untested: the actual Linux jump. No device
+was attached, so nothing here establishes that the stock 4.4.23 kernel
+accepts this handoff at 0x30080000, that its decompressed Image the script
+extracts has the assumed header fields, or that the 70,000-read transfer
+finishes reliably. `xnu/patches/*` is untouched.
+
+## Persistent console log (0140)
+
+The UART is gated by EL3 and the framebuffer console wraps back to the top,
+so the last lines of a hung boot are lost and the photo only ever shows the
+truncated line where output stopped. Patch `0140-pra-console-ring-log.patch`
+keeps `_cnputs` bytes in a 4 MiB ring in `bsd/dev/pra_sdhci.c` and a kernel
+thread flushes it every 10 s to `erecovery_kernel` p27 (absolute LBA 753664,
+24 MiB): sector 0 is a `PRALOG1` header with `total`/`seq`, sectors 1..8192
+are the ring. Only `erecovery_kernel` is written, and only its first 8193
+sectors; the filesystem write gate in `pra_emmc_write_sector` is unchanged
+(`pra_emmc_write_raw` is now shared, `pra_log_write_sector` range-checks and
+takes the same lock per sector so a 4 MiB flush cannot stall HFS).
+
+Boot args:
+
+- `pralog=1` - keep the ring and flush it (no extra console output).
+- `praloghalt=1` - at probe, print the previous boot's tail from p27 and halt
+  (stays on screen; for a hang where nothing else can run).
+- `pralogat=<s>` - print the in-memory tail and halt `<s>` seconds after the
+  log starts. Deterministic capture of the current boot.
+- `pralogidle=<s>` - same, after `<s>` seconds without new console output.
+
+Trade-off: p27 holds the stock eRecovery kernel, so eRecovery stops working
+once the log is enabled. That is acceptable here - eRecovery must never be
+used on this device (it can wipe userdata) - and nothing else reads p27.

@@ -33,10 +33,14 @@ CFLAGS="-O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie
 $CC $CFLAGS -c start.S      -o "$OUT/start.o"
 $CC $CFLAGS -c console.c    -o "$OUT/console.o"
 $CC $CFLAGS -c boot_main.c  -o "$OUT/boot_main.o"
+$CC $CFLAGS -c linux_boot.c -o "$OUT/linux_boot.o"
+$CC $CFLAGS -c sdhci_read.c -o "$OUT/sdhci_read.o"
 $CC $CFLAGS -c xnu_jump.S   -o "$OUT/xnu_jump.o"
+$CC $CFLAGS -c linux_jump.S -o "$OUT/linux_jump.o"
 
 $LD -static -T xnu_boot.ld --build-id=none \
-    "$OUT/start.o" "$OUT/console.o" "$OUT/boot_main.o" "$OUT/xnu_jump.o" \
+    "$OUT/start.o" "$OUT/console.o" "$OUT/boot_main.o" "$OUT/linux_boot.o" \
+    "$OUT/sdhci_read.o" "$OUT/xnu_jump.o" "$OUT/linux_jump.o" \
     -o "$OUT/loader.elf"
 
 if $NM -u "$OUT/loader.elf" | grep -q .; then
