@@ -678,3 +678,88 @@ staged Linux header and Image occupy LBA 2097152 and 2101248 plus ~71,000
 sectors, so a ring at, say, LBA 2199552 does not overlap them. That is a
 0140 code change (`pra_log_erecovery_lba`) plus a rebuild, not a runtime
 setting.
+
+## SMP is already wired; only `cpus=1` holds it back (2026-11-12)
+
+Nothing in the tree needs to be written to run more than one core:
+
+- `machine_routines.c` clamps `cpus=N` to `SWEET_SMP_MAX_CPUS` (8) and PRA.h
+  already defines SWEET/A5XELTE, so the SMP topology parser builds all eight
+  entries from `mkadt_pra.py`'s `/cpus` nodes (MPIDR 0..3 and 0x100..0x103).
+- `iokit/Kernel/arm/SweetCPU.cpp` is the A5XELTE implementation:
+  `startAll` starts each `processor_start()` and waits for `initCPU`, which
+  sends a self-SGI through the GICv2 memory-mapped interface
+  (`a5xelte_send_self_ipi`) and verifies `cpu_signal`; `startCPU` issues
+  `PSCI CPU_ON` (SMC, SMCCC 1.0) with the physical address of
+  `sweet_secondary_entry` in `osfmk/arm64/start.s`.
+- `cpu_start()` already cleans `CpuDataEntries`, `CpuData`, `ResetHandlerData`,
+  `BootArgs`, `sysreg_restore`, `cpu_ttep` and `bootstrap_pagetables` to PoC
+  before CPU_ON, which is what `sweet_secondary_entry`/`LowResetVectorBase`
+  need with the MMU off.
+- `pexpert/arm/pe_fiq.c` runs `pe_init_fiq()` per CPU (`PE_init_cpu()` in
+  `arm_cpu_init()`), maps the GICv2 pair from the ADT (`0xE82B1000` /
+  `0xE82B2000` offsets from SOC_BASE) and records each core's banked
+  `ITARGETSR0` mask for later cross-CPU SGIs.
+
+So the whole SMP path is present and only the boot argument `cpus=1` in the
+payload keeps seven cores parked. `cpus=4` selects the four 2.1 GHz cores of
+cluster 0 (logical 0..3, MPIDR 0..3); `cpus=8` adds cluster 1 (MPIDR
+0x100..0x103).
+
+Because the cmdline lives in the payload header (`tools/mkpayload.py`,
+`CMDLINE = 0x48`), it can be changed without rebuilding the kernel: in the
+raw boot image the payload starts at file offset `2048 + 0x80000` and the
+cmdline at `+0x48`. `pra-xnu-smp4-raw.img` and `pra-xnu-smp8-raw.img` are the
+known-good launchd image with only that one byte changed (`0x80860`, `1` ->
+`4`/`8`), SHA-256 `b438c2e8…` and `b5aa1d2e…`.
+
+Risks to watch on the first multi-core boot (all visible on the fb console):
+
+- `PSCI CPU_ON rc=` non-zero (`-3` = NOT_SUPPORTED, `-4` = INVALID_PARAMS)
+  means the ATF conduit differs (HVC vs SMC) or rejects the entry address.
+- `cpu=N startup timeout (reset/MMU/GIC/SGI)` means the core was powered on
+  but never reached `initCPU`; the entry/MMU/GICv2 ordering is then next.
+- `cpu=N NOT registered (IOKit matching timeout)` means the ADT CPU node did
+  not match the SweetCPU driver (MPIDR/logical-id mismatch).
+
+Since the ring log writes p27 and p27 is the boot image, test these without
+`pralog=1`; the fb console is the log.
+
+## SpringBoard's 0x0 display is a missing AppleCLCD match (2026-11-12)
+
+The launchd payload's userland boot is alive but SpringBoard never stays up:
+
+```
+STR *** Terminating app due to uncaught exception 'NSInternalInconsistencyException',
+    reason: 'We expect a valid bounds for configuration: <FBDisplayConfiguration'
+STR CRDisplay.name = Wireless;
+STR CRDisplay.deviceName = wireless0;
+STR CRDisplay.currentMode = <FBDisplayMode: 0x...; 0x0 0Hz sRGB SD...>
+STR bounds = {{0, 0}, {0, 0}};
+CRASH SpringBoard Reason ns 2 code 0x6! (none)      # SIGABRT
+SpringBoard crashed: Too many corpses being created.
+```
+
+- `ns 2 code 0x6` is `OS_REASON_SIGNAL` / SIGABRT, i.e. the exception above.
+  launchd then refuses to respawn SpringBoard ("Too many corpses being
+  created") and the phone keeps cycling xpcproxy/fairplayd/bluetoothd.
+- `CRDisplay.name = Wireless` / `deviceName = wireless0` is CoreDisplay's
+  *virtual* display placeholder. The real display never appeared because the
+  kernel never published an `IOMobileFramebuffer`.
+- Root cause: the AppleCLCD personality in `iokit/KernelConfigTables.cpp`
+  matched only `samsung,a5xelte-display` / `samsung,dreamlte-display` on an
+  A5XELTE build, but `tools/mkadt_pra.py` publishes `/arm-io/disp0` as
+  `hisilicon,hi6250-display`. No match -> `SweetFramebuffer.cpp` never starts
+  -> no IOMobileFramebuffer -> CoreDisplay invents the 0x0 wireless display.
+- Fix: patch `0141-pra-display-name-match.patch` adds
+  `'hisilicon,hi6250-display'` to that IONameMatch list for
+  `ARM64_BOARD_CONFIG_PRA` (next to the a5xelte/dreamlte names). The driver
+  itself already handles PRA: `AppleCLCD::start` uses `A5_FB_PHYS`
+  (0x5D000000), `A5_FB_WIDTH/HEIGHT` (1080x1920) and `A5_FB_STRIDE` (4320)
+  from PRA.h, and reports `SWEET FB: AppleCLCD ...` when it starts.
+- Consequence: the fb console never gives way to CoreAnimation yet. Once
+  AppleCLCD matches, its first swap mutes the text console
+  (`sweet_console_muted`) and publishes the 1080x1920 surface.
+
+The display fix needs a kernel rebuild, so it rides with the SMP test:
+`CMDLINE='... cpus=8 ...' tools/pra_package.sh out/ci/kernel.development.pra`.
