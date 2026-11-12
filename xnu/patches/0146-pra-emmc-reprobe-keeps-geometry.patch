@@ -1,0 +1,68 @@
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -1029,6 +1029,27 @@
+ 	return 0;
+ }
+ 
++/* pra_emmc_find_root_partition() clears the geometry on entry, so a re-probe
++ * that fails on a transiently busy card erased a partition table the device
++ * had already parsed: every later read returned EINVAL (22) and the root could
++ * never mount again. Keep the last good values when a later pass fails. */
++static int
++pra_emmc_find_root_partition_keep(void)
++{
++	uint64_t root_lba = pra_emmc_first_lba, root_sectors = pra_emmc_nsectors;
++	uint64_t log_lba = pra_log_erecovery_lba;
++	uint64_t log_sectors = pra_log_erecovery_sectors;
++	int error = pra_emmc_find_root_partition();
++
++	if (error) {
++		pra_emmc_first_lba = root_lba;
++		pra_emmc_nsectors = root_sectors;
++		pra_log_erecovery_lba = log_lba;
++		pra_log_erecovery_sectors = log_sectors;
++	}
++	return error;
++}
++
+ static int
+ pra_emmc_map_host(void)
+ {
+@@ -1065,6 +1086,14 @@
+ 		printf("PRA eMMC: unexpected SDHCI spec version %u\n", version & 0xffu);
+ 	}
+ 	pra_emmc_ensure_clock();
++	/* CMD18 is worth its keep only while it behaves: a multi-block transfer
++	 * that leaves the DAT line asserted blocks every later command with
++	 * EBUSY. emmcmulti=0 forces the per-sector path without a rebuild. */
++	int multi = 1;
++	if (PE_parse_boot_argn("emmcmulti", &multi, sizeof(multi)) && multi == 0) {
++		pra_emmc_multi_ok = false;
++		printf("PRA eMMC: CMD18 disabled by boot arg\n");
++	}
+ 	/* With an explicit LBA the ring can start here, before the GPT read, so
+ 	 * a failure inside that read is still on the disk afterwards. Without
+ 	 * one it starts in pra_emmc_rootdev() as before, keeping the normal
+@@ -1078,8 +1107,11 @@
+ void
+ pra_emmc_probe(void)
+ {
++	if (pra_emmc_ready) {
++		return;
++	}
+ 	if (!pra_emmc_map_host()) {
+-		(void)pra_emmc_find_root_partition();
++		(void)pra_emmc_find_root_partition_keep();
+ 	}
+ }
+ 
+@@ -1284,7 +1316,7 @@
+ 		if (error) {
+ 			return error;
+ 		}
+-		error = pra_emmc_find_root_partition();
++		error = pra_emmc_find_root_partition_keep();
+ 		if (error) {
+ 			return error;
+ 		}
