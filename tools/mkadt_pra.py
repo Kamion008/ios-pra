@@ -66,10 +66,16 @@ def build():
     # hole at 0x87b00000..0x87b07fff that is not System RAM. boot_args carries
     # one contiguous physBase/memSize pair, and XNU would put the hole in its
     # VM free list, so start the window above it. 0x88000000 is 2 MiB aligned
-    # and 0x88000000..0xa8000000 is contiguous (matches the donor's 512 MiB
-    # sizing, which already booted iOS userland on the A5).
+    # and 0x88000000..0xdfffffff is one contiguous System RAM range in
+    # live/iomem.txt, so the only limit is that end address.
+    #
+    # 1 GiB here (0x88000000..0xc8000000) is the first step up from the 512 MiB
+    # the donor used; the ceiling for this single window is 1.375 GiB. The
+    # bootstrap page tables are sized for 2 GiB (osfmk/arm/pmap/pmap.h
+    # BOOTSTRAP_TABLE_SIZE), so no kernel change is needed to grow further.
+    # Keep in sync with RAM_END in shim/pra/boot_main.c.
     set_prop(chosen, 'dram-base', mkadt.u64(0x88000000))
-    set_prop(chosen, 'dram-size', mkadt.u64(0x20000000))
+    set_prop(chosen, 'dram-size', mkadt.u64(0x40000000))
     set_prop(chosen, 'firmware-version', mkadt.cstr('pra-hi6250-entry'))
     set_prop(chosen, 'system-firmware-version', mkadt.cstr('pra-hi6250-entry'))
     cpus = child(root, 'cpus')
