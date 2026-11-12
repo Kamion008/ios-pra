@@ -1,0 +1,89 @@
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -14,10 +14,14 @@
+  *
+  * The UART is gated by EL3 and the framebuffer console wraps around, so the
+  * last lines of a hung boot are lost. Boot-arg pralog=1 keeps console output
+- * in a 4 MiB ring and flushes it every 10 s to the unused erecovery_kernel
+- * partition (p27, LBA 753664). praloghalt=1 prints the previous boot's tail
+- * at probe and halts, pralogat=<seconds> prints the in-memory tail and halts
+- * that long after the log starts, and pralogidle=<seconds> does the same
++ * in a 4 MiB ring and flushes it every 10 s to the tail of the unused
++ * erecovery_kernel partition (p27, LBA 753664 + 49152 - 8193). The tail
++ * matters: LK loads the boot image from the start of that partition, so a
++ * ring there would destroy the next power-on. praloglba=<LBA> overrides the
++ * target and starts the ring before the GPT is read, which is the only way to
++ * see a failure inside that read. praloghalt=1 prints the previous boot's
++ * tail at probe and halts, pralogat=<seconds> prints the in-memory tail and
++ * halts that long after the log starts, and pralogidle=<seconds> does the same
+  * after that much console silence, so a hang stays on the screen.
+  *
+  * Once the root is mounted writable the filesystem driver and this log
+@@ -780,6 +784,22 @@
+ 	}
+ }
+ 
++/* praloglba=<absolute LBA> points the ring at a fixed sector instead of at the
++ * tail of erecovery_kernel. It exists for the one case the GPT path cannot
++ * cover: a boot that dies before, or inside, the partition-table read, which
++ * is exactly when a log is worth most. Returns true when it was supplied. */
++static bool
++pra_log_pick_explicit_lba(void)
++{
++	int lba = 0;
++	if (!PE_parse_boot_argn("praloglba", &lba, sizeof(lba)) || lba <= 0) {
++		return false;
++	}
++	pra_log_erecovery_lba = (uint64_t)lba;
++	pra_log_erecovery_sectors = PRA_LOG_SECTORS;
++	return true;
++}
++
+ static void
+ pra_log_start(void)
+ {
+@@ -801,7 +821,7 @@
+ 	pra_log_idle_limit = idle > 0 ? (idle + 9) / 10 : 0;
+ 	pra_log_at_limit = at > 0 ? (at + 9) / 10 : 0;
+ 	pra_log_enabled = true;
+-	printf("PRA LOG: erecovery_kernel first=%llu, %u sectors, idle=%d at=%d\n",
++	printf("PRA LOG: lba=%llu, %u sectors, idle=%d at=%d\n",
+ 	    pra_log_erecovery_lba, PRA_LOG_SECTORS, pra_log_idle_limit * 10,
+ 	    pra_log_at_limit * 10);
+ 	if (kernel_thread_start(pra_log_thread, NULL, &thread) == KERN_SUCCESS) {
+@@ -975,8 +995,18 @@
+ 				pra_emmc_nsectors = last - first + 1;
+ 			}
+ 			if (log_match) {
+-				pra_log_erecovery_lba = first;
+-				pra_log_erecovery_sectors = last - first + 1;
++				uint64_t sectors = last - first + 1;
++				/* Keep the ring at the end of the partition. The
++				 * default target, erecovery_kernel, is also where
++				 * LK loads the boot image, so a ring at its start
++				 * destroys the next power-on; the tail only eats
++				 * space the 24 MiB slot never uses. */
++				if (sectors >= PRA_LOG_SECTORS) {
++					pra_log_erecovery_lba =
++					    first + sectors - PRA_LOG_SECTORS;
++					pra_log_erecovery_sectors =
++					    PRA_LOG_SECTORS;
++				}
+ 			}
+ 		}
+ 	}
+@@ -1035,6 +1065,13 @@
+ 		printf("PRA eMMC: unexpected SDHCI spec version %u\n", version & 0xffu);
+ 	}
+ 	pra_emmc_ensure_clock();
++	/* With an explicit LBA the ring can start here, before the GPT read, so
++	 * a failure inside that read is still on the disk afterwards. Without
++	 * one it starts in pra_emmc_rootdev() as before, keeping the normal
++	 * boot path unchanged. */
++	if (pra_log_pick_explicit_lba()) {
++		pra_log_start();
++	}
+ 	return 0;
+ }
+ 
