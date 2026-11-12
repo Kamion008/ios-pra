@@ -59,21 +59,35 @@ fi
 # TWRP auto-mounts /data; unmount so nothing writes behind the dd.
 $adb shell "umount /data 2>/dev/null; umount /sdcard 2>/dev/null; true"
 
+# TWRP's dd (toolbox) rejects "4M" and has conv=fsync compiled out, and hiding
+# its stderr made a failed stream look like a fast success. Use a numeric block
+# size, keep the output, and sync from the shell afterwards.
 echo "streaming image..."
 if command -v pv >/dev/null; then
-    pv "$img" | $adb shell "dd of=$dev bs=4M conv=fsync 2>/dev/null"
+    if ! pv -f -s "$img_bytes" "$img" | $adb shell "dd of=$dev bs=1048576"; then
+        echo "error: streaming to $dev failed" >&2
+        exit 1
+    fi
 else
-    cat "$img" | $adb shell "dd of=$dev bs=4M conv=fsync 2>/dev/null"
+    if ! cat "$img" | $adb shell "dd of=$dev bs=1048576"; then
+        echo "error: streaming to $dev failed" >&2
+        exit 1
+    fi
 fi
 $adb shell "sync"
 
-# Compare the HFS+ volume header region (offset 1024, 2 KiB) on both sides.
-$adb exec-out "dd if=$dev bs=1024 skip=1 count=2 2>/dev/null" > /tmp/pra-stage-readback.bin
-dd if="$img" bs=1024 skip=1 count=2 2>/dev/null > /tmp/pra-stage-source.bin
-if cmp -s /tmp/pra-stage-readback.bin /tmp/pra-stage-source.bin; then
-    echo "readback matches (HFS+ volume header at 1024)"
-else
-    echo "error: readback differs from the image" >&2
-    exit 1
-fi
+# The primary volume header (offset 1024) and the alternate one (1024 bytes
+# before the end) are both written sequentially, so comparing them proves the
+# write started and ended where it should.
+for spec in "primary 1 2" "alternate $((userdata_bytes / 1024 - 1)) 1"; do
+    set -- $spec
+    name=$1 skip=$2 count=$3
+    $adb exec-out "dd if=$dev bs=1024 skip=$skip count=$count 2>/dev/null" > "/tmp/pra-stage-$name.bin"
+    dd if="$img" bs=1024 skip=$skip count=$count 2>/dev/null > "/tmp/pra-stage-source.bin"
+    if ! cmp -s "/tmp/pra-stage-$name.bin" "/tmp/pra-stage-source.bin"; then
+        echo "error: $name volume header readback differs from the image" >&2
+        exit 1
+    fi
+    echo "readback matches: $name volume header"
+done
 echo "done; boot XNU with rd=sdhcroot0 emmcwrite=1"
