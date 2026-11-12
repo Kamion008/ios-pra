@@ -1,0 +1,285 @@
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -37,6 +37,7 @@
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/sched_prim.h>
++#include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+@@ -76,10 +77,20 @@
+ #define SDHCI_ERROR_BITS       (0x1fffu << 16)
+ 
+ #define CMD_R1_DATA_READ       0x113Au /* CMD17, response R1, data present */
++#define CMD_R1_MULTI_READ      0x123Au /* CMD18, response R1, data present */
+ #define CMD_R1_DATA_WRITE      0x183Au /* CMD24, response R1, data present */
+ #define TRANSFER_SINGLE_READ   0x12u   /* block count enable, read, single */
++#define TRANSFER_MULTI_READ    0x36u   /* count enable, read, multi, auto CMD12 */
+ #define TRANSFER_SINGLE_WRITE  0x02u   /* block count enable, write, single */
+ 
++/* Largest read issued as one CMD18. The 24 MiB/s the card sustains is not the
++ * limit here: every 512-byte CMD17 costs a full command setup plus a poll for
++ * CMD complete and one for buffer-ready, so an iOS page-in (4 KiB, eight
++ * sectors) paid that eight times. One CMD18 per 64 KiB turns that into one
++ * command per sixteen pages. 64 KiB of bounce buffer then covers a whole
++ * 16-page cluster read. */
++#define PRA_MULTI_MAX          64u
++
+ /* Console log: 4 MiB ring plus one header sector at the start of p27. */
+ #define PRA_LOG_SIZE           (4u << 20)
+ #define PRA_LOG_SECTORS        (1u + PRA_LOG_SIZE / 512u)
+@@ -92,6 +103,13 @@
+ static dev_t pra_emmc_bdev;
+ static bool pra_emmc_ready;
+ static bool pra_emmc_writable;
++/* Multi-block reads stay enabled unless the controller rejects one; the
++ * fallback is the old single-sector path, so a wrong guess costs one command
++ * and a warning, never a boot. */
++static bool pra_emmc_multi_ok = true;
++static uint8_t pra_emmc_multi_buf[PRA_MULTI_MAX * 512u] __attribute__((aligned(64)));
++static bool pra_emmc_stats;
++static uint64_t pra_emmc_stat_bytes, pra_emmc_stat_cmds, pra_emmc_stat_ns;
+ static LCK_GRP_DECLARE(pra_emmc_grp, "pra_emmc");
+ static LCK_MTX_DECLARE(pra_emmc_lock, &pra_emmc_grp);
+ 
+@@ -139,6 +157,18 @@
+ 	*(volatile uint16_t *)(pra_emmc_regs + off) = value;
+ }
+ 
++static inline uint8_t
++pra_emmc_rd8(uint32_t off)
++{
++	return *(volatile uint8_t *)(pra_emmc_regs + off);
++}
++
++static inline void
++pra_emmc_wr8(uint32_t off, uint8_t value)
++{
++	*(volatile uint8_t *)(pra_emmc_regs + off) = value;
++}
++
+ /* Present State bits 0/1 are Command Inhibit (CMD/DAT). The card can stay
+  * busy for a while after a write, so poll instead of failing immediately. */
+ static int
+@@ -292,6 +322,157 @@
+ 	return error;
+ }
+ 
++/* Recover from a rejected multi-block transfer: reset the CMD and DAT lines so
++ * the next single-sector read starts from a clean command state. */
++static void
++pra_emmc_abort_data(void)
++{
++	pra_emmc_wr8(SDHCI_SOFTWARE_RESET, 0x6u);       /* CMD | DAT */
++	for (unsigned i = 0; i < 200000; i++) {
++		if (!(pra_emmc_rd8(SDHCI_SOFTWARE_RESET) & 0x6u)) {
++			break;
++		}
++	}
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	pra_emmc_ensure_clock();
++}
++
++/* One CMD18 for up to PRA_MULTI_MAX sectors. The block count register drives
++ * how much the card sends; auto CMD12 stops the transfer, so there is no
++ * separate STOP command. The port still has to be drained one 512-byte block
++ * at a time, but the command/response overhead is paid once per chunk. */
++static int
++pra_emmc_read_multi(uint32_t lba, uint8_t *dst, uint32_t nblocks)
++{
++	struct pra_sdhci_saved s;
++	uint32_t status = 0;
++	int error = 0;
++
++	if (pra_emmc_wait_ready()) {
++		printf("PRA eMMC: card busy, skip read lba=%u\n", lba);
++		return EBUSY;
++	}
++
++	pra_emmc_save(&s);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_SIGNAL_EN, 0);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS_EN, 0x7ffu);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	pra_emmc_wr16(SDHCI_TIMEOUT_CONTROL, 0xeu);
++	pra_emmc_wr16(SDHCI_BLOCK_SIZE, 512);
++	pra_emmc_wr16(SDHCI_BLOCK_COUNT, (uint16_t)nblocks);
++	pra_emmc_wr32(SDHCI_ARGUMENT, lba);
++	pra_emmc_wr16(SDHCI_TRANSFER_MODE, TRANSFER_MULTI_READ);
++	__asm__ volatile("dsb sy" : : : "memory");
++	pra_emmc_wr16(SDHCI_COMMAND, CMD_R1_MULTI_READ);
++
++	for (unsigned i = 0; i < 2000000; i++) {
++		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & SDHCI_ERROR_BITS) {
++			error = EIO;
++			break;
++		}
++		if (status & NORMAL_CMD_COMPLETE) {
++			break;
++		}
++	}
++	if (error) {
++		printf("PRA eMMC: CMD18 lba=%u command error status=%x\n", lba, status);
++		goto out;
++	}
++	if (!(status & NORMAL_CMD_COMPLETE)) {
++		printf("PRA eMMC: CMD18 lba=%u command timeout status=%x\n", lba, status);
++		error = ETIMEDOUT;
++		goto out;
++	}
++	if (pra_emmc_rd32(SDHCI_RESPONSE0) & 0xfdffe008u) {
++		printf("PRA eMMC: CMD18 lba=%u card error r1=%x\n",
++		    lba, pra_emmc_rd32(SDHCI_RESPONSE0));
++		error = EIO;
++		goto out;
++	}
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, NORMAL_CMD_COMPLETE);
++
++	for (uint32_t b = 0; b < nblocks; b++) {
++		uint32_t data[128];
++
++		error = ETIMEDOUT;
++		for (unsigned i = 0; i < 2000000; i++) {
++			status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++			if (status & SDHCI_ERROR_BITS) {
++				error = EIO;
++				break;
++			}
++			if (status & NORMAL_BUFFER_READ_READY) {
++				error = 0;
++				break;
++			}
++		}
++		if (error) {
++			printf("PRA eMMC: CMD18 lba=%u block %u status=%x\n",
++			    lba, b, status);
++			goto out;
++		}
++		for (unsigned i = 0; i < 128; i++) {
++			data[i] = pra_emmc_rd32(SDHCI_BUFFER);
++		}
++		memcpy(dst + (uint64_t)b * 512u, data, sizeof(data));
++	}
++
++	error = ETIMEDOUT;
++	for (unsigned i = 0; i < 2000000; i++) {
++		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & SDHCI_ERROR_BITS) {
++			error = EIO;
++			break;
++		}
++		if (status & NORMAL_TRANSFER_COMPLETE) {
++			error = 0;
++			break;
++		}
++	}
++	if (error) {
++		printf("PRA eMMC: CMD18 lba=%u transfer status=%x\n", lba, status);
++		goto out;
++	}
++
++out:
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	if (error) {
++		pra_emmc_abort_data();
++	} else {
++		(void)pra_emmc_wait_ready();
++	}
++	pra_emmc_restore(&s);
++	return error;
++}
++
++/* emmcstats=1 reports the achieved rate, so the gain over per-sector reads is
++ * measured on the phone instead of guessed. */
++static void
++pra_emmc_note_io(uint32_t bytes, uint32_t cmds, uint64_t start)
++{
++	uint64_t delta, ns;
++
++	if (!pra_emmc_stats || bytes == 0) {
++		return;
++	}
++	delta = mach_absolute_time() - start;
++	absolutetime_to_nanoseconds(delta, &ns);
++	pra_emmc_stat_bytes += bytes;
++	pra_emmc_stat_cmds += cmds;
++	pra_emmc_stat_ns += ns;
++	if (pra_emmc_stat_bytes >= (8u << 20)) {
++		uint64_t kib = pra_emmc_stat_bytes >> 10;
++		uint64_t kbs = pra_emmc_stat_ns ?
++		    (pra_emmc_stat_bytes * 1000000000ull) / pra_emmc_stat_ns / 1024ull : 0;
++		printf("PRA eMMC: %llu KiB, %llu cmds, %llu KiB/s\n",
++		    kib, pra_emmc_stat_cmds, kbs);
++		pra_emmc_stat_bytes = 0;
++		pra_emmc_stat_cmds = 0;
++		pra_emmc_stat_ns = 0;
++	}
++}
++
+ static int
+ pra_emmc_write_raw(uint32_t lba, const uint8_t *sector)
+ {
+@@ -910,14 +1091,42 @@
+ 		error = EIO;
+ 		goto done;
+ 	}
++	bool is_read = (buf_flags(bp) & B_READ) != 0;
++	uint32_t cmds = 0;
++	uint64_t t0 = pra_emmc_stats ? mach_absolute_time() : 0;
+ 	lck_mtx_lock(&pra_emmc_lock);
+ 	for (uint32_t n = 0; n < count;) {
+ 		uint64_t pos = off + n;
+ 		uint32_t skip = pos & 511u;
+ 		uint32_t take = MIN(count - n, 512u - skip);
+ 		uint32_t lba = (uint32_t)(pra_emmc_first_lba + pos / 512u);
+-		if (buf_flags(bp) & B_READ) {
++		/* Whole sectors on a sector boundary go out as one CMD18. */
++		if (is_read && pra_emmc_multi_ok && skip == 0 &&
++		    count - n >= 1024u) {
++			uint32_t sectors = MIN((count - n) / 512u, PRA_MULTI_MAX);
++			error = pra_emmc_read_multi(lba, pra_emmc_multi_buf,
++			    sectors);
++			if (!error) {
++				memcpy(vaddr + n, pra_emmc_multi_buf,
++				    (size_t)sectors * 512u);
++				cmds++;
++				n += sectors * 512u;
++				buf_setresid(bp, count - n);
++				continue;
++			}
++			/* One failure of any other kind means the controller will
++			 * not do this at all; keep booting on per-sector reads. A
++			 * busy card is transient and must not disable the path. */
++			if (error != EBUSY) {
++				printf("PRA eMMC: CMD18 unavailable (%d), "
++				    "falling back to 512-byte reads\n", error);
++				pra_emmc_multi_ok = false;
++			}
++			error = 0;
++		}
++		if (is_read) {
+ 			error = pra_emmc_read_sector(lba, pra_emmc_bounce);
++			cmds++;
+ 			if (!error) {
+ 				memcpy(vaddr + n, pra_emmc_bounce + skip, take);
+ 			}
+@@ -938,6 +1147,7 @@
+ 	}
+ 	lck_mtx_unlock(&pra_emmc_lock);
+ 	buf_unmap(bp);
++	pra_emmc_note_io(count - buf_resid(bp), cmds, t0);
+ done:
+ 	if (error) {
+ 		buf_seterror(bp, error);
+@@ -1031,6 +1241,9 @@
+ {
+ 	if (!pra_emmc_ready) {
+ 		int error = pra_emmc_map_host();
++		int stats = 0;
++		PE_parse_boot_argn("emmcstats", &stats, sizeof(stats));
++		pra_emmc_stats = stats != 0;
+ 		if (error) {
+ 			return error;
+ 		}

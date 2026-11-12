@@ -814,3 +814,33 @@ instead of `strings`.
 Raw image with the fixed gate, 4 cores and 0141: `pra-xnu-smp4-raw.img`
 (`74886924107df63440c62e022770a117cd729df733b28acc93967f3217128d39`),
 written to p27 and read back over all 33,220 sectors.
+
+### Slow userland: the root read path was one CMD17 per 512 bytes (0142)
+
+With display and 4 cores working, the remaining "this is slow" is mostly the
+root filesystem, not the CPU. `pra_sdhci.c` read every 512-byte sector as its
+own CMD17: full command setup, a poll for command complete, an R1 check and a
+second poll for buffer-ready. An iOS 4 KiB page-in therefore paid that eight
+times, and every page fault in a 450 MiB machine pays it too.
+
+Patch `0142-pra-sdhci-multi-block-read.patch`:
+
+- one CMD18 per read chunk, up to 64 sectors (32 KiB), with block-count
+  enabled and auto CMD12 (`TRANSFER_MULTI_READ` = 0x36), draining one 512-byte
+  block per `BUFFER_READ_READY` poll into a static 32 KiB bounce buffer;
+- the old per-sector path stays as a fallback: any non-`EBUSY` failure during
+  the first CMD18 prints `CMD18 unavailable` and disables multi-block for the
+  rest of the boot, so an unsupported controller costs one command, not a
+  boot;
+- on failure the CMD/DAT lines are reset (`SOFTWARE_RESET` 0x6) before the
+  fallback retries, so a half-finished transfer cannot wedge the channel;
+- `emmcstats=1` accumulates bytes/commands/time and prints
+  `PRA eMMC: N KiB, M cmds, K KiB/s` every 8 MiB, so the gain is measured on
+  the phone.
+
+Expected effect: an 8-sector page-in becomes one command instead of eight, and
+a 16-page cluster read one instead of 128. This matters more than core count
+once the system starts paging in a 512 MiB window.
+
+The other two limits, in order of payoff: the 512 MiB RAM window (jetsam and
+page pressure) and cluster 1 (4 more cores), both still open.
