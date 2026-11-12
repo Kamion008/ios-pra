@@ -123,19 +123,29 @@ copy() {
 	local err="$work/rsync.err" rc=0 perm other
 	sudo rsync -aH --numeric-ids "${extra_excludes[@]}" "$1/" "$2/" 2>"$err" || rc=$?
 	perm=$(grep -c 'failed to set permissions on .*Operation not supported (95)' "$err" 2>/dev/null || true)
-	other=$(grep -v 'failed to set permissions on .*Operation not supported (95)' "$err" 2>/dev/null | grep -c . || true)
+	other=$(grep -v -e 'failed to set permissions on .*Operation not supported (95)' \
+		-e '^rsync error: some files/attrs were not transferred' "$err" 2>/dev/null | grep -c . || true)
 	if (( other > 0 )); then
 		cat "$err" >&2
 		echo "error: rsync reported $other unexpected messages" >&2
 		exit 1
 	fi
 	if (( perm > 0 )); then
-		local notlink=0
-		while IFS= read -r p; do
-			sudo test -L "$p" || { echo "error: chmod failed on a non-symlink: $p" >&2; notlink=1; }
-		done < <(sed -n 's/.*failed to set permissions on "\(.*\)": Operation not supported (95)$/\1/p' "$err")
-		(( notlink == 0 )) || exit 1
-		echo "  ($perm symlink chmod warnings ignored; every one is a symlink)"
+		local matched notlink
+		matched=$(sed -n 's/.*failed to set permissions on "\(.*\)": Operation not supported (95)$/\1/p' "$err" | wc -l)
+		if (( matched != perm )); then
+			cat "$err" >&2
+			echo "error: could not account for every rsync chmod failure" >&2
+			exit 1
+		fi
+		notlink=$(sed -n 's/.*failed to set permissions on "\(.*\)": Operation not supported (95)$/\1/p' "$err" |
+			sudo xargs -r -d '\n' sh -c 'for p; do [ -L "$p" ] || printf "%s\n" "$p"; done' sh)
+		if [[ -n $notlink ]]; then
+			echo "error: chmod failed on paths that are not symlinks:" >&2
+			printf '%s\n' "$notlink" | head -20 >&2
+			exit 1
+		fi
+		echo "  ($perm symlink chmod warnings ignored; rsync cannot set symlink modes on Linux)"
 	fi
 	if (( rc != 0 && rc != 23 )); then
 		echo "error: rsync exited $rc" >&2
