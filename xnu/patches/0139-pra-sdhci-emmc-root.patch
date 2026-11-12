@@ -1,0 +1,823 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 851addd..9670656 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
++bsd/dev/pra_sdhci.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+new file mode 100644
+index 0000000..a8b9527
+--- /dev/null
++++ b/bsd/dev/pra_sdhci.c
+@@ -0,0 +1,757 @@
++/*
++ * PRA-LX1 (hi6250) Arasan SDHCI eMMC bring-up.
++ *
++ * The Huawei bootloader has already initialised the eMMC host at
++ * 0xFF390000, selected the user area and left the card in transfer state.
++ * Do not reset that state. This driver moves one 512-byte sector at a time
++ * through the SDHCI buffer port (polled PIO, no DMA, no interrupts), which
++ * is the same register sequence the EL1 diagnostic shim used to read the
++ * GPT and write misc on the phone.
++ *
++ * Root reads need no boot argument beyond rd=sdhcroot0; the selected GPT
++ * partition defaults to "userdata" and can be changed with emmcroot=<name>.
++ * Writes stay disabled unless emmcwrite=1 and the partition is "userdata".
++ */
++#if defined(ARM64_BOARD_CONFIG_PRA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define PRA_SDHCI_BASE_DEFAULT 0xFF390000ULL
++
++/* SDHCI register offsets (Arasan SDHCI 3.0, 32-bit buffer port). */
++#define SDHCI_BLOCK_SIZE       0x04u
++#define SDHCI_BLOCK_COUNT      0x06u
++#define SDHCI_ARGUMENT         0x08u
++#define SDHCI_TRANSFER_MODE    0x0Cu
++#define SDHCI_COMMAND          0x0Eu
++#define SDHCI_RESPONSE0        0x10u
++#define SDHCI_BUFFER           0x20u
++#define SDHCI_PRESENT_STATE    0x24u
++#define SDHCI_HOST_CONTROL     0x28u
++#define SDHCI_POWER_CONTROL    0x29u
++#define SDHCI_CLOCK_CONTROL    0x2Cu
++#define SDHCI_TIMEOUT_CONTROL  0x2Eu
++#define SDHCI_SOFTWARE_RESET   0x2Fu
++#define SDHCI_NORMAL_INT_STATUS 0x30u
++#define SDHCI_ERROR_INT_STATUS  0x32u
++#define SDHCI_NORMAL_INT_STATUS_EN 0x34u
++#define SDHCI_NORMAL_INT_SIGNAL_EN 0x38u
++#define SDHCI_CAPABILITIES     0x40u
++#define SDHCI_HOST_VERSION     0xFEu
++
++#define NORMAL_CMD_COMPLETE    (1u << 0)
++#define NORMAL_TRANSFER_COMPLETE (1u << 1)
++#define NORMAL_BUFFER_WRITE_READY (1u << 4)
++#define NORMAL_BUFFER_READ_READY  (1u << 5)
++/* Reading 0x30 as a 32-bit little-endian word gives normal status in the low
++ * half and error status (0x32) in the high half, as the shim did. */
++#define SDHCI_ERROR_BITS       (0x1fffu << 16)
++
++#define CMD_R1_DATA_READ       0x113Au /* CMD17, response R1, data present */
++#define CMD_R1_DATA_WRITE      0x183Au /* CMD24, response R1, data present */
++#define TRANSFER_SINGLE_READ   0x12u   /* block count enable, read, single */
++#define TRANSFER_SINGLE_WRITE  0x02u   /* block count enable, write, single */
++
++static vm_offset_t pra_emmc_regs;
++static uint64_t pra_emmc_first_lba, pra_emmc_nsectors;
++static char pra_emmc_partition_name[32] = "userdata";
++static dev_t pra_emmc_bdev;
++static bool pra_emmc_ready;
++static bool pra_emmc_writable;
++static LCK_GRP_DECLARE(pra_emmc_grp, "pra_emmc");
++static LCK_MTX_DECLARE(pra_emmc_lock, &pra_emmc_grp);
++
++static inline uint32_t
++pra_emmc_rd32(uint32_t off)
++{
++	return *(volatile uint32_t *)(pra_emmc_regs + off);
++}
++
++static inline uint16_t
++pra_emmc_rd16(uint32_t off)
++{
++	return *(volatile uint16_t *)(pra_emmc_regs + off);
++}
++
++static inline void
++pra_emmc_wr32(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(pra_emmc_regs + off) = value;
++}
++
++static inline void
++pra_emmc_wr16(uint32_t off, uint16_t value)
++{
++	*(volatile uint16_t *)(pra_emmc_regs + off) = value;
++}
++
++/* Present State bits 0/1 are Command Inhibit (CMD/DAT). The card can stay
++ * busy for a while after a write, so poll instead of failing immediately. */
++static int
++pra_emmc_wait_ready(void)
++{
++	for (unsigned i = 0; i < 4000000; i++) {
++		if (!(pra_emmc_rd32(SDHCI_PRESENT_STATE) & 0x3u)) {
++			return 0;
++		}
++	}
++	return -1;
++}
++
++/* The bootloader leaves the SD clock running. If it gated it at handoff,
++ * re-enable the internal clock and then the SD clock, keeping the divider
++ * and power settings it chose. */
++static void
++pra_emmc_ensure_clock(void)
++{
++	uint16_t clk = pra_emmc_rd16(SDHCI_CLOCK_CONTROL);
++	if (clk & 0x4u) {
++		return;
++	}
++	printf("PRA eMMC: SD clock off (%x), re-enabling\n", clk);
++	pra_emmc_wr16(SDHCI_CLOCK_CONTROL, clk | 0x1u);
++	for (unsigned i = 0; i < 100000; i++) {
++		if (pra_emmc_rd16(SDHCI_CLOCK_CONTROL) & 0x2u) {
++			break;
++		}
++	}
++	pra_emmc_wr16(SDHCI_CLOCK_CONTROL,
++	    pra_emmc_rd16(SDHCI_CLOCK_CONTROL) | 0x4u);
++	for (unsigned i = 0; i < 100000; i++) {
++		__asm__ volatile("nop");
++	}
++}
++
++struct pra_sdhci_saved {
++	uint16_t blksiz, blkcnt, transfer, timeout;
++	uint32_t arg, int_en, sig_en;
++};
++
++static void
++pra_emmc_save(struct pra_sdhci_saved *s)
++{
++	s->blksiz = pra_emmc_rd16(SDHCI_BLOCK_SIZE);
++	s->blkcnt = pra_emmc_rd16(SDHCI_BLOCK_COUNT);
++	s->transfer = pra_emmc_rd16(SDHCI_TRANSFER_MODE);
++	s->timeout = pra_emmc_rd16(SDHCI_TIMEOUT_CONTROL);
++	s->arg = pra_emmc_rd32(SDHCI_ARGUMENT);
++	s->int_en = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS_EN);
++	s->sig_en = pra_emmc_rd32(SDHCI_NORMAL_INT_SIGNAL_EN);
++}
++
++static void
++pra_emmc_restore(const struct pra_sdhci_saved *s)
++{
++	pra_emmc_wr16(SDHCI_BLOCK_SIZE, s->blksiz);
++	pra_emmc_wr16(SDHCI_BLOCK_COUNT, s->blkcnt);
++	pra_emmc_wr16(SDHCI_TRANSFER_MODE, s->transfer);
++	pra_emmc_wr16(SDHCI_TIMEOUT_CONTROL, s->timeout);
++	pra_emmc_wr32(SDHCI_ARGUMENT, s->arg);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS_EN, s->int_en);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_SIGNAL_EN, s->sig_en);
++}
++
++static int
++pra_emmc_read_sector(uint32_t lba, uint8_t *sector)
++{
++	struct pra_sdhci_saved s;
++	uint32_t status = 0;
++	int error = 0;
++
++	if (pra_emmc_wait_ready()) {
++		printf("PRA eMMC: card busy, skip read lba=%u\n", lba);
++		return EBUSY;
++	}
++
++	pra_emmc_save(&s);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_SIGNAL_EN, 0);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS_EN, 0x7ffu);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	pra_emmc_wr16(SDHCI_TIMEOUT_CONTROL, 0xeu);
++	pra_emmc_wr16(SDHCI_BLOCK_SIZE, 512);
++	pra_emmc_wr16(SDHCI_BLOCK_COUNT, 1);
++	pra_emmc_wr32(SDHCI_ARGUMENT, lba);
++	pra_emmc_wr16(SDHCI_TRANSFER_MODE, TRANSFER_SINGLE_READ);
++	__asm__ volatile("dsb sy" : : : "memory");
++	pra_emmc_wr16(SDHCI_COMMAND, CMD_R1_DATA_READ);
++
++	for (unsigned i = 0; i < 2000000; i++) {
++		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & SDHCI_ERROR_BITS) {
++			error = EIO;
++			break;
++		}
++		if (status & NORMAL_CMD_COMPLETE) {
++			break;
++		}
++	}
++	if (error) {
++		printf("PRA eMMC: CMD17 lba=%u command error status=%x\n", lba, status);
++		goto out;
++	}
++	if (!(status & NORMAL_CMD_COMPLETE)) {
++		printf("PRA eMMC: CMD17 lba=%u command timeout status=%x\n", lba, status);
++		error = ETIMEDOUT;
++		goto out;
++	}
++	if (pra_emmc_rd32(SDHCI_RESPONSE0) & 0xfdffe008u) {
++		printf("PRA eMMC: CMD17 lba=%u card error r1=%x\n",
++		    lba, pra_emmc_rd32(SDHCI_RESPONSE0));
++		error = EIO;
++		goto out;
++	}
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, NORMAL_CMD_COMPLETE);
++
++	error = ETIMEDOUT;
++	for (unsigned i = 0; i < 2000000; i++) {
++		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & SDHCI_ERROR_BITS) {
++			printf("PRA eMMC: CMD17 lba=%u data error status=%x\n", lba, status);
++			error = EIO;
++			goto out;
++		}
++		if (status & NORMAL_BUFFER_READ_READY) {
++			error = 0;
++			break;
++		}
++	}
++	if (error) {
++		printf("PRA eMMC: CMD17 lba=%u data timeout status=%x\n", lba, status);
++		goto out;
++	}
++
++	{
++		uint32_t data[128];
++		for (unsigned i = 0; i < 128; i++) {
++			data[i] = pra_emmc_rd32(SDHCI_BUFFER);
++		}
++		memcpy(sector, data, sizeof(data));
++	}
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS,
++	    NORMAL_TRANSFER_COMPLETE | NORMAL_BUFFER_READ_READY);
++	(void)pra_emmc_wait_ready();
++	error = 0;
++
++out:
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	pra_emmc_restore(&s);
++	return error;
++}
++
++static int
++pra_emmc_write_sector(uint32_t lba, const uint8_t *sector)
++{
++	struct pra_sdhci_saved s;
++	uint32_t status = 0;
++	int error = 0;
++
++	if (!pra_emmc_writable || lba < pra_emmc_first_lba ||
++	    (uint64_t)lba - pra_emmc_first_lba >= pra_emmc_nsectors) {
++		return EROFS;
++	}
++	if (pra_emmc_wait_ready()) {
++		printf("PRA eMMC: card busy, skip write lba=%u\n", lba);
++		return EBUSY;
++	}
++
++	pra_emmc_save(&s);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_SIGNAL_EN, 0);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS_EN, 0x7ffu);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	pra_emmc_wr16(SDHCI_TIMEOUT_CONTROL, 0xeu);
++	pra_emmc_wr16(SDHCI_BLOCK_SIZE, 512);
++	pra_emmc_wr16(SDHCI_BLOCK_COUNT, 1);
++	pra_emmc_wr32(SDHCI_ARGUMENT, lba);
++	pra_emmc_wr16(SDHCI_TRANSFER_MODE, TRANSFER_SINGLE_WRITE);
++	__asm__ volatile("dsb sy" : : : "memory");
++	pra_emmc_wr16(SDHCI_COMMAND, CMD_R1_DATA_WRITE);
++
++	for (unsigned i = 0; i < 2000000; i++) {
++		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & SDHCI_ERROR_BITS) {
++			error = EIO;
++			break;
++		}
++		if (status & NORMAL_CMD_COMPLETE) {
++			break;
++		}
++	}
++	if (error) {
++		printf("PRA eMMC: CMD24 lba=%u command error status=%x\n", lba, status);
++		goto out;
++	}
++	if (!(status & NORMAL_CMD_COMPLETE)) {
++		printf("PRA eMMC: CMD24 lba=%u command timeout status=%x\n", lba, status);
++		error = ETIMEDOUT;
++		goto out;
++	}
++	if (pra_emmc_rd32(SDHCI_RESPONSE0) & 0xfdffe008u) {
++		printf("PRA eMMC: CMD24 lba=%u card error r1=%x\n",
++		    lba, pra_emmc_rd32(SDHCI_RESPONSE0));
++		error = EIO;
++		goto out;
++	}
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, NORMAL_CMD_COMPLETE);
++
++	error = ETIMEDOUT;
++	for (unsigned i = 0; i < 2000000; i++) {
++		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & SDHCI_ERROR_BITS) {
++			printf("PRA eMMC: CMD24 lba=%u buffer error status=%x\n", lba, status);
++			error = EIO;
++			goto out;
++		}
++		if (status & NORMAL_BUFFER_WRITE_READY) {
++			error = 0;
++			break;
++		}
++	}
++	if (error) {
++		printf("PRA eMMC: CMD24 lba=%u buffer timeout status=%x\n", lba, status);
++		goto out;
++	}
++
++	{
++		uint32_t data[128];
++		memcpy(data, sector, sizeof(data));
++		for (unsigned i = 0; i < 128; i++) {
++			pra_emmc_wr32(SDHCI_BUFFER, data[i]);
++		}
++	}
++
++	error = ETIMEDOUT;
++	for (unsigned i = 0; i < 2000000; i++) {
++		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & SDHCI_ERROR_BITS) {
++			printf("PRA eMMC: CMD24 lba=%u transfer error status=%x\n", lba, status);
++			error = EIO;
++			goto out;
++		}
++		if (status & NORMAL_TRANSFER_COMPLETE) {
++			error = 0;
++			break;
++		}
++	}
++	if (error) {
++		printf("PRA eMMC: CMD24 lba=%u transfer timeout status=%x\n", lba, status);
++		goto out;
++	}
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS,
++	    NORMAL_TRANSFER_COMPLETE | NORMAL_BUFFER_WRITE_READY);
++	(void)pra_emmc_wait_ready();
++	error = 0;
++
++out:
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	pra_emmc_restore(&s);
++	return error;
++}
++
++static uint32_t
++pra_emmc_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
++	    (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint64_t
++pra_emmc_le64(const uint8_t *p)
++{
++	return pra_emmc_le32(p) | (uint64_t)pra_emmc_le32(p + 4) << 32;
++}
++
++static uint32_t
++pra_emmc_crc32(uint32_t crc, const uint8_t *data, size_t len)
++{
++	for (size_t i = 0; i < len; i++) {
++		crc ^= data[i];
++		for (unsigned bit = 0; bit < 8; bit++) {
++			crc = (crc >> 1) ^ (0xedb88320u & -(crc & 1u));
++		}
++	}
++	return crc;
++}
++
++/* GPT names are UTF-16LE. Compare against an ASCII boot argument,
++ * ignoring case, so "userdata" matches the stock Huawei GPT. */
++static bool
++pra_emmc_name_matches(const uint8_t *entry, const char *name)
++{
++	/* GPT stores 36 UTF-16LE characters at offset 56. */
++	for (unsigned i = 0; i < 36; i++) {
++		uint16_t gpt = (uint16_t)entry[56 + i * 2] |
++		    (uint16_t)entry[57 + i * 2] << 8;
++		char want = name[i];
++		if (want >= 'A' && want <= 'Z') {
++			want = (char)(want - 'A' + 'a');
++		}
++		if (gpt > 0x7f) {
++			return false;
++		}
++		char have = (gpt >= 'A' && gpt <= 'Z') ? (char)(gpt - 'A' + 'a') : (char)gpt;
++		if (have != want) {
++			return false;
++		}
++		if (want == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++pra_emmc_ascii_eq(const char *a, const char *b)
++{
++	for (;; a++, b++) {
++		char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a - 'A' + 'a') : *a;
++		char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b - 'A' + 'a') : *b;
++		if (ca != cb) {
++			return false;
++		}
++		if (ca == 0) {
++			return true;
++		}
++	}
++}
++
++static int
++pra_emmc_find_root_partition(void)
++{
++	uint8_t hdr[512], entry[512];
++	int error;
++
++	(void)PE_parse_boot_argn("emmcroot", pra_emmc_partition_name,
++	    sizeof(pra_emmc_partition_name));
++	pra_emmc_partition_name[sizeof(pra_emmc_partition_name) - 1] = '\0';
++
++	pra_emmc_first_lba = 0;
++	pra_emmc_nsectors = 0;
++	error = pra_emmc_read_sector(1, hdr);
++	if (error) {
++		return error;
++	}
++	uint32_t header_size = pra_emmc_le32(hdr + 12);
++	if (memcmp(hdr, "EFI PART", 8) ||
++	    (header_size != 92 && header_size != 512) ||
++	    pra_emmc_le64(hdr + 24) != 1) {
++		printf("PRA eMMC: invalid GPT header\n");
++		return ENXIO;
++	}
++	uint32_t expected_header_crc = pra_emmc_le32(hdr + 16);
++	memset(hdr + 16, 0, 4);
++	if ((pra_emmc_crc32(~0u, hdr, header_size) ^ ~0u) != expected_header_crc) {
++		printf("PRA eMMC: GPT header CRC mismatch\n");
++		return EIO;
++	}
++	uint64_t first_usable = pra_emmc_le64(hdr + 40);
++	uint64_t last_usable = pra_emmc_le64(hdr + 48);
++	uint64_t entry_lba = pra_emmc_le64(hdr + 72);
++	uint32_t nentries = pra_emmc_le32(hdr + 80);
++	uint32_t entry_size = pra_emmc_le32(hdr + 84);
++	if (entry_lba < 2 || entry_lba > 1024 || nentries == 0 ||
++	    nentries > 128 || (nentries & 3u) || entry_size != 128 ||
++	    first_usable > last_usable || last_usable > UINT32_MAX) {
++		printf("PRA eMMC: unsupported GPT layout\n");
++		return ENXIO;
++	}
++	uint32_t crc = ~0u;
++	for (uint32_t s = 0; s < nentries / 4; s++) {
++		error = pra_emmc_read_sector((uint32_t)entry_lba + s, entry);
++		if (error) {
++			return error;
++		}
++		crc = pra_emmc_crc32(crc, entry, 512);
++		for (uint32_t j = 0; j < 4; j++) {
++			const uint8_t *p = entry + j * 128;
++			if (p[0] == 0) {
++				continue;
++			}
++			if (!pra_emmc_name_matches(p, pra_emmc_partition_name)) {
++				continue;
++			}
++			uint64_t first = pra_emmc_le64(p + 32);
++			uint64_t last = pra_emmc_le64(p + 40);
++			if (first < first_usable || last > last_usable || first > last) {
++				printf("PRA eMMC: %s out of GPT bounds\n",
++				    pra_emmc_partition_name);
++				return EINVAL;
++			}
++			pra_emmc_first_lba = first;
++			pra_emmc_nsectors = last - first + 1;
++		}
++	}
++	if ((crc ^ ~0u) != pra_emmc_le32(hdr + 88)) {
++		printf("PRA eMMC: GPT entries CRC mismatch\n");
++		return EIO;
++	}
++	if (!pra_emmc_nsectors) {
++		printf("PRA eMMC: %s partition not found\n", pra_emmc_partition_name);
++		return ENXIO;
++	}
++	int enable_write = 0;
++	(void)PE_parse_boot_argn("emmcwrite", &enable_write, sizeof(enable_write));
++	pra_emmc_writable = pra_emmc_ascii_eq(pra_emmc_partition_name, "userdata") &&
++	    enable_write == 1;
++	printf("PRA eMMC: GPT %s first=%llu sectors=%llu %s\n",
++	    pra_emmc_partition_name, pra_emmc_first_lba, pra_emmc_nsectors,
++	    pra_emmc_writable ? "writable" : "read-only");
++	return 0;
++}
++
++static int
++pra_emmc_map_host(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	if (pra_emmc_regs) {
++		return 0;
++	}
++	if (SecureDTLookupEntry(NULL, "/pra-emmc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("PRA eMMC: missing ADT register window\n");
++		return ENXIO;
++	}
++	uint64_t base = reg[0];
++	if (base != PRA_SDHCI_BASE_DEFAULT) {
++		printf("PRA eMMC: unexpected ADT base %llx (want %llx)\n",
++		    base, PRA_SDHCI_BASE_DEFAULT);
++		return ENXIO;
++	}
++	pra_emmc_regs = ml_io_map(base, MAX((vm_size_t)reg[1], (vm_size_t)0x1000));
++	if (!pra_emmc_regs) {
++		printf("PRA eMMC: MMIO map failed\n");
++		return ENOMEM;
++	}
++	uint16_t version = pra_emmc_rd16(SDHCI_HOST_VERSION);
++	uint16_t clk = pra_emmc_rd16(SDHCI_CLOCK_CONTROL);
++	uint32_t present = pra_emmc_rd32(SDHCI_PRESENT_STATE);
++	printf("PRA eMMC: host base=%llx version=%x clock=%x present=%x power=%x\n",
++	    base, version, clk, present,
++	    (uint32_t)*(volatile unsigned char *)(pra_emmc_regs + SDHCI_POWER_CONTROL));
++	if ((version & 0xffu) != 2 && (version & 0xffu) != 3) {
++		printf("PRA eMMC: unexpected SDHCI spec version %u\n", version & 0xffu);
++	}
++	pra_emmc_ensure_clock();
++	return 0;
++}
++
++void
++pra_emmc_probe(void)
++{
++	if (!pra_emmc_map_host()) {
++		(void)pra_emmc_find_root_partition();
++	}
++}
++
++static int
++pra_emmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	return !pra_emmc_ready ? ENXIO :
++	       ((flags & FWRITE) && !pra_emmc_writable ? EROFS : 0);
++}
++
++static int
++pra_emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	return 0;
++}
++
++static uint32_t pra_emmc_secsize = 512;
++static uint8_t pra_emmc_bounce[512];
++
++static void
++pra_emmc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint32_t count = buf_count(bp);
++	uint64_t bytes = pra_emmc_nsectors * 512u;
++	uint64_t off = 0;
++	buf_setresid(bp, count);
++	if (!pra_emmc_ready) {
++		error = ENXIO;
++	} else if (!(buf_flags(bp) & B_READ) && !pra_emmc_writable) {
++		error = EROFS;
++	} else if (buf_blkno(bp) < 0) {
++		error = EINVAL;
++	} else {
++		off = (uint64_t)buf_blkno(bp) * pra_emmc_secsize;
++		if (off > bytes || count > bytes - off) {
++			error = EINVAL;
++		}
++	}
++	if (error || count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++	lck_mtx_lock(&pra_emmc_lock);
++	for (uint32_t n = 0; n < count;) {
++		uint64_t pos = off + n;
++		uint32_t skip = pos & 511u;
++		uint32_t take = MIN(count - n, 512u - skip);
++		uint32_t lba = (uint32_t)(pra_emmc_first_lba + pos / 512u);
++		if (buf_flags(bp) & B_READ) {
++			error = pra_emmc_read_sector(lba, pra_emmc_bounce);
++			if (!error) {
++				memcpy(vaddr + n, pra_emmc_bounce + skip, take);
++			}
++		} else {
++			if (skip || take != 512u) {
++				error = pra_emmc_read_sector(lba, pra_emmc_bounce);
++			}
++			if (!error) {
++				memcpy(pra_emmc_bounce + skip, vaddr + n, take);
++				error = pra_emmc_write_sector(lba, pra_emmc_bounce);
++			}
++		}
++		if (error) {
++			break;
++		}
++		n += take;
++		buf_setresid(bp, count - n);
++	}
++	lck_mtx_unlock(&pra_emmc_lock);
++	buf_unmap(bp);
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++pra_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p)
++{
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*(uint32_t *)data = pra_emmc_secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE: {
++		uint32_t requested = *(uint32_t *)data;
++		if (requested < 512 || requested > 4096 ||
++		    (requested & (requested - 1))) {
++			return EINVAL;
++		}
++		pra_emmc_secsize = requested;
++		return 0;
++	}
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*(uint32_t *)data = 512;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*(uint64_t *)data = pra_emmc_nsectors * 512u / pra_emmc_secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*(uint32_t *)data = pra_emmc_writable ? 1 : 0;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*(uint64_t *)data = 1;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*(uint64_t *)data = pra_emmc_writable ? 1 : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*(uint64_t *)data = 1;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++pra_emmc_psize(__unused dev_t dev)
++{
++	return pra_emmc_ready ?
++	       (int)MIN(pra_emmc_nsectors * 512u / pra_emmc_secsize, INT_MAX) : -1;
++}
++
++static int
++pra_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(pra_emmc_strategy, NULL, dev, B_READ, minphys, uio,
++	    (int)pra_emmc_secsize);
++}
++
++static int
++pra_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return pra_emmc_writable ?
++	       physio(pra_emmc_strategy, NULL, dev, B_WRITE, minphys, uio,
++	    (int)pra_emmc_secsize) : EROFS;
++}
++
++static const struct bdevsw pra_emmc_bdevsw = {
++	.d_open = pra_emmc_open, .d_close = pra_emmc_close,
++	.d_strategy = pra_emmc_strategy, .d_ioctl = pra_emmc_ioctl,
++	.d_dump = eno_dump, .d_psize = pra_emmc_psize, .d_type = D_DISK,
++};
++
++static const struct cdevsw pra_emmc_cdevsw = {
++	.d_open = pra_emmc_open, .d_close = pra_emmc_close,
++	.d_read = pra_emmc_read, .d_write = pra_emmc_write,
++	.d_ioctl = pra_emmc_ioctl, .d_stop = eno_stop, .d_reset = eno_reset,
++	.d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc, .d_type = D_DISK,
++};
++
++int
++pra_emmc_rootdev(dev_t *dev)
++{
++	if (!pra_emmc_ready) {
++		int error = pra_emmc_map_host();
++		if (error) {
++			return error;
++		}
++		error = pra_emmc_find_root_partition();
++		if (error) {
++			return error;
++		}
++		int bmajor = bdevsw_add(-1, &pra_emmc_bdevsw);
++		if (bmajor < 0) {
++			return ENXIO;
++		}
++		int cmajor = cdevsw_add_with_bdev(-1, &pra_emmc_cdevsw, bmajor);
++		if (cmajor < 0) {
++			return ENXIO;
++		}
++		pra_emmc_bdev = makedev(bmajor, 0);
++		devfs_make_node(pra_emmc_bdev, DEVFS_BLOCK, UID_ROOT,
++		    GID_OPERATOR, 0640, "sdhcroot0");
++		devfs_make_node(makedev(cmajor, 0), DEVFS_CHAR, UID_ROOT,
++		    GID_OPERATOR, 0640, "rsdhcroot0");
++		pra_emmc_ready = true;
++		printf("PRA eMMC: /dev/sdhcroot0 ready, GPT %s %s\n",
++		    pra_emmc_partition_name,
++		    pra_emmc_writable ? "writable" : "read-only");
++	}
++	*dev = pra_emmc_bdev;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_PRA */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index b6ba676..d8a960c 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -72,6 +72,9 @@ extern void a5xelte_emmc_probe(void);
+ extern void a5xelte_keys_init(void);
+ extern void a5xelte_touch_probe(void);
+ #endif
++#if defined(ARM64_BOARD_CONFIG_PRA)
++extern void pra_emmc_probe(void);
++#endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+ 
+@@ -771,6 +774,33 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_PRA)
++//
++//	PRA: root on a GPT partition of the internal eMMC (bsd/dev/pra_sdhci.c).
++//	The bootloader has already initialised the Arasan SDHCI host at
++//	0xFF390000, so this path only needs polled sector I/O.
++//
++	{
++		uint32_t emmcprobe = 0;
++		PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
++		if (emmcprobe == 1) {
++			pra_emmc_probe();
++		}
++	}
++	if (strcmp(rdBootVar, "sdhcroot0") == 0) {
++		extern int pra_emmc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int emmc_error = pra_emmc_rootdev(root);
++		if (emmc_error) {
++			panic("IOFindBSDRoot: PRA eMMC root unavailable: %d", emmc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();

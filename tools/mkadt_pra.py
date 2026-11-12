@@ -166,13 +166,12 @@ def build():
         ('height', mkadt.u32(1920)),
         ('stride', mkadt.u32(4320)),
     ]))
-    # Live iomem "ff390000-ff39ffff : mmc0", the block host the GPT probe reads.
-    # Written as the 0xE0000000 SoC-relative offset per the SoC-base convention.
-    # Caveat: the donor's b-s-d dev host driver (a5xelte-emmc-c) maps its own
-    # root-level node with ml_io_map(reg[0], reg[1]) and no soc offset, so a PRA
-    # driver that reuses that pattern must publish the absolute 0xFF390000 instead.
+    # Live iomem "ff390000-ff39ffff : mmc0", the Arasan SDHCI eMMC host the
+    # bootloader has already initialised. Like pra-fbcon this is a root-level
+    # node and the PRA driver maps reg[0] directly with ml_io_map(), so the
+    # window is absolute, not an /arm-io SoC-relative offset.
     root.children.append(mkadt.node('pra-emmc', [
-        ('reg', mkadt.u64(0x1F390000, 0x10000)),
+        ('reg', mkadt.u64(0xFF390000, 0x1000)),
     ]))
     return root
 
