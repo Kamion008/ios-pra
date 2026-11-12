@@ -763,3 +763,54 @@ SpringBoard crashed: Too many corpses being created.
 
 The display fix needs a kernel rebuild, so it rides with the SMP test:
 `CMDLINE='... cpus=8 ...' tools/pra_package.sh out/ci/kernel.development.pra`.
+
+### cpus=8 panics registering the second cluster (known from A5XELTE)
+
+The PRA 8-core trial printed exactly the sequence the SMP code wants:
+
+```
+A5XELTE CPU: requested=8 selected=8 (limit=8)
+A5XELTE CPU: cpu=0 mpidr=0x0 came alive; SGI1 OK
+A5XELTE CPU: cpu=1 CPU_ON target=0x1 entry_pa=0x89425000 context=1
+A5XELTE CPU: cpu=1 PSCI CPU_ON rc=0
+panic(cpu 0 caller ...lock_ticket.c:143): Ticket lock 0xfffffff007b70880
+  is unexpectedly owned by thread 0xfffffff65a54c820
+```
+
+- `0xfffffff007b70880` is `pset0 + 0x100`, i.e. `pset0.sched_lock`
+  (`lck_ticket_t`). The panic is the recursive-acquire detector in
+  `lck_ticket_contended` (`cthread->ctid == tlock->lck_ticket_owner`).
+- This is not a PRA surprise: `A5XELTE_PROGRESS.md` records the same result
+  on the Exynos donor — "the eight-core trial reached CPU1 but panicked on
+  CPU0 with an unexpectedly owned ticket lock while registering the second
+  physical cluster. Selecting cpus=4 on the same eight-core-capable source
+  instead produced a user-visible 4/4 CPUs initialized, SGI1 verified."
+- So PSCI `CPU_ON` and the CPU1 entry path work on PRA (rc=0, CPU0 SGI1 OK);
+  what breaks is bringing up cluster 1 (MPIDR 0x100..0x103). `cpus=4`
+  selects cluster 0 (MPIDR 0..3, the 1.7 GHz cluster per
+  `mkadt_pra.py`; cluster 1 is the 2.1 GHz one) and avoids it.
+- Practical layout: `cpus=4` now for a 4x speedup; cluster 1 is a separate
+  debugging item (suspects: per-cluster `ml_processor_register` path,
+  `cluster_type`/cluster-id bookkeeping, or the second cluster's
+  `pset_update_processor_state` racing the boot CPU's startAll).
+
+### The Linux branch trigger was LK's own flag (`pra_linux=1` now)
+
+The 4-core + display-fix image booted to a black screen that printed only
+`linux MiB4` / `jumping to Linux`. The loader gate was
+`enter_recovery=1`, which LK's eRecovery failsafe sets **itself** on every
+power-on while it stays latched — the same reason p27 is what gets booted.
+So the gate was always true and the loader went to the staged Image in p51
+every time.
+
+`shim/pra/linux_boot.c` now requires the exact token `pra_linux=1`, which
+nothing in the boot chain sets today, so the branch is inert and fails
+closed to XNU. It stays as an explicit opt-in hook for a future dual-boot
+trigger (misc flag or key state read by the loader) once one exists.
+`bootarg_has()` is inlined and the token is folded into immediates, so the
+string does not appear in `loader.bin`; verify a rebuild by loader size/time
+instead of `strings`.
+
+Raw image with the fixed gate, 4 cores and 0141: `pra-xnu-smp4-raw.img`
+(`74886924107df63440c62e022770a117cd729df733b28acc93967f3217128d39`),
+written to p27 and read back over all 33,220 sectors.

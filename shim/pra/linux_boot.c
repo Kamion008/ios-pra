@@ -19,11 +19,17 @@
  *             androidboot.mode=normal   normal_reset_type=VolUsbUpdate
  *   normal    enter_recovery=0   (expected, not read from a normal-boot DTB)
  *
- * androidboot.mode is `normal` in both, so it cannot be the trigger. This
- * branch therefore requires the exact space-delimited token
- * `enter_recovery=1` and declines otherwise. Absence means "not recovery",
- * so the branch fails closed to XNU and a plain power-on can never take the
- * staged Image even when its header and CRC are valid.
+ * androidboot.mode is `normal` in both, so it cannot be the trigger.
+ *
+ * `enter_recovery=1` is not a trigger either: LK's eRecovery failsafe sets
+ * it itself on every power-on while it stays latched (that is how it loads
+ * p27 and the p28 ramdisk), so branching on it booted the staged Image on an
+ * ordinary power-on. This branch now requires the exact space-delimited
+ * token `pra_linux=1`, which nothing in the boot chain sets today. It is an
+ * explicit opt-in for a future dual-boot trigger (misc flag, key state read
+ * by the loader, ...); until then the branch is inert and fails closed to
+ * XNU, and a plain power-on can never take the staged Image even when its
+ * header and CRC are valid.
  *
  * The Image itself is staged in `preas` (p51) by
  * tools/pra-stage-twrp-kernel.sh. The header and CRC let a blank partition
@@ -392,9 +398,10 @@ void pra_linux_try(uintptr_t dtb)
 	uintptr_t initrd_start, initrd_end, image_pa;
 	uint64_t dtb_size, image_size, sectors, text_offset;
 
-	/* Only a real recovery boot may take the staged Image; the initrd
-	 * properties exist on ordinary boots too. */
-	if (!bootarg_has(dtb, "enter_recovery=1"))
+	/* Only an explicit opt-in may take the staged Image. enter_recovery=1
+	 * is set by LK's eRecovery failsafe on every power-on, so it cannot be
+	 * the trigger; the initrd properties exist on ordinary boots too. */
+	if (!bootarg_has(dtb, "pra_linux=1"))
 		return;
 	if (!initrd_range(dtb, &initrd_start, &initrd_end))
 		return;

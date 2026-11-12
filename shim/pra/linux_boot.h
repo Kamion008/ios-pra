@@ -1,13 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * PRA-LX1 loader: on-demand Linux boot from a pre-staged arm64 Image.
  *
- * The bootloader always takes the kernel from `kernel` (p30) and, when the
- * recovery keys are held, takes only the ramdisk from `recovery_ramdisk`
- * (p32), describing it in /chosen as linux,initrd-start/end. Those
- * properties also appear on an ordinary boot, so the initrd is not the
- * trigger: the loader requires /chosen/bootargs to carry the token
- * `enter_recovery=1` and only then boots the Linux Image staged in the
- * otherwise unused `preas` partition (p51). Absence fails closed to XNU.
+ * The bootloader takes the kernel from `kernel` (p30) and, when the
+ * recovery keys are held, only the ramdisk from `recovery_ramdisk` (p32),
+ * describing it in /chosen as linux,initrd-start/end. Those properties also
+ * appear on an ordinary boot, so the initrd is not the trigger. Neither is
+ * enter_recovery=1: LK's eRecovery failsafe sets that on every power-on
+ * while it stays latched. The loader instead requires /chosen/bootargs to
+ * carry the token `pra_linux=1`, which nothing in the boot chain sets today,
+ * and only then boots the Linux Image staged in the otherwise unused `preas`
+ * partition (p51). Absence fails closed to XNU.
  *
  * Scratch layout (absolute LBA, 512-byte sectors):
  *
