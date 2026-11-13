@@ -20,17 +20,21 @@ flashed. Keep all claims below scoped to this Huawei device.
   PRA-only patch `0153-pra-setup-mach-msg-probe.patch` logs the sender,
   receiver and Mach message ID for messages involving Setup, with output
   capped/sampled. Patch committed as `59b2d1f`.
-- CI push run `43437655574` (commit `a13788f`, which contains 0153) is
-  **in progress**. It is a push event; workflow default `MACHINE_CONFIG` is
-  PRA and its default runner is `macos-15`; confirm the build result and PRA
-  target before packaging. Explicit dispatches `43437675161`, `43437391746`,
+- CI push run `43437655574` (commit `a13788f`, which contains 0153)
+  **failed** at Build after 4m9s. The probe compilation failed because
+  `ipc_kmsg.c` already declares `proc_name_address(struct proc *)`; 0153 had
+  added a conflicting `void *` declaration. Corrected the patch to use the
+  existing declaration and cast the opaque BSD task info to `struct proc *`;
+  patch dry-run now applies cleanly. Fix committed and pushed as `08e8f56`.
+  New push build `43439514198` (PRA default, `macos-15`) is **in progress**;
+  confirm its result before packaging. Explicit dispatches `43437675161`, `43437391746`,
   `43437092765` requested `macos-14`, which the workflow documents as
   unsupported for this account, and were cancelled before any steps ran. The
   earlier useful push run `43437069518` was cancelled by the same-ref
   concurrency rule when an explicit dispatch arrived. Commit `a13788f`
   changes concurrency to unique run IDs so a push build is not cancelled by
   an unsupported manual dispatch.
-- Next: verify CI run 43437655574 and download the kernel artifact. Confirm
+- Next: verify CI run `43439514198` and download the kernel artifact. Confirm
   `ARM64_BOARD_CONFIG_PRA` and that the probe is linked; do not flash a failed
   or unverified artifact. Then, if valid, use the authorized p27/TWRP write
   workflow and preserve p30/p32, bootloaders, recovery, modem, persist and GPT.
