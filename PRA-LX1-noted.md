@@ -1207,16 +1207,72 @@ Boot of 0151 with the patched `com.apple.springboard.plist`
   `device_type=0x57` (HS400-capable card). The 2.7 MB/s ceiling is not bus
   width - it is 512 B per command at ~179 us (wait 142 + buf 43), i.e.
   per-command overhead, plus occasional stalls.
-- Stalls are the real problem: `>5ms` counts of 300-500 per 16,400 commands
-  and single-request maxima of 6.2 s, 9.7 s, 11.4 s, and **24.8 s** right
-  after Setup's launch. At those numbers Setup's first frame is tens of
-  minutes away, which is why a 20-minute wait ended on the Apple logo with
-  the system still healthy.
+- Stalls are real but bounded: `>5ms` counts of 300-500 per 16,400
+  commands, and single-request waits up to **59.5 s** in the whole ring
+  (49.7 s after Setup). Nothing failed or was retried - the ring has zero
+  `command timeout` / `card busy` / reset lines - so the requests completed
+  after a long wait. The eMMC stats block only prints once per **8 MiB**, so
+  each line is one interval, not a running total.
+- Correction to an earlier reading of this ring: comparing two lines
+  (`8224 KiB` at Setup, `8234 KiB` later) and calling it "0 MiB of I/O after
+  Setup" was wrong - those are two different 8 MiB intervals. Counting the
+  intervals instead: **98 intervals after `exec Setup` = 786 MiB moved**
+  (68 MiB of it written). Setup's launch is followed by a lot of continued
+  I/O, not a dead card.
+- Per-interval `KiB/s` is bytes over accumulated request nanoseconds. Summing
+  it over the ring gives 410 min for a ~20 min boot, so the denominator
+  double-counts when threads queue on `pra_emmc_lock` (each request starts
+  its timer before taking the lock). Use it as a relative signal only. Wall
+  clock ground truth: ~1,888 MiB in ~20 min, i.e. **~1.6 MB/s average**,
+  consistent with 2.7 MB/s bursts and 590-614 KiB/s writes.
 - `Failed to open swap file 2` appears late; the VM could not create a swap
   file (95 % full volume), so Setup runs without swap.
 - Throughput collapses after `exec backboardd`: 2.7 MB/s -> 311 KiB/s ->
   63 KiB/s -> 44 KiB/s, then recovers to ~200 KiB/s-1.4 MiB/s while daemons
   churn. Writes stay at ~590 KiB/s throughout (614 KiB/s peak).
+- Open contradiction worth resolving before any driver work: the comment at
+  the top of `PRA_MULTI_MAX` in `bsd/dev/pra_sdhci.c` says "the 24 MiB/s the
+  card sustains is not the limit here", i.e. per-command overhead is
+  dominant and CMD18 is the lever. The 0146 note says the opposite ("reads
+  are already at the card's internal limit, multi-block buys ~15 %"). The
+  former is a design assumption, the latter an inference from the CMD18
+  wedge; neither is measured. A clean CMD18 (proper CMD12 and a bounded
+  per-block loop) would settle it.
+
+### Journal bit: tooling ready, deliberately not applied (2026-11-13)
+
+The only write-side lever left is the HFS+ journal, which costs a second
+copy of every metadata write on a volume that only sustains 590-614 KiB/s.
+Two new tools, both reversible:
+
+- `tools/pra_hfs_journal.py IMAGE --report|--clear` works on a dump. Edits
+  the attrs word (`kHFSVolumeJournaledBit`, 1 << 13, big-endian at offset 4)
+  in **both** the primary header (image offset 1024) and the alternate (last
+  bytes of the partition), saves each 512-byte sector, emits the dd lines.
+- `tools/pra_journal_off.py --report|--off|--restore` does the same over adb
+  from TWRP by reading **four sectors** instead of dumping 9.8 GiB: primary
+  LBA 10715138, alternate LBA 30777342, journal info block LBA 10715760,
+  journal header (inline, offset 323584 -> LBA 10715808). It refuses when
+  the journal still holds transactions unless `--force`.
+
+Validated on throwaway `mkfs.hfsplus -J` images: journaled image reports
+`attrs=0x80002100 journaled=YES`, and `fsck.hfsplus` says "corrupt" (the
+Linux mkfs leaves a blank journal); after `--clear` both headers read
+`journaled=no` and `fsck.hfsplus -n` returns `rc=0 ... appears to be OK`. A
+synthetic pending range makes `--clear` refuse. The first version applied
+the primary's attrs word to both headers, which would have silently dropped
+the alternate's `kHFSVolumeUnmountedBit` - visible on real geometry
+(`0x80002000` primary vs `0x80002100` alternate) and invisible on the test
+image until the two were made to differ. Each header now keeps its own bits.
+
+Not applied because the expected gain is smaller than it looked: after
+`exec Setup` the ring shows 786 MiB moved with only **68 MiB written**, so
+the boot is read-bound and journaling cannot be the main cost. The case for
+it is the long single-request stalls (up to 49.7 s after Setup), which are
+the shape a journal checkpoint flush would make. Test it only after ring8
+says the stalls cluster on writes; otherwise the next read-side question is
+the contradiction recorded above (24 MiB/s design assumption vs "at the
+card's limit").
 
 ### Handoff 2026-11-13 (stopping for the day)
 
