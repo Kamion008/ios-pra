@@ -1252,7 +1252,13 @@ free HFS+ allocation is fragmented, and every future write is scattered.
 
 Do it from iOS userland once it boots (`rm -rf /Applications/Setup.app`, e.g.
 through the planned injection path), not from the PC: TWRP does not mount
-HFSX, and rewriting the whole 10 GB image at 0.5 MB/s is five hours. Read
+HFSX, so it cannot delete inside the volume at all.
+
+Careful with the "0.5 MB/s" figure: that is XNU's polled 512-byte PIO path, the
+thing the boot suffers from - not the hardware. TWRP runs the stock dw_mmc
+driver with DMA at the real bus width, and the 10.27 GB p58 dump already moved
+over adb at 44 MB/s (line above), so a 14 GB root write from TWRP is tens of
+minutes, not six hours. The slow path only explains why the *boot* is slow. Read
 `/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist` and
 `com.apple.mobileactivationd.plist` first - the setup-done and activation keys
 there are what decides whether SpringBoard needs Setup at all.
