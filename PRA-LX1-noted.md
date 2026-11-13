@@ -1560,3 +1560,27 @@ last `Setup -> X` line before the ring goes quiet is the service that never
 answered, which is the one thing none of the on-device reports could name.
 
 PRA-only (`ARM64_BOARD_CONFIG_PRA`), so the other board configs are untouched.
+
+## 0153 build and p27 trial (2026-11-13)
+
+- Initial CI run [43437655574](https://github.com/Kamion008/ios-pra/actions/runs/43437655574)
+  failed in `ipc_kmsg.c`: my probe redeclared the existing
+  `proc_name_address(struct proc *)` as accepting `void *`. Corrected it to
+  use the existing declaration and cast `get_bsdtask_info()`'s opaque pointer.
+- Corrected push CI run [43439514198](https://github.com/Kamion008/ios-pra/actions/runs/43439514198)
+  succeeded: Build, PRA preemption linked-kernel guard, LSE check and artifact
+  upload all passed. It built commit `08e8f56`. Downloaded kernel SHA-256:
+  `c270dfd1ae2e8e17e8fcf89bc11189788857175eafec9448463e4b605f10fdcd`.
+  Linked strings include `PRA MSG[%u]: %s -> %s id=0x%x bits=0x%x`.
+- Packaged as `research/pra-artifacts/pra-xnu-0153-setup-msg-bar.img` using
+  the existing 0151 command line with `-noprogress` absent, restoring the
+  kernel progress bar. `praexecskip` is also absent. Size 6,000,640 bytes
+  (within p27's 24 MiB); SHA-256
+  `41be36e756892c6368a3c4585ac083bc12612bf235c1605c179ad9814c7694d1`.
+- At 46% battery, `tools/pra_flash_skip.sh` wrote only p27 from TWRP and
+  verified readback against that SHA-256 before rebooting. p30, p32,
+  bootloaders, recovery, modem, persist and GPT were not written. Runtime
+  result is pending; this is not yet evidence of a successful XNU boot or
+  Hello screen. The user should report whether the progress bar appears and
+  moves/freezes. After the diagnostic window, collect ring11 and inspect
+  `PRA MSG` peer lines around `exec Setup`.

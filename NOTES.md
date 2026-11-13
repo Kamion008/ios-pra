@@ -2,9 +2,10 @@
 
 ## Separate PRA-LX1 handoff (Huawei; not SWEET or A5XELTE results)
 
-**Current state (2026-11-13):** Huawei PRA-LX1 is in TWRP after the 20-minute
-0151 no-progress-bar boot with no visible change. No probe kernel has been
-flashed. Keep all claims below scoped to this Huawei device.
+**Current state (2026-11-13):** Probe kernel 0153 was just flashed to p27
+from TWRP and readback-verified; the device is rebooting into XNU. The display
+and runtime behavior are not yet observed. Keep all claims below scoped to
+this Huawei device.
 
 - Ring10 is `ios/ios-pra/research/pra-artifacts/ring10.txt` (gitignored). It
   records one `exec Setup`, no `CRASH Setup`, 4 full-screen framebuffer swaps,
@@ -26,19 +27,27 @@ flashed. Keep all claims below scoped to this Huawei device.
   added a conflicting `void *` declaration. Corrected the patch to use the
   existing declaration and cast the opaque BSD task info to `struct proc *`;
   patch dry-run now applies cleanly. Fix committed and pushed as `08e8f56`.
-  New push build `43439514198` (PRA default, `macos-15`) is **in progress**;
-  confirm its result before packaging. Explicit dispatches `43437675161`, `43437391746`,
+  New push build `43439514198` (PRA default, `macos-15`) **succeeded**. Artifact
+  SHA-256: `c270dfd1ae2e8e17e8fcf89bc11189788857175eafec9448463e4b605f10fdcd`;
+  PRA preemption-link check passed and probe strings are present. Packaged with
+  bar-enabled 0151 cmdline (no `-noprogress`, no `praexecskip`) as
+  `research/pra-artifacts/pra-xnu-0153-setup-msg-bar.img`, 6,000,640 bytes,
+  SHA-256 `41be36e756892c6368a3c4585ac083bc12612bf235c1605c179ad9814c7694d1`.
+  `pra_flash_skip.sh` wrote p27 only and readback matched exactly; no p30/p32,
+  bootloaders, recovery, modem, persist or GPT were touched. Explicit dispatches
+  `43437675161`, `43437391746`,
   `43437092765` requested `macos-14`, which the workflow documents as
   unsupported for this account, and were cancelled before any steps ran. The
   earlier useful push run `43437069518` was cancelled by the same-ref
   concurrency rule when an explicit dispatch arrived. Commit `a13788f`
   changes concurrency to unique run IDs so a push build is not cancelled by
   an unsupported manual dispatch.
-- Next: verify CI run `43439514198` and download the kernel artifact. Confirm
-  `ARM64_BOARD_CONFIG_PRA` and that the probe is linked; do not flash a failed
-  or unverified artifact. Then, if valid, use the authorized p27/TWRP write
-  workflow and preserve p30/p32, bootloaders, recovery, modem, persist and GPT.
-  The probe is diagnostic only; it is not evidence that Hello has been reached.
+- Next: observe the progress bar and let this boot reach its normal 20-minute
+  diagnostic window; report whether it appears, advances, or freezes. Then pull
+  ring11 and inspect `PRA MSG` peer lines near `exec Setup`. The probe is
+  diagnostic only; build success and verified p27 write do not mean it booted
+  or that Hello has been reached. Keep Setup Assistant intact until Hello is
+  actually observed.
 
 This section is a separate PRA handoff. The SWEET notes below remain donor
 history; nothing here is an A5XELTE/Samsung result.
