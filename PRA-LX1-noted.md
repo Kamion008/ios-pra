@@ -1156,6 +1156,24 @@ Caveat: the volume is journaled (`attrs 0x80002000`, in-FS journal at block
 restore the old plist; the ring line above is the tell, and the cure is
 `fsck.hfsplus -f -y` on the dump, then writing the larger changed block set.
 
+Applied 2026-11-13 (before flashing 0151): fresh dump -> `p58-fresh.img`
+(9,796 MiB), journal pending range `6,408,192..6,696,960` searched for the
+plist content and for block 2503067 - **no hits**, so replay cannot undo the
+edit and the fsck step was skipped. The edit landed at image offset
+10,252,562,432 / p58 block 2,503,067 (device LBA 3,842,459 at bs=4096); the
+original 4 KiB block is `/tmp/opencode/plist_block.orig` and the readback
+from `/dev/block/mmcblk0` matched the payload sha256 `366e55a0...`. Verified
+before the phone write by mounting the patched image read-only: HFS+ reports
+2006 bytes, 20 keys, `FBLaunchWatchdogExceptions = {com.apple.purplebuddy =
+280}`, `SBLastSystemVersion` intact.
+
+Journal header layout, for the next time: `magic 0x4a4e4c78`, `endian
+0x12345678`, then `start`, `end`, `size` as three little-endian u64s at
+offsets 8/16/24 (`start != end` means pending transactions). TWRP's adb
+`exec-out` stalls on multi-GB reads - a 9.8 GiB dump needed three attempts
+and had to be finished in 160 MiB chunks, truncating to the last whole MiB
+before each resume so nothing is duplicated.
+
 Where the space on this volume actually is (same study, measured): 523.8 MiB
 free (95 % used); `Setup.app` is **35 MB**, not 500 MB, so deleting it after
 Hello buys little. `/System` is 7.9 GB and sealed by SSV - never edit it.

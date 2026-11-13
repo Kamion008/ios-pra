@@ -19,6 +19,7 @@ the ring log showing "20.00 seconds" instead of "300.00 seconds" is the
 tell.  Replaying with fsck.hfsplus first is the cure.
 """
 import argparse
+import mmap
 import os
 import plistlib
 import struct
@@ -38,23 +39,15 @@ def find_file(img, content):
         needle = content[:min(64, len(content))]
     hits = []
     with open(img, "rb", buffering=0) as f:
-        pos = 0
-        while True:
-            f.seek(pos)
-            chunk = f.read(64 << 20)
-            if not chunk:
-                break
-            i = chunk.find(needle)
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            i = m.find(needle)
             while i >= 0:
-                base = pos + i - NEEDLE_OFF
-                if base >= 0:
-                    f.seek(base)
-                    if f.read(len(content)) == content:
-                        hits.append(base)
-                        if len(hits) > 4:
-                            return hits
-                i = chunk.find(needle, i + 1)
-            pos += len(chunk) - len(needle)
+                base = i - NEEDLE_OFF
+                if base >= 0 and m[base:base + len(content)] == content:
+                    hits.append(base)
+                    if len(hits) > 4:
+                        break
+                i = m.find(needle, i + 1)
     return hits
 
 
@@ -99,14 +92,16 @@ def journal_state(img):
             return "journal on another device (flags=0x%x)" % flags
         f.seek(off)
         h = f.read(64)
-        magic, endian = struct.unpack_from(">II", h, 0)
-        little = magic == 0x4A4E4C78 or magic == 0x784C4E4A
-        fmt = "<" if magic == 0x784C4E4A else ">"
-        start, end = struct.unpack_from(fmt + "II", h, 8)
-        seq, = struct.unpack_from(fmt + "I", h, 28)
-        state = "empty (clean)" if start == end else "PENDING start=%d end=%d" % (start, end)
-        return "in-FS journal offset=%d size=%d magic=%s seq=%d %s" % (
-            off, size, h[:4].decode("latin-1"), seq, state)
+        magic, = struct.unpack_from("<I", h, 0)
+        fmt = "<" if magic == 0x4A4E4C78 else ">"
+        start, end, size = struct.unpack_from(fmt + "QQQ", h, 8)
+        if start == end:
+            return "in-FS journal offset=%d size=%d %s empty (clean)" % (
+                off, size, "LE" if fmt == "<" else "BE")
+        return ("in-FS journal offset=%d size=%d %s PENDING %d..%d (%d bytes); "
+                "replay may undo this edit if the block is in there"
+                % (off, size, "LE" if fmt == "<" else "BE", start, end,
+                   end - start))
 
 
 def main():
