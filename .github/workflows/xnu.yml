@@ -26,8 +26,11 @@ on:
       - ".github/workflows/xnu.yml"
 
 concurrency:
-  group: xnu-${{ github.ref }}
-  cancel-in-progress: true
+  # A patch push and an explicit PRA dispatch for the same commit are both
+  # useful: the push run validates the change and the dispatch selects the
+  # PRA target. Do not have either run cancel the other (or a queued rerun).
+  group: xnu-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
