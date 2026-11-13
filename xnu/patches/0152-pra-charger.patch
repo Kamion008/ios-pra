@@ -741,3 +741,48 @@ index 0000000..1111111
 +	return 0;
 +}
 +#endif /* ARM64_BOARD_CONFIG_PRA */
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/pra_sdhci.c			standard
++bsd/dev/pra_charger.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -18,6 +18,21 @@
+ extern "C" int dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+     int *external, int *charging, int *full);
+ #else
++#if defined(ARM64_BOARD_CONFIG_PRA)
++/* PRA-LX1: bsd/dev/pra_charger.c probes the TI BQ25892 over a polled
++ * DesignWare I2C host and reads its status/ADC; percent is an OCV estimate.
++ * It returns 0 only when a chip answered, so poll() keeps the static fallback
++ * when the charger is absent or the bus is dead.  The name stays because
++ * poll() below is shared with the DREAMLTE path. */
++extern "C" int pra_charger_status(unsigned *percent, unsigned *mv, int *ma,
++    int *external, int *charging, int *full);
++static inline int
++dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
++    int *external, int *charging, int *full)
++{
++	return pra_charger_status(percent, mv, ma, external, charging, full);
++}
++#else
+ /* PRA-LX1 has no MAX77865; the gauge implementation is DREAMLTE-only.  Report
+  * failure so poll() publishes the static fallback and never probes Exynos I2C. */
+ static inline int
+@@ -29,6 +44,7 @@
+ 	return -1;
+ }
+ #endif
++#endif
+ static inline int sweet_spmi_init(void) { return -1; }
+ static inline int sweet_spmi_read(unsigned, unsigned, uint8_t *) { return -1; }
+ #define SWEET_BAT_MAH 3000u

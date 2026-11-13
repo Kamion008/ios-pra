@@ -150,6 +150,15 @@ jobs:
           awk '/<return_to_user>:/ {inside=1} inside {print} inside && /<no_asts>:/ {exit}' /tmp/pra-kernel.disasm \
             | grep '_pra_preempt_notzero' >/dev/null
           echo 'PRA preemption diagnostic helper is linked and called from return_to_user.'
+          # 0155 regression guard: build.sh SKIPS patches whose git apply
+          # --check fails, so a half-regenerated patch can silently drop a
+          # whole driver (the charger was missing from one kernel while CI
+          # stayed green). Every PRA-only driver must assert its strings.
+          strings -a "$kernel" | grep 'PRA charger:' >/dev/null
+          strings -a "$kernel" | grep 'prai2c2' >/dev/null
+          xcrun llvm-nm -n "$kernel" | grep '_pra_log_panic_flush' >/dev/null
+          strings -a "$kernel" | grep 'PRA MSG' >/dev/null
+          echo 'PRA charger, panic flush and Setup probe are linked.'
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
         if: always()
