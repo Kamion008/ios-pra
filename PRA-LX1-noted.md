@@ -1033,3 +1033,85 @@ further along than the console made it look:
 `mount -t hfsplus` returns "No such device", so p58 cannot be mounted from
 recovery. Staging has to be either a PC-side image edit plus a re-stage, or
 an in-place overwrite of an already-allocated file (no HFS+ metadata work).
+
+### 2026-11-13: the UI stack works; RunningBoard's launch watchdog is the blocker
+
+Boot of `0148` + `emmcmulti=0` reached Setup Assistant and is the first boot
+whose panel sequence is fully explained by the log (ring at LBA 794623,
+91,675 bytes, seq 55, no panic, no `CRASH` other than the ones below).
+
+Display, verified working end to end:
+
+    SWEET FB: display on
+    SWEET FB: swap 1 layer 0 surface 2 1080x1920 fmt 0x42475241 bpr 4352 ...
+    SWEET FB: display off            <- boot screen ends, console muted here
+    exec Setup
+    SWEET FB: display on
+    SWEET FB: swap 6 / 7 ...
+    SWEET FB: display off
+
+The Apple logo the user sees is drawn by userland (`IOMFB_FDR_Loader` ->
+`backboardd`), not by a bootloader; there is no iBoot in this path. The logo
+fading out is backboardd handing the display to the render server, which also
+arms `sweetfb_noconsole` (mute happens at the first `present()`).
+
+What actually stops the Hello screen:
+
+    CRASH Setup[431] sig 9 ... reason ns 10 code 0x8badf00d:
+      process-launch watchdog transgression:
+      application<com.apple.purplebuddy>:431 exhausted real (wall clock)
+      time allowance of 20.00 seconds
+    CRASH chronod[473] ... reason ns 10 code 0x8badf00d:
+      scene-create watchdog transgression: osservice<com.apple.chronod>:473
+      exhausted real (wall clock) time allowance of 10.00 seconds
+
+`exec Setup` appears three times: Setup Assistant launches, gets the display,
+is killed at 20 s by RunningBoard, is relaunched. So the graphics path is no
+longer the problem: the process cannot finish launching off this disk inside
+the watchdog window. At the measured ~100 KiB/s the 20 s allowance is ~2 MB of
+I/O, nowhere near what Buddy faults in.
+
+Throughput shape (the reason it is that slow) - from the same ring:
+
+    2142 2751 2738 2527 2757 2766 2747 2755 2376 2678 2547
+    508  240  83   160  232  102  77   61   35   93   128  50 ...
+
+Eleven 8 MiB windows at ~2.1-2.8 MB/s, then a collapse to tens of KiB/s that
+begins at `exec backboardd`/`containermanagerd`, i.e. when first-boot starts
+writing state. 512 bytes on a 26 MHz bus costs 157 us in transfer alone and
+~185 us is measured, so **reads are already at the bus limit**: CMD18 could
+not have bought more than ~15%, which retires it as a lever. The collapse is
+on the write side (card program/erase time, HFS+ journal rewriting one region).
+
+`emmcmulti=1` (0138/0148) is dead: it wedges the card before the first 10 s
+flush, so the root read fails ("mount failed") and the ring cannot be written
+at all - the ring stayed at seq 22, byte-identical. The CMD12 abort does not
+rescue it. Not worth another boot.
+
+Flashed but **not booted** (user asked to stop after the write):
+`/tmp/opencode/pra/pra-xnu-0149.img`, sha256 `78ed044a...`, p27 LBA 753664.
+
+    0147 exec skip + 0148 CMD12 (dormant, emmcmulti=0) + 0149 split stats
+    emmcstats=1 emmcmulti=0 pralog=1 praloglba=794623 sweetfb_noconsole=1
+    sweetfb_hz=1 praexecskip=fairplayd.H2,bluetoothd,nanotimekitcompaniond,
+      locationd,WirelessRadioManagerd,rapportd,nsurlsessiond,cloudpaird,
+      syncdefaultsd,chronod,ScreenTimeAgent,bluetoothuserd,nfcd,misd,
+      mobiletimerd
+
+0149 makes the stats line report reads and writes separately, plus the worst
+single request and a `>5ms` count, and starts the ring before the first host
+print so the SDHCI version/clock/capabilities survive a wedge. That tells us
+whether the collapse is write time (uniformly slow writes) or a hot spot (a
+few very slow requests, e.g. the HFS+ journal).
+
+Next levers, in order of expected value:
+
+1. Read the 0149 `(r ... | w ...)` numbers to confirm the write collapse.
+2. Raise the bus clock: high-speed mode (CMD6 SWITCH HS_TIMING=1, 52 MHz) is a
+   clean 2x on every read and is the only safe lever on the read side.
+3. If the split shows a journal hot spot: disable HFS+ journaling on the p58
+   working copy offline (dump -> edit -> write back), which also removes the
+   biggest write amplifier.
+4. Only then consider disabling RunningBoard's launch watchdog, or the
+   SetupDone bypass the user does not want yet - the Hello screen should be
+   reachable by speed alone, since Setup does run and does get the display.
