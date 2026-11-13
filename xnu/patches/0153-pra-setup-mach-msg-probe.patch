@@ -1,0 +1,131 @@
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -2850,6 +2850,117 @@
+ 	return MACH_MSG_SUCCESS;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_PRA)
++/*
++ * PRA diagnostics: name the peer of a Mach message.
++ *
++ * This phone boots to "exec Setup" and then stops.  Setup's own crash
++ * reports (Setup-*.ips) show its main thread inside UIKit/BoardServices
++ * and a second thread parked in
++ * xpc_connection_send_message_with_reply_sync(), i.e. Setup asked a
++ * service something and the reply never came.  Nothing in userland says
++ * which service that was, so log every message where either end is the
++ * process called "Setup": the peer's BSD name, the msgh_id and the
++ * bits (send-once marks the reply side).  The last line before the boot
++ * goes quiet names the process Setup is stuck on.
++ *
++ * Volume control: a distinct (sender, receiver, msgh_id) triple prints
++ * once and then every 500th time, so a client that loops cannot push
++ * the interesting boot text out of the 4 MiB ring.  The table is small
++ * on purpose; if it fills, the overflow is counted and sampled.
++ *
++ * Receiver lookup: ip_get_receiver_ptr_noauth() strips the PAC without
++ * taking ip_mq_lock().  That is safe here because the message we are
++ * sending holds a reference to the destination port, and a port that
++ * is in a space keeps that space (and its task) alive.
++ */
++#define PRA_MSG_KEYS 128
++
++struct pra_msg_key {
++	task_t          sender;
++	task_t          receiver;
++	mach_msg_id_t   id;
++	uint32_t        hits;
++};
++
++static struct pra_msg_key pra_msg_keys[PRA_MSG_KEYS];
++static uint32_t pra_msg_nkeys;
++static uint64_t pra_msg_overflow;
++
++/* bsd/kern/kern_proc.c; declared here so osfmk needs no BSD headers. */
++extern char *proc_name_address(void *);
++
++static const char *
++pra_task_comm(task_t task)
++{
++	void *info;
++
++	if (task == TASK_NULL) {
++		return "kernel";
++	}
++	info = get_bsdtask_info(task);
++	if (info == NULL) {
++		return "kernel";
++	}
++	return proc_name_address(info);
++}
++
++static void
++pra_msg_probe(ipc_kmsg_t kmsg, ipc_port_t port)
++{
++	mach_msg_header_t *hdr = ikm_header(kmsg);
++	task_t sender = current_task();
++	task_t receiver = TASK_NULL;
++	ipc_space_t space;
++	const char *sname, *rname;
++	uint32_t i, free_slot = PRA_MSG_KEYS;
++
++	space = (ipc_space_t)ip_get_receiver_ptr_noauth(port);
++	if (space != IPC_SPACE_NULL) {
++		receiver = space->is_task;
++	}
++	sname = pra_task_comm(sender);
++	rname = pra_task_comm(receiver);
++	if (strcmp(sname, "Setup") != 0 && strcmp(rname, "Setup") != 0) {
++		return;
++	}
++
++	for (i = 0; i < PRA_MSG_KEYS; i++) {
++		if (pra_msg_keys[i].hits == 0) {
++			if (free_slot == PRA_MSG_KEYS) {
++				free_slot = i;
++			}
++			continue;
++		}
++		if (pra_msg_keys[i].sender == sender &&
++		    pra_msg_keys[i].receiver == receiver &&
++		    pra_msg_keys[i].id == hdr->msgh_id) {
++			if ((++pra_msg_keys[i].hits % 500) == 0) {
++				printf("PRA MSG: %s -> %s id=0x%x bits=0x%x hits=%u\n",
++				    sname, rname, hdr->msgh_id, hdr->msgh_bits,
++				    pra_msg_keys[i].hits);
++			}
++			return;
++		}
++	}
++	if (free_slot == PRA_MSG_KEYS) {
++		if ((++pra_msg_overflow % 1024) == 1) {
++			printf("PRA MSG: %s -> %s id=0x%x bits=0x%x table full %llu\n",
++			    sname, rname, hdr->msgh_id, hdr->msgh_bits,
++			    (unsigned long long)pra_msg_overflow);
++		}
++		return;
++	}
++	pra_msg_keys[free_slot].sender = sender;
++	pra_msg_keys[free_slot].receiver = receiver;
++	pra_msg_keys[free_slot].id = hdr->msgh_id;
++	pra_msg_keys[free_slot].hits = 1;
++	pra_msg_nkeys++;
++	printf("PRA MSG[%u]: %s -> %s id=0x%x bits=0x%x\n",
++	    pra_msg_nkeys, sname, rname, hdr->msgh_id, hdr->msgh_bits);
++}
++#endif /* ARM64_BOARD_CONFIG_PRA */
++
+ /*
+  *	Routine:	ipc_kmsg_send
+  *	Purpose:
+@@ -2910,6 +3021,9 @@
+ 
+ 	port = hdr->msgh_remote_port;
+ 	assert(IP_VALID(port));
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	pra_msg_probe(kmsg, port);
++#endif
+ 	ip_mq_lock(port);
+ 
+ 	/*
