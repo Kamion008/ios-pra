@@ -1,7 +1,7 @@
 diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
 --- a/osfmk/ipc/ipc_kmsg.c
 +++ b/osfmk/ipc/ipc_kmsg.c
-@@ -2850,6 +2850,117 @@
+@@ -2850,6 +2850,114 @@
  	return MACH_MSG_SUCCESS;
  }
  
@@ -42,9 +42,6 @@ diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
 +static uint32_t pra_msg_nkeys;
 +static uint64_t pra_msg_overflow;
 +
-+/* bsd/kern/kern_proc.c; declared here so osfmk needs no BSD headers. */
-+extern char *proc_name_address(void *);
-+
 +static const char *
 +pra_task_comm(task_t task)
 +{
@@ -57,7 +54,7 @@ diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
 +	if (info == NULL) {
 +		return "kernel";
 +	}
-+	return proc_name_address(info);
++	return proc_name_address((struct proc *)info);
 +}
 +
 +static void
@@ -119,7 +116,7 @@ diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
  /*
   *	Routine:	ipc_kmsg_send
   *	Purpose:
-@@ -2910,6 +3021,9 @@
+@@ -2910,6 +3018,9 @@
  
  	port = hdr->msgh_remote_port;
  	assert(IP_VALID(port));
