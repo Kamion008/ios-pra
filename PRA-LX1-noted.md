@@ -1147,3 +1147,65 @@ the ring because 0149 moved `pra_log_start()` ahead of the first print.
 
 Decision tree from those two lines is in the section above: uniform slow writes
 => write volume / block size; few very slow requests => HFS+ journal hot spot.
+
+## GPU: what the herolte branch proves, and what it costs here (2026-11-13)
+
+The user pointed at `wardevsa/ios-a5xelte` branch `herolte`: a Galaxy S7
+(SM-G930F, Exynos 8890, Mali-T880 MP12) that reaches the iPhone X iOS 16.7.16
+home screen with the GPU doing CoreAnimation. A shallow clone is in
+`research/herolte-ref` (6.2 MB, gitignored).
+
+How that stack is built, because it decides what transfers:
+
+- `iokit/Kernel/arm/HeroGPU.cpp` (grown from `bsd/dev/herolte_gpu.c`, patches
+  0225-0250 and 0333): an XNU-internal Midgard driver - probe, page tables,
+  job slots and fences, tiler heap, BO alloc/map/submit, IOSurface import -
+  exposed to userland as one IOKit user client. Not kbase, not DRM.
+- `gpu/mesa/herodrm.c` + `build-mesa.sh` + `patch-mesa.py`: a libdrm stand-in
+  that answers Mesa's panfrost DRM ioctls with that IOKit client, and Mesa
+  25.0.7's Panfrost + OSMesa cross-built for iOS arm64 (`iphoneos` SDK).
+- `gpu/eagl` (Bergamota's EAGL shim) and `gpu/hakios-gl` (HakiOS EAGL bridge
+  with CoreAnimation hooks): SpringBoard/backboardd keep calling EAGL/GL ES,
+  which lands in OSMesa -> Panfrost -> our kernel jobs. Patches 0245/0246 put
+  the shim in the root and widen AMFI/dyld policy so it loads.
+
+Why this is closer to possible here than it looks: the PRA's GPU is a Mali-T830
+MP2, and T830 is the same Midgard **v5** ISA as the T880. Mesa's Midgard
+compiler, descriptor layout and most quirk handling are shared, and Panfrost
+already lists 0x830. The kernel driver's Exynos constants are the part that
+does not transfer.
+
+Hardware facts for hi6250, from Huawei's own GPL DTS in
+`/home/kamion008/Ai/huawei/hi6250-kernel`
+(`arch/arm64/boot/dts/auto-generate/config/hi6250/hisi_6250_gpu.dtsi`):
+
+    gpu: mali@E8970000   reg 0x4000, compatible "arm,malit6xx","arm,mali-midgard"
+    interrupts: 258 JOB, 259 MMU, 260 GPU (SPI, level)
+    clocks = <&clk_g3d>;  gpu-supply = <&g3d>;
+    OPP: 120 MHz 696 mV, 240/698, 360/700, 480/744, 680/820, 800/943, 900/1073
+
+The best news is in `hisi_6250_powerip.dtsi` and `hisi_6250_clock.dtsi`: on
+hi6250 the GPU rail and clock are **not** PMIC/CRG register pokes, they are two
+LPM3 IPC requests that the vendor firmware already implements -
+
+    g3d enable  0x00030004 / disable 0x00030104   (regulator "g3d", type2)
+    clk_g3d set-rate 0x0003030A, get-rate 0x0003020A, devid 2
+
+So power-on + rate is a mailbox conversation with LPM3, not the Exynos-style
+BUCK4 voltage table plus CMU divider/mux sequencing that cost herolte the
+0130/0170 patches. The mailbox message format is in Huawei's full kernel
+release (our local tree is a DTS-only cut, no `drivers/`), and the LPM3 side is
+still alive under our kernel - it is what the stock boot chain talks to.
+
+Stage order stays the herolte one: probe (expect GPU_ID product 0x830) ->
+one private WRITE_VALUE job -> fragment clear -> IOSurface import -> panel
+blit -> user client -> Mesa/OSMesa -> EAGL shim in SpringBoard.
+
+Two honest costs:
+
+- This is stage 4 of 4. It cannot put the Hello screen on the panel; the eMMC
+  throughput and the 20 s launch watchdog do that. It makes the UI usable
+  afterwards, and it is untestable until boot and touch work.
+- The userland side is not free either: OSMesa+Panfrost+shim are ~20 MB that
+  every first boot must read from a 0.5 MB/s eMMC (~40 s), so it interacts
+  with the I/O problem rather than sidestepping it.
