@@ -1115,3 +1115,35 @@ Next levers, in order of expected value:
 4. Only then consider disabling RunningBoard's launch watchdog, or the
    SetupDone bypass the user does not want yet - the Hello screen should be
    reachable by speed alone, since Setup does run and does get the display.
+
+### Handoff 2026-11-13 (stopping for the day)
+
+State at stop: `pra-xnu-0149.img` is flashed to p27 and the phone was rebooted
+into it by the user; whether it finished booting is unknown. The phone is in
+**XNU**, not TWRP. To get back: force off, then vol+ + power with the cable
+unplugged. The ring at LBA 794623 then holds the 0149 boot.
+
+Saved to persistent disk (research/ is gitignored):
+
+    research/p58-20261113.img        10,271,850,600 B, full p58 after a first boot
+    research/pra-artifacts/ring5.txt 91,675 B ring - the Setup/watchdog boot
+    research/pra-artifacts/ring{2,3,4}.txt, ring.txt
+    research/pra-artifacts/pra-xnu-0149.img    what is flashed now (78ed044a...)
+    research/pra-artifacts/pra-xnu-single-raw.img  0148 with emmcmulti=0
+    out/ci.0147 out/ci.0148 out/ci.0149           CI kernels (sha256sums inside)
+    ~/Videos/Moskau/                 Moskau-1080p.mp4, moskau-full-480p.mp4
+
+`/tmp` is a 16 GiB tmpfs and does not survive a reboot, which is why the ring
+logs and both flashed images were copied out. The video originals, the 60 s
+cuts and `art140/` were left in /tmp on purpose.
+
+First thing next session - read the 0149 ring and compare the split:
+
+    PRA eMMC: 8192 KiB, ... KiB/s (r ... KiB ... cmds ... KiB/s | w ... KiB
+      ... cmds ... KiB/s | >5ms N max N us)
+
+Then `host base=... clock=... caps=... base=N MHz div=N`, which is now inside
+the ring because 0149 moved `pra_log_start()` ahead of the first print.
+
+Decision tree from those two lines is in the section above: uniform slow writes
+=> write volume / block size; few very slow requests => HFS+ journal hot spot.
