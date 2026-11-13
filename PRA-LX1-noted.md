@@ -1116,6 +1116,53 @@ Next levers, in order of expected value:
    SetupDone bypass the user does not want yet - the Hello screen should be
    reachable by speed alone, since Setup does run and does get the display.
 
+### 2026-11-13: the 20 s allowance is settable from SpringBoard's prefs
+
+A dyld-cache and volume study (report: `research/rb-watchdog-report.md`)
+established the owner of the number and a filesystem-only way to raise it:
+
+- The timeout is **FrontBoard's** `FBApplicationProcessWatchdogPolicy`,
+  evaluated inside the process that owns the app (`SpringBoard` for a
+  foreground launch). The 20.0 s is a compile-time constant
+  (`mov x9,#0x4034000000000000` at cache VA `0x1a266e704`), selected by
+  `event == process-launch` with launch intent 3/4; intents 1/2 get 60/30 s.
+- Two additive extensions run on the same accumulator right after that
+  dispatch, one of them the `FBLaunchWatchdogExceptions` dictionary read
+  with `doubleValue` and `fadd`ed into it. Value is **added seconds**.
+- Domain: `com.apple.springboard`, file
+  `/private/var/mobile/Library/Preferences/com.apple.springboard.plist`
+  (2006 bytes, 18 keys, exists). `com.apple.purplebuddy.plist` has no
+  watchdog key; the Setup process is `/Applications/Setup.app/Setup`
+  (there is no `purplebuddy` executable).
+- `{"com.apple.purplebuddy" = 280}` therefore means 300.00 s for the launch
+  and 290 s for its scene-create path. The proof line to look for in the
+  ring is `allowance of 300.00 seconds`; if the boot is still killed at
+  `20.00 seconds` the key was not read.
+- Do not patch `Setup`'s Mach-O (breaks the signature) and do not delete
+  dyld caches (nothing would launch).
+
+Getting the key onto the volume is the awkward part: TWRP cannot mount HFSX
+and Linux has no HFS+ writer. The file happens to occupy exactly one 4096-byte
+block with 2090 bytes of slack, so the new plist is re-encoded to the *same*
+2006-byte logical size (a `PRAWatchdogPad` filler key absorbs the difference)
+and only that block is rewritten. No catalog record, B-tree node, allocation
+bitmap or GPT is touched.
+
+    tools/pra_hfs_watchdog.py IMAGE --add com.apple.purplebuddy=280 --plist P
+    tools/pra_setwatchdog.sh  IMAGE [ADDITIVE] [--yes]    # mount, patch, dd, verify
+
+Caveat: the volume is journaled (`attrs 0x80002000`, in-FS journal at block
+79, 8 MiB). If the journal still holds the edited block, XNU's replay can
+restore the old plist; the ring line above is the tell, and the cure is
+`fsck.hfsplus -f -y` on the dump, then writing the larger changed block set.
+
+Where the space on this volume actually is (same study, measured): 523.8 MiB
+free (95 % used); `Setup.app` is **35 MB**, not 500 MB, so deleting it after
+Hello buys little. `/System` is 7.9 GB and sealed by SSV - never edit it.
+`/Applications` is 228 MB total; the dyld cache dir is 2.74 GB but is stored
+once (`/System/Library/Caches/com.apple.dyld` and the preboot cryptex copy
+share inodes, `nlink=2`). `*.lproj` trees are 248 MB in 91,562 directories.
+
 ### Handoff 2026-11-13 (stopping for the day)
 
 State at stop: `pra-xnu-0149.img` is flashed to p27 and the phone was rebooted
