@@ -1,0 +1,68 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1157,6 +1157,49 @@
+  *		activators should not be given the opportunity to attempt
+  *		to activate the image.
+  */
++#if defined(ARM64_BOARD_CONFIG_PRA)
++/*
++ * praexecskip=name1,name2,... makes exec of those binaries fail before the
++ * image is read. Daemons that need hardware this phone does not have (SEP,
++ * bluetooth, telephony, GPS) otherwise crash-loop through launchd, and each
++ * retry re-reads a multi-MB Mach-O over single-sector PIO: on one boot five
++ * such daemons accounted for 630 execs and most of the 3 GiB read.
++ */
++static int
++pra_exec_skipped(const char *path)
++{
++	static int logged;
++	char list[256];
++	const char *base = path;
++	char *item, *comma;
++	size_t len;
++
++	if (!path || !PE_parse_boot_argn("praexecskip", list, sizeof(list))) {
++		return 0;
++	}
++	if (!logged) {
++		logged = 1;
++		printf("praexecskip: %s\n", list);
++	}
++	for (const char *c = path; *c; c++) {
++		if (*c == '/') {
++			base = c + 1;
++		}
++	}
++	for (item = list; *item; item = comma + 1) {
++		comma = strchr(item, ',');
++		len = comma ? (size_t)(comma - item) : strlen(item);
++		if (len && strlen(base) == len && strncmp(base, item, len) == 0) {
++			return 1;
++		}
++		if (!comma) {
++			break;
++		}
++	}
++	return 0;
++}
++#endif
++
+ static int
+ exec_mach_imgact(struct image_params *imgp)
+ {
+@@ -1179,6 +1222,14 @@
+ 	boolean_t               reslide = FALSE;
+ 	char *                  userspace_coredump_name = NULL;
+ 
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	if (imgp->ip_ndp != NULL &&
++	    pra_exec_skipped(imgp->ip_ndp->ni_cnd.cn_nameptr)) {
++		error = EPERM;
++		goto bad;
++	}
++#endif
++
+ 	/*
+ 	 * make sure it's a Mach-O 1.0 or Mach-O 2.0 binary; the difference
+ 	 * is a reserved field on the end, so for the most part, we can
