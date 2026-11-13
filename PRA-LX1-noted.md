@@ -1274,6 +1274,87 @@ says the stalls cluster on writes; otherwise the next read-side question is
 the contradiction recorded above (24 MiB/s design assumption vs "at the
 card's limit").
 
+### ring8: Setup never asks for its scene; five daemons supply the I/O (2026-11-13)
+
+One-hour boot of 0151 with the watchdog key, dumped as
+`research/pra-artifacts/ring8.txt` (187,158 B, 5,270 lines, no wrap).
+
+    jnl: replay_journal: from: 4617216 to: 5682176
+    exec Setup                  <- exactly once, no CRASH Setup in 5,270 lines
+    SWEET FB: display on
+    SWEET FB: swap 9 / swap 10  <- last frames, ~30 lines after Setup
+    (3,188 further lines, no SWEET FB call at all)
+
+- **No frame is presented after Setup launches.** The last `swap` is 10, about
+  thirty lines after `exec Setup`; the remaining 3,300 lines have zero
+  framebuffer calls. The panel keeps the last frame, which is why the Apple
+  logo sits there for an hour.
+- Since a scene-create watchdog kill at 300 s would have printed `CRASH
+  Setup` (the hook prints SIGKILL - it printed `CRASH driverkitd sig 9`), and
+  none appears, **Setup never requested its scene**. It is stuck in
+  initialisation, not "rendering slowly".
+- The I/O is not Setup's: 238 stat intervals (8 MiB each) = 1,912 MiB total,
+  859 MiB after Setup. `xpcproxy` execs: 3,002 (2,609 after Setup), and the
+  last 305 lines are back-to-back `exec xpcproxy` with nothing between.
+- The write share climbs across the second half of the boot: 0-30 % early,
+  then 76, 97, 37, 47, 13, 85, 81, 67, **99 %** (last interval: 8,160 KiB
+  written, 32 KiB read, 611 KiB/s). Something is writing 8 MiB streams with
+  512-byte commands while reads starve.
+
+### Where that churn comes from (launchd's own log, on-disk)
+
+`/private/var/log/com.apple.xpc.launchd/launchd.log` holds a full boot of the
+same failure mode. Counting spawns and exits in 7.5 minutes of it:
+
+    106 locationd                              88 exit(78)
+     37 bluetoothd                            27 exit(78)
+     37 fairplayd.H2                          27 exit(78)
+     35 nanotimekitcompaniond                 23 exit(78)
+     35 WirelessRadioManager                  27 exit(78)
+    254 spawns total, 230 "throttled by 10 seconds"
+
+The current cmdline has **no** `praexecskip`; these five fail on their own
+(exit 78 = EX_CONFIG) and launchd respawns them every 10 s because their
+plists set `KeepAlive`. At ~34 launches a minute, each re-reading a multi-MB
+Mach-O and writing a crash report, they account for essentially all of the
+859 MiB after Setup and for the write storm. Setup cannot get the disk even
+if it wanted to.
+
+Crash reports on disk (from the pre-fix boots) show the history the ring
+never printed: six `Setup-*.ips` files, all `EXC_CRASH/SIGKILL`,
+`0x8BADF00D`, with two distinct events - `process-launch watchdog
+transgression ... allowance of 20.00 seconds` and `scene-create watchdog
+transgression ... 20.00 seconds`, `ProcessVisibility: Background`. Setup
+*did* reach scene creation in those boots, so the 300 s key is what keeps it
+alive now, and its current silence means it no longer gets that far.
+
+### Disabling the five jobs the way launchd intends
+
+`launchd` contains `%s/disabled.plist` and `%s/disabled.migrated`, and
+`/private/var/db/com.apple.xpc.launchd/disabled.plist` exists and is live:
+an **XML plist of label -> true** (six Apple jobs already disabled: bootpd,
+dhcp6d, ftp-proxy-embedded, magicswitchd.companion, relevanced, otpaird).
+The file is one 4 KiB allocation block with a **459-byte fork**, so a
+rewritten plist must occupy exactly 459 bytes or the catalog record and
+bitmap have to change.
+
+Located through the catalog B-tree key (UTF-16BE name, fileID 313658,
+extent 2411046, one block) and confirmed live by reading it back: device
+LBA **30003504** (bs=512). `tools/pra_disabled_jobs.py` merges labels into
+the live file as a binary plist padded to the fork length with a throwaway
+boolean key, writes one block, and verifies the read-back.
+
+Applied 2026-11-13: the five looping jobs now map to true, all six original
+entries preserved, 12 entries in a 459-byte binary plist, block written and
+compared byte-for-byte. Revert with `tools/pra_disabled_jobs.py --restore`
+(the original block is in `/tmp/opencode/disabled_block.orig`).
+
+Expected on the next boot: `launchd.log` shows no respawns for those five,
+the `exec xpcproxy` count should collapse from ~3,000/hour, and the write
+storm with it. If Setup then draws, the churn was the blocker; if it stays
+silent, the churn is not what blocks it and the next probe is Setup's own
+state.
+
 ### Handoff 2026-11-13 (stopping for the day)
 
 State at stop: `pra-xnu-0149.img` is flashed to p27 and the phone was rebooted
