@@ -1,0 +1,769 @@
+diff --git a/bsd/dev/pra_charger.c b/bsd/dev/pra_charger.c
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/bsd/dev/pra_charger.c
+@@ -0,0 +1,719 @@
++/*
++ * PRA-LX1 (hi6250) TI BQ25892 charger bring-up.
++ *
++ * The phone charges through a BQ25892 behind one of the two DesignWare
++ * I2C hosts at 0xFFD73000 (19.2 MHz input clock, reset register at
++ * 0xFFD7E000) or 0xFDF0D000 (120 MHz, reset at 0xFFF35000). Which host
++ * carries the chip is not established, so both are probed read-only at
++ * both legal 7-bit addresses (0x6B for the BQ25892, 0x6A as the
++ * fallback; TI datasheet SLUSC86D "Device Comparison Table"). The
++ * bootloader runs its own charger firmware and may leave the controller
++ * clocked and pinmuxed or not; the probe fails closed instead of
++ * spinning: every poll is bounded and a silent bus just ends the probe.
++ *
++ * Safety: the default is read-only. Not one register write reaches the
++ * chip unless boot-arg pracharger=1 is set AND the chip answered REG0B
++ * with power good AND REG0C carried no fault bits. Even then the only
++ * writes are EN_HIZ=0, IINLIM=500 mA, ICHG=512 mA and the watchdog
++ * period/kick (see pra_chg_apply_limits). VREG, JEITA, termination,
++ * BATFET, boost/OTG and the charge timer are never touched: a wrong
++ * write to those can overcharge or overheat the battery. pra_chg_write
++ * is the single choke point and refuses everything without pracharger=1.
++ *
++ * Register provenance: field map and conversion formulas from mainline
++ * drivers/power/supply/bq25890_charger.c (torvalds/linux master,
++ * fetched 2026-11-12; identical back to v6.1). DesignWare register
++ * offsets from Linux v6.1 drivers/i2c/busses/i2c-designware-core.h
++ * (unchanged through master). Nothing was guessed.
++ *
++ * SOC is NOT a fuel gauge reading: percent is interpolated from VBAT on
++ * a flat Li-ion OCV table (3.30 V = 0%, 4.35 V = 100%) and is logged as
++ * an estimate. The HI6555 coulomb counter is out of scope here.
++ */
++#if defined(ARM64_BOARD_CONFIG_PRA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++
++/*
++ * DesignWare I2C register offsets (Linux v6.1 i2c-designware-core.h).
++ * The Huawei "i2c_designware-hs" driver is a DesignWare fork with a
++ * separate reset register; its register layout is assumed standard and
++ * verified at runtime through COMP_VERSION/COMP_TYPE.
++ */
++#define DW_IC_CON               0x00u
++#define DW_IC_TAR               0x04u
++#define DW_IC_DATA_CMD          0x10u
++#define DW_IC_SS_SCL_HCNT       0x14u
++#define DW_IC_SS_SCL_LCNT       0x18u
++#define DW_IC_RAW_INTR_STAT     0x34u
++#define DW_IC_CLR_TX_ABRT       0x54u   /* read-to-clear */
++#define DW_IC_CLR_STOP_DET      0x60u   /* read-to-clear */
++#define DW_IC_ENABLE            0x6Cu
++#define DW_IC_STATUS            0x70u
++#define DW_IC_TXFLR             0x74u
++#define DW_IC_ENABLE_STATUS     0x9Cu
++#define DW_IC_COMP_VERSION      0xF8u
++#define DW_IC_COMP_TYPE         0xFCu
++
++#define DW_IC_CON_MASTER        0x01u   /* MASTER_MODE */
++#define DW_IC_CON_SPEED_STD     0x02u   /* SPEED = standard (100 kHz) */
++#define DW_IC_CON_10BIT         0x08u   /* IC_10BITADDR_MASTER */
++#define DW_IC_CON_RESTART_EN    0x20u   /* IC_RESTART_EN */
++#define DW_IC_CON_SLAVE_DIS     0x40u   /* IC_SLAVE_DISABLE */
++#define DW_IC_CMD_READ          0x100u  /* DATA_CMD bit 8 */
++#define DW_IC_CMD_STOP          0x200u  /* DATA_CMD bit 9 */
++#define DW_IC_INTR_RX_FULL      (1u << 2)
++#define DW_IC_INTR_TX_ABRT      (1u << 6)
++#define DW_IC_INTR_STOP_DET     (1u << 9)
++#define DW_IC_STATUS_BUSY       0x21u   /* ACTIVITY | MASTER_ACTIVITY */
++#define DW_IC_EN_STATUS_IC_EN   (1u << 0)
++#define DW_IC_TXABRT_ADDR_NOACK (1u << 0)       /* ABRT_7B_ADDR_NOACK */
++
++/*
++ * BQ25892 registers (mainline bq25890_charger.c bq25890_reg_fields[]).
++ * Only REG00, REG02, REG03, REG04 and REG07 are ever written, and only
++ * behind pracharger=1. REG0B/0C/0E/11/12/14 are read-only per the
++ * mainline writeable-register table.
++ */
++#define BQ_REG00        0x00u   /* EN_HIZ[7] EN_ILIM[6] IINLIM[5:0] */
++#define BQ_REG02        0x02u   /* CONV_START[7] CONV_RATE[6] ... */
++#define BQ_REG03        0x03u   /* BAT_LOAD_EN[7] WD_RST[6] OTG_CFG[5] CHG_CFG[4] SYSVMIN[3:1] */
++#define BQ_REG04        0x04u   /* PUMPX_EN[7] ICHG[6:0] */
++#define BQ_REG07        0x07u   /* TERM_EN[7] STAT_DIS[6] WD[5:4] TMR_EN[3] CHG_TMR[2:1] JEITA_ISET[0] */
++#define BQ_REG0B        0x0Bu   /* VBUS_STAT[7:5] CHG_STAT[4:3] PG_STAT[2] SDP_STAT[1] VSYS_STAT[0] */
++#define BQ_REG0C        0x0Cu   /* WD_FAULT[7] BOOST_FAULT[6] CHG_FAULT[5:4] BAT_FAULT[3] NTC_FAULT[2:0] */
++#define BQ_REG0E        0x0Eu   /* THERM_STAT[7] BATV[6:0] */
++#define BQ_REG11        0x11u   /* VBUS_GD[7] VBUSV[6:0] */
++#define BQ_REG12        0x12u   /* ICHGR[6:0] */
++#define BQ_REG14        0x14u   /* REG_RST[7] ICO_OPT[6] PN[5:3] TS_PROFILE[2] DEV_REV[1:0] */
++
++/* BQ25892 = 0x6B, BQ25890 = 0x6A (TI datasheet SLUSC86D). */
++#define BQ_ADDR_25892   0x6Bu
++#define BQ_ADDR_25890   0x6Au
++
++/* IINLIM/ICHG indices from the mainline range tables
++ * (TBL_IINLIM 100 mA step 50 mA, TBL_ICHG 0 step 64 mA). */
++#define BQ_IINLIM_500MA_IDX     8u      /* 100 + 8*50 = 500 mA */
++#define BQ_ICHG_512MA_IDX       8u      /* 8*64 = 512 mA */
++
++/* Watchdog field: 0=disabled 1=40 s 2=80 s 3=160 s (longest). */
++#define BQ_WD_LONGEST           3u
++#define BQ_WD_MASK              0x30u
++#define BQ_WD_RST               0x40u   /* REG03 trigger, self-clearing */
++#define BQ_CONV_START           0x80u   /* REG02 trigger, self-clearing */
++
++/* Bounded waits. Each iteration is one mapped MMIO read; 20000 keeps a
++ * dead controller under ~20 ms per wait and a live one far below that.
++ * The ADC one-shot conversion takes ~10 ms, so it is bounded the same
++ * way but in I2C register reads (~1 ms each). */
++#define PRA_I2C_POLLS           20000u
++#define PRA_CONV_POLLS          20u
++
++/* Flat Li-ion OCV estimate (contract: 3.30 V = 0%, 4.35 V = 100%). This
++ * is voltage at the BAT pin, so load sag while charging reads high. */
++static const uint16_t pra_soc_mv[] = {
++	3300, 3400, 3500, 3600, 3700, 3800, 3900,
++	4000, 4100, 4200, 4300, 4350,
++};
++static const uint8_t pra_soc_pct[] = {
++	0, 3, 8, 14, 25, 40, 55, 68, 79, 89, 96, 100,
++};
++
++struct pra_i2c_host {
++	uint64_t base;
++	uint64_t reset;                 /* reset register, logged, never written */
++	uint32_t clk;                   /* input clock, Hz */
++	const char *name;
++	vm_offset_t regs;
++	vm_offset_t reset_regs;
++	uint8_t addr;                   /* configured TAR, 0 = not configured */
++	bool usable;
++};
++
++static struct pra_i2c_host pra_i2c[2] = {
++	{ .base = 0xFFD73000ULL, .reset = 0xFFD7E000ULL,
++	  .clk = 19200000, .name = "ffd73000" },
++	{ .base = 0xFDF0D000ULL, .reset = 0xFFF35000ULL,
++	  .clk = 120000000, .name = "fdf0d000" },
++};
++
++static struct pra_i2c_host *pra_h;      /* host the chip answered on */
++static struct pra_chg_sample {
++	unsigned percent;               /* 0..100, OCV estimate */
++	unsigned mv;                    /* VBAT, mV */
++	int ma;                         /* charge current, positive = charging */
++	bool external, charging, full, mv_valid;
++} pra_snap;
++
++static bool _Atomic pra_started;        /* probe ran at most once */
++static bool pra_present;                /* chip answered */
++static bool pra_writes;                 /* pracharger=1 */
++static bool pra_dbg;                    /* prachgdebug=1 */
++static bool pra_wd_kick;                /* watchdog enabled, must kick */
++static uint8_t pra_last0b, pra_last0c;  /* last raw status, for the log */
++static char pra_charger_chan;
++
++static LCK_GRP_DECLARE(pra_charger_grp, "pra_chg");
++static LCK_MTX_DECLARE(pra_charger_lock, &pra_charger_grp);
++
++static inline uint32_t
++pra_i2c_rd32(vm_offset_t regs, uint32_t off)
++{
++	return *(volatile uint32_t *)(regs + off);
++}
++
++static inline void
++pra_i2c_wr32(vm_offset_t regs, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(regs + off) = value;
++}
++
++/* IC_EN in ENABLE_STATUS follows ENABLE a few clocks later. */
++static int
++pra_i2c_wait_enable(vm_offset_t regs, bool want)
++{
++	for (unsigned i = 0; i < PRA_I2C_POLLS; i++) {
++		bool have = (pra_i2c_rd32(regs, DW_IC_ENABLE_STATUS) &
++		    DW_IC_EN_STATUS_IC_EN) != 0;
++		if (have == want) {
++			return 0;
++		}
++	}
++	return ETIMEDOUT;
++}
++
++/* Bounded wait for an idle bus before (re)configuring the controller. */
++static void
++pra_i2c_wait_idle(vm_offset_t regs)
++{
++	for (unsigned i = 0; i < PRA_I2C_POLLS; i++) {
++		if (!(pra_i2c_rd32(regs, DW_IC_STATUS) & DW_IC_STATUS_BUSY)) {
++			break;
++		}
++	}
++}
++
++/* Take the controller from whatever the bootloader left to a known
++ * standard-mode master pointed at addr. This is controller state, not
++ * chip state: the charger register contents are untouched. */
++static int
++pra_i2c_setup(struct pra_i2c_host *h, uint8_t addr)
++{
++	vm_offset_t r = h->regs;
++	uint32_t total, hcnt;
++
++	pra_i2c_wr32(r, DW_IC_ENABLE, 0);
++	if (pra_i2c_wait_enable(r, false)) {
++		return ETIMEDOUT;
++	}
++	(void)pra_i2c_rd32(r, DW_IC_CLR_TX_ABRT);
++	(void)pra_i2c_rd32(r, DW_IC_CLR_STOP_DET);
++	/* Standard mode 100 kHz from the measured input clock: ~40% high
++	 * duty keeps the 4.0 us high / 4.7 us low minimums of the I2C spec.
++	 * SDA hold is left as the bootloader configured it. */
++	total = h->clk / 100000;
++	if (total < 24) {
++		return EINVAL;
++	}
++	hcnt = total * 2 / 5;
++	pra_i2c_wr32(r, DW_IC_SS_SCL_HCNT, hcnt);
++	pra_i2c_wr32(r, DW_IC_SS_SCL_LCNT, total - hcnt);
++	pra_i2c_wr32(r, DW_IC_CON, DW_IC_CON_MASTER | DW_IC_CON_SPEED_STD |
++	    DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DIS);
++	pra_i2c_wr32(r, DW_IC_TAR, addr & 0x7Fu);
++	h->addr = addr;
++	__asm__ volatile("dsb sy" : : : "memory");
++	pra_i2c_wr32(r, DW_IC_ENABLE, 1);
++	if (pra_i2c_wait_enable(r, true)) {
++		return ETIMEDOUT;
++	}
++	return 0;
++}
++
++/* One register read: write the offset, then a repeated-start read with
++ * STOP. NACK is the normal probe outcome for an absent chip and maps to
++ * ENXIO; a silent bus is a timeout. */
++static int
++pra_i2c_read_reg(struct pra_i2c_host *h, uint8_t reg, uint8_t *val)
++{
++	vm_offset_t r = h->regs;
++	uint32_t raw;
++	int error = ETIMEDOUT;
++
++	if (h->addr == 0) {
++		return ENXIO;
++	}
++	pra_i2c_wait_idle(r);
++	(void)pra_i2c_rd32(r, DW_IC_CLR_STOP_DET);
++	(void)pra_i2c_rd32(r, DW_IC_CLR_TX_ABRT);
++	pra_i2c_wr32(r, DW_IC_DATA_CMD, reg);
++	__asm__ volatile("dsb sy" : : : "memory");
++	pra_i2c_wr32(r, DW_IC_DATA_CMD, DW_IC_CMD_READ | DW_IC_CMD_STOP);
++	for (unsigned i = 0; i < PRA_I2C_POLLS; i++) {
++		raw = pra_i2c_rd32(r, DW_IC_RAW_INTR_STAT);
++		if (raw & DW_IC_INTR_TX_ABRT) {
++			error = ENXIO;          /* address NACK: no chip */
++			break;
++		}
++		if (raw & DW_IC_INTR_RX_FULL) {
++			error = 0;
++			break;
++		}
++	}
++	if (!error) {
++		*val = (uint8_t)pra_i2c_rd32(r, DW_IC_DATA_CMD);
++		/* Let the controller release the bus before the next txn. */
++		pra_i2c_wait_idle(r);
++	}
++	(void)pra_i2c_rd32(r, DW_IC_CLR_TX_ABRT);
++	(void)pra_i2c_rd32(r, DW_IC_CLR_STOP_DET);
++	if (error == ETIMEDOUT) {
++		/* Force reconfiguration before the next attempt. */
++		h->addr = 0;
++	}
++	return error;
++}
++
++/* One register write: offset then value with STOP. */
++static int
++pra_i2c_write_reg(struct pra_i2c_host *h, uint8_t reg, uint8_t val)
++{
++	vm_offset_t r = h->regs;
++	uint32_t raw;
++	int error = ETIMEDOUT;
++
++	if (h->addr == 0) {
++		return ENXIO;
++	}
++	pra_i2c_wait_idle(r);
++	(void)pra_i2c_rd32(r, DW_IC_CLR_STOP_DET);
++	(void)pra_i2c_rd32(r, DW_IC_CLR_TX_ABRT);
++	pra_i2c_wr32(r, DW_IC_DATA_CMD, reg);
++	__asm__ volatile("dsb sy" : : : "memory");
++	pra_i2c_wr32(r, DW_IC_DATA_CMD, val | DW_IC_CMD_STOP);
++	for (unsigned i = 0; i < PRA_I2C_POLLS; i++) {
++		raw = pra_i2c_rd32(r, DW_IC_RAW_INTR_STAT);
++		if (raw & DW_IC_INTR_TX_ABRT) {
++			error = ENXIO;
++			break;
++		}
++		if (raw & DW_IC_INTR_STOP_DET) {
++			error = 0;
++			break;
++		}
++	}
++	if (!error) {
++		pra_i2c_wait_idle(r);
++	}
++	(void)pra_i2c_rd32(r, DW_IC_CLR_TX_ABRT);
++	(void)pra_i2c_rd32(r, DW_IC_CLR_STOP_DET);
++	if (error == ETIMEDOUT) {
++		h->addr = 0;
++	}
++	return error;
++}
++
++/* Map both hosts and log their identity plus the hisi reset register
++ * value. The reset register is read-only here: its bit layout was not
++ * established and writing an unknown reset block is not allowed. */
++static void
++pra_map_hosts(void)
++{
++	for (unsigned i = 0; i < 2; i++) {
++		struct pra_i2c_host *h = &pra_i2c[i];
++		uint32_t ver, type, rstv;
++
++		if (h->regs) {
++			continue;
++		}
++		h->regs = ml_io_map((vm_offset_t)h->base, 0x1000);
++		h->reset_regs = ml_io_map((vm_offset_t)h->reset, 0x1000);
++		if (!h->regs) {
++			printf("PRA charger: i2c %s MMIO map failed\n", h->name);
++			continue;
++		}
++		ver = pra_i2c_rd32(h->regs, DW_IC_COMP_VERSION);
++		type = pra_i2c_rd32(h->regs, DW_IC_COMP_TYPE);
++		rstv = h->reset_regs ?
++		    pra_i2c_rd32(h->reset_regs, 0) : 0;
++		printf("PRA charger: i2c %s base=%llx reset=%llx "
++		    "COMP_VERSION=%08x COMP_TYPE=%08x reset_value=%08x\n",
++		    h->name, h->base, h->reset, ver, type, rstv);
++		if (ver == 0 || ver == 0xFFFFFFFFu ||
++		    type == 0 || type == 0xFFFFFFFFu) {
++			/* In reset or behind a gated clock: nothing will
++			 * move. Skip this host; this is a normal outcome. */
++			printf("PRA charger: i2c %s not responding, skip\n",
++			    h->name);
++		} else {
++			h->usable = true;
++		}
++	}
++}
++
++/* Charger register access above the I2C layer, with the debug log.
++ * The chip is bound by the time anything calls these. */
++static int
++pra_chg_read(uint8_t reg, uint8_t *val)
++{
++	int error = pra_i2c_read_reg(pra_h, reg, val);
++
++	if (pra_dbg) {
++		printf("PRA charger: rd %02x = %02x (%d)\n",
++		    reg, error ? 0 : *val, error);
++	}
++	return error;
++}
++
++static int
++pra_chg_write(uint8_t reg, uint8_t val)
++{
++	int error;
++
++	/* The only write choke point. Without pracharger=1 not one write
++	 * reaches the chip (contract section 3). */
++	if (!pra_writes) {
++		return EPERM;
++	}
++	error = pra_i2c_write_reg(pra_h, reg, val);
++	if (pra_dbg) {
++		printf("PRA charger: wr %02x <- %02x (%d)\n", reg, val, error);
++	}
++	return error;
++}
++
++/* Read-modify-write that only ever changes bits inside mask. */
++static int
++pra_chg_rmw(uint8_t reg, uint8_t mask, uint8_t bits)
++{
++	uint8_t v;
++	int error = pra_chg_read(reg, &v);
++
++	if (error) {
++		return error;
++	}
++	return pra_chg_write(reg, (uint8_t)(v & ~mask) | bits);
++}
++
++static unsigned
++pra_percent(unsigned mv)
++{
++	unsigned i;
++
++	if (mv <= pra_soc_mv[0]) {
++		return 0;
++	}
++	if (mv >= pra_soc_mv[sizeof(pra_soc_mv) / sizeof(pra_soc_mv[0]) - 1]) {
++		return 100;
++	}
++	for (i = 1; i < sizeof(pra_soc_mv) / sizeof(pra_soc_mv[0]); i++) {
++		if (mv < pra_soc_mv[i]) {
++			return pra_soc_pct[i - 1] +
++			    (mv - pra_soc_mv[i - 1]) *
++			    (pra_soc_pct[i] - pra_soc_pct[i - 1]) /
++			    (pra_soc_mv[i] - pra_soc_mv[i - 1]);
++		}
++	}
++	return 100;
++}
++
++/* Probe both hosts at both addresses, read-only. First chip that answers
++ * REG14 with a BQ25892-class part number wins. */
++static void
++pra_probe_chip(void)
++{
++	static const uint8_t addrs[2] = { BQ_ADDR_25892, BQ_ADDR_25890 };
++
++	lck_mtx_lock(&pra_charger_lock);
++	for (unsigned i = 0; i < 2 && !pra_present; i++) {
++		struct pra_i2c_host *h = &pra_i2c[i];
++
++		if (!h->usable) {
++			continue;
++		}
++		for (unsigned a = 0; a < 2 && !pra_present; a++) {
++			uint8_t id;
++			int error;
++
++			if (pra_i2c_setup(h, addrs[a])) {
++				printf("PRA charger: i2c %s would not start\n",
++				    h->name);
++				continue;
++			}
++			error = pra_i2c_read_reg(h, BQ_REG14, &id);
++			if (error) {
++				printf("PRA charger: i2c %s addr %02x: no chip "
++				    "(%s)\n", h->name, addrs[a],
++				    error == ENXIO ? "NACK" : "timeout");
++				continue;
++			}
++			/* PN from mainline bq25890_get_chip_version():
++			 * 0 = BQ25892/BQ25896 family, 3 = BQ25890,
++			 * 7 = BQ25895. Only the BQ25892 family binds. */
++			if (((id >> 3) & 7u) != 0) {
++				printf("PRA charger: i2c %s addr %02x: "
++				    "REG14=%02x not BQ25892-class, skip\n",
++				    h->name, addrs[a], id);
++				continue;
++			}
++			pra_h = h;
++			pra_present = true;
++			printf("PRA charger: found BQ25892-class chip on i2c "
++			    "%s addr %02x (REG14=%02x rev=%u)\n",
++			    h->name, addrs[a], id, id & 3u);
++		}
++	}
++	lck_mtx_unlock(&pra_charger_lock);
++}
++
++/*
++ * The only allowed writes (pracharger=1, once, after the plausibility
++ * gate: REG0C must carry no fault bits and PG_STAT must show input
++ * power). All of them are read-modify-writes that preserve every other
++ * bit, so VREG, JEITA, termination, BATFET and boost stay untouched:
++ *   REG00  EN_HIZ=0, IINLIM=500 mA
++ *   REG04  ICHG=512 mA
++ *   REG07  watchdog longest period (160 s), left off if already off
++ * Any other outcome is logged once and the driver stays read-only.
++ */
++static void
++pra_chg_apply_limits(void)
++{
++	uint8_t st, fault, v;
++
++	if (pra_chg_read(BQ_REG0B, &st) || pra_chg_read(BQ_REG0C, &fault)) {
++		printf("PRA charger: pracharger=1 ignored: status unread\n");
++		return;
++	}
++	if (fault != 0) {
++		printf("PRA charger: pracharger=1 ignored: REG0C=%02x\n",
++		    fault);
++		return;
++	}
++	if (!((st >> 2) & 1u)) {
++		printf("PRA charger: pracharger=1 ignored: no input power "
++		    "(REG0B=%02x)\n", st);
++		return;
++	}
++
++	if (pra_chg_read(BQ_REG00, &v) == 0) {
++		uint8_t nv = (uint8_t)((v & ~0xBFu) | BQ_IINLIM_500MA_IDX);
++
++		if (nv != v && pra_chg_write(BQ_REG00, nv) == 0) {
++			printf("PRA charger: pracharger=1: EN_HIZ=0, "
++			    "IINLIM=500 mA (REG00 %02x->%02x)\n", v, nv);
++		}
++	}
++	if (pra_chg_read(BQ_REG04, &v) == 0) {
++		uint8_t nv = (uint8_t)((v & ~0x7Fu) | BQ_ICHG_512MA_IDX);
++
++		if (nv != v && pra_chg_write(BQ_REG04, nv) == 0) {
++			printf("PRA charger: pracharger=1: ICHG=512 mA "
++			    "(REG04 %02x->%02x)\n", v, nv);
++		}
++	}
++	if (pra_chg_read(BQ_REG07, &v) == 0) {
++		uint8_t wd = (v >> 4) & 3u;
++
++		if (wd == 0) {
++			printf("PRA charger: pracharger=1: watchdog already "
++			    "disabled (REG07=%02x)\n", v);
++		} else {
++			uint8_t nv = (uint8_t)(v | (BQ_WD_LONGEST << 4));
++
++			if (nv != v && pra_chg_write(BQ_REG07, nv) == 0) {
++				printf("PRA charger: pracharger=1: watchdog "
++				    "160 s (REG07 %02x->%02x)\n", v, nv);
++			}
++			pra_wd_kick = true;
++		}
++	}
++}
++
++/* One status sample from the chip into the snapshot. Runs on the poll
++ * thread; the only I2C user after the probe. */
++static void
++pra_chg_sample(void)
++{
++	uint8_t st, fault, batv, ichgr;
++	bool external, charging, full;
++	unsigned mv, pct;
++	int ma;
++
++	lck_mtx_lock(&pra_charger_lock);
++	if (!pra_present) {
++		lck_mtx_unlock(&pra_charger_lock);
++		return;
++	}
++	if (pra_chg_read(BQ_REG0B, &st) || pra_chg_read(BQ_REG0C, &fault)) {
++		lck_mtx_unlock(&pra_charger_lock);
++		return;
++	}
++	external = ((st >> 2) & 1u) != 0;       /* PG_STAT */
++	charging = external &&
++	    (((st >> 3) & 3u) == 1 || ((st >> 3) & 3u) == 2);
++	full = ((st >> 3) & 3u) == 3;           /* CHRG_STAT == 3 */
++
++	/* One-shot ADC conversion (REG02 CONV_START, self-clearing). A
++	 * write, so only behind pracharger=1; without it the sample is
++	 * whatever the chip's own state-change conversions left. */
++	if (pra_writes && external) {
++		if (pra_chg_rmw(BQ_REG02, BQ_CONV_START, BQ_CONV_START) == 0) {
++			for (unsigned i = 0; i < PRA_CONV_POLLS; i++) {
++				uint8_t v;
++
++				if (pra_chg_read(BQ_REG02, &v) ||
++				    !(v & BQ_CONV_START)) {
++					break;
++				}
++			}
++		}
++	}
++	if (pra_chg_read(BQ_REG0E, &batv) || pra_chg_read(BQ_REG12, &ichgr)) {
++		lck_mtx_unlock(&pra_charger_lock);
++		return;
++	}
++	/* Mainline: VBAT = 2.304 V + idx*20 mV, ICHG = idx*50 mA. */
++	mv = 2304u + (batv & 0x7Fu) * 20u;
++	ma = charging ? (int)(ichgr & 0x7Fu) * 50 : 0;
++	/* A zero index is not a converted sample: it means no conversion
++	 * has ever run (2.304 V would be a depleted battery). Keep the
++	 * previous estimate in that case. */
++	pra_snap.mv_valid = (batv & 0x7Fu) != 0;
++	if (pra_snap.mv_valid) {
++		pct = pra_percent(mv);
++		pra_snap.percent = pct;
++		pra_snap.mv = mv;
++	}
++	pra_snap.ma = ma;
++	pra_snap.external = external;
++	pra_snap.charging = charging;
++	pra_snap.full = full;
++	pra_last0b = st;
++	pra_last0c = fault;
++
++	if (pra_writes && pra_wd_kick) {
++		/* REG03 WD_RST is a self-clearing trigger; every other
++		 * REG03 bit is written back unchanged. */
++		(void)pra_chg_rmw(BQ_REG03, BQ_WD_RST, BQ_WD_RST);
++	}
++	lck_mtx_unlock(&pra_charger_lock);
++}
++
++static void
++pra_charger_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	bool last_ext = false, last_chg = false, last_full = false;
++	unsigned last_pct = 0;
++
++	for (;;) {
++		(void)tsleep(&pra_charger_chan, PZERO, "prachg", hz * 10);
++		pra_chg_sample();
++		if (!pra_present) {
++			continue;
++		}
++		/* Log transitions and 5% steps; the OCV percent is an
++		 * estimate and must never read like a gauge SOC. */
++		if (pra_snap.external != last_ext ||
++		    pra_snap.charging != last_chg ||
++		    pra_snap.full != last_full ||
++		    (pra_snap.mv_valid &&
++		    (pra_snap.percent >= last_pct ?
++		    pra_snap.percent - last_pct : last_pct - pra_snap.percent)
++		    >= 5)) {
++			printf("PRA charger: %s SOC=%u%% (est) %u mV %d mA "
++			    "charging=%d full=%d REG0B/0C=%02x/%02x\n",
++			    pra_snap.external ? "VBUS" : "no VBUS",
++			    pra_snap.percent, pra_snap.mv, pra_snap.ma,
++			    pra_snap.charging ? 1 : 0,
++			    pra_snap.full ? 1 : 0,
++			    pra_last0b, pra_last0c);
++			last_ext = pra_snap.external;
++			last_chg = pra_snap.charging;
++			last_full = pra_snap.full;
++			last_pct = pra_snap.percent;
++		}
++	}
++}
++
++/* One-time entry point. SweetBattery's poll() calls pra_charger_status(),
++ * which reaches here before the poll thread exists, so the probe runs
++ * inline: bounded polls only, at most a few tens of ms even when the
++ * bus is dead. After it, the 10 s poll thread owns the chip. */
++static void
++pra_charger_probe(void)
++{
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("pracharger", &pra_writes,
++	    sizeof(pra_writes));
++	(void)PE_parse_boot_argn("prachgdebug", &pra_dbg, sizeof(pra_dbg));
++
++	pra_map_hosts();
++	pra_probe_chip();
++	if (!pra_present) {
++		/* Contract section 3: a normal outcome, never an error. */
++		printf("PRA charger: no charger found\n");
++		return;
++	}
++
++	/* First sample straight away so SweetBattery's very first poll()
++	 * sees real data instead of the empty snapshot. */
++	pra_chg_sample();
++	printf("PRA charger: status=%u%% (est) %u mV %d mA external=%d "
++	    "charging=%d full=%d (REG0B=%02x REG0C=%02x)%s\n",
++	    pra_snap.percent, pra_snap.mv, pra_snap.ma,
++	    pra_snap.external ? 1 : 0, pra_snap.charging ? 1 : 0,
++	    pra_snap.full ? 1 : 0, pra_last0b, pra_last0c,
++	    pra_snap.mv_valid ? "" : " [ADC not converted; estimate may be "
++	    "stale, pracharger=1 triggers one-shot conversions]");
++
++	if (pra_writes) {
++		lck_mtx_lock(&pra_charger_lock);
++		pra_chg_apply_limits();
++		lck_mtx_unlock(&pra_charger_lock);
++	}
++	if (kernel_thread_start(pra_charger_thread, NULL, &thread) ==
++	    KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("PRA charger: poll thread unavailable\n");
++	}
++}
++
++int
++pra_charger_status(unsigned *percent, unsigned *mv, int *ma, int *external,
++    int *charging, int *full)
++{
++	/* cmpxchg makes the probe run exactly once even if SweetBattery's
++	 * start-time poll() ever raced the timer poll. */
++	bool want = false;
++	if (os_atomic_cmpxchg(&pra_started, want, true, relaxed)) {
++		pra_charger_probe();
++	}
++	if (!pra_present) {
++		return 1;               /* caller keeps its fallback */
++	}
++	lck_mtx_lock(&pra_charger_lock);
++	*percent = pra_snap.percent;
++	*mv = pra_snap.mv;
++	*ma = pra_snap.ma;
++	*external = pra_snap.external ? 1 : 0;
++	*charging = pra_snap.charging ? 1 : 0;
++	*full = pra_snap.full ? 1 : 0;
++	lck_mtx_unlock(&pra_charger_lock);
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_PRA */
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/pra_sdhci.c			standard
++bsd/dev/pra_charger.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -18,6 +18,21 @@
+ extern "C" int dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+     int *external, int *charging, int *full);
+ #else
++#if defined(ARM64_BOARD_CONFIG_PRA)
++/* PRA-LX1: bsd/dev/pra_charger.c probes the TI BQ25892 over a polled
++ * DesignWare I2C host and reads its status/ADC; percent is an OCV estimate.
++ * It returns 0 only when a chip answered, so poll() keeps the static fallback
++ * when the charger is absent or the bus is dead.  The name stays because
++ * poll() below is shared with the DREAMLTE path. */
++extern "C" int pra_charger_status(unsigned *percent, unsigned *mv, int *ma,
++    int *external, int *charging, int *full);
++static inline int
++dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
++    int *external, int *charging, int *full)
++{
++	return pra_charger_status(percent, mv, ma, external, charging, full);
++}
++#else
+ /* PRA-LX1 has no MAX77865; the gauge implementation is DREAMLTE-only.  Report
+  * failure so poll() publishes the static fallback and never probes Exynos I2C. */
+ static inline int
+@@ -29,6 +44,7 @@
+ 	return -1;
+ }
+ #endif
++#endif
+ static inline int sweet_spmi_init(void) { return -1; }
+ static inline int sweet_spmi_read(unsigned, unsigned, uint8_t *) { return -1; }
+ #define SWEET_BAT_MAH 3000u
