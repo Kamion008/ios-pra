@@ -1181,6 +1181,43 @@ Hello buys little. `/System` is 7.9 GB and sealed by SSV - never edit it.
 once (`/System/Library/Caches/com.apple.dyld` and the preboot cryptex copy
 share inodes, `nlink=2`). `*.lproj` trees are 248 MB in 91,562 directories.
 
+### 2026-11-13: the watchdog key works; the boot is just very slow
+
+Boot of 0151 with the patched `com.apple.springboard.plist`
+(`research/pra-artifacts/ring7.txt`, 150,136 B):
+
+    host_control=800bf4 width=8bit hs=1
+    extcsd rev=8 bus_width=6 hs_timing=3 device_type=57
+    8247 KiB, 16495 cmds, 2607 KiB/s (r 8118 KiB 16237 cmds 2749 KiB/s | w 129 KiB ...)
+    jnl: b(1, 0): replay_journal: from: 6408192 to: 6696960
+    jnl: b(1, 0): journal replay done.
+    exec Setup                  <- exactly once
+    SWEET FB: display on
+    SWEET FB: swap 6 / swap 7
+    (1,671 further log lines, no CRASH Setup, no panic)
+
+- `exec Setup` happens once and **no `CRASH Setup` follows**, versus three
+  launches and three 20 s kills in `ring5.txt`. The additive
+  `FBLaunchWatchdogExceptions` entry is being read; the launch allowance is no
+  longer what stops the Hello screen.
+- The journal replay range is the same one the PC-side check cleared
+  (6,408,192..6,696,960) and the patched plist block is not in it, so the
+  key survives the mount.
+- The bus is already optimal for this host: 8-bit, `hs=1`, `hs_timing=3`,
+  `device_type=0x57` (HS400-capable card). The 2.7 MB/s ceiling is not bus
+  width - it is 512 B per command at ~179 us (wait 142 + buf 43), i.e.
+  per-command overhead, plus occasional stalls.
+- Stalls are the real problem: `>5ms` counts of 300-500 per 16,400 commands
+  and single-request maxima of 6.2 s, 9.7 s, 11.4 s, and **24.8 s** right
+  after Setup's launch. At those numbers Setup's first frame is tens of
+  minutes away, which is why a 20-minute wait ended on the Apple logo with
+  the system still healthy.
+- `Failed to open swap file 2` appears late; the VM could not create a swap
+  file (95 % full volume), so Setup runs without swap.
+- Throughput collapses after `exec backboardd`: 2.7 MB/s -> 311 KiB/s ->
+  63 KiB/s -> 44 KiB/s, then recovers to ~200 KiB/s-1.4 MiB/s while daemons
+  churn. Writes stay at ~590 KiB/s throughout (614 KiB/s peak).
+
 ### Handoff 2026-11-13 (stopping for the day)
 
 State at stop: `pra-xnu-0149.img` is flashed to p27 and the phone was rebooted
