@@ -1,0 +1,323 @@
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -83,6 +83,16 @@
+ #define CMD_R1_DATA_READ       0x113Au /* CMD17, response R1, data present */
+ #define CMD_R1_MULTI_READ      0x123Au /* CMD18, response R1, data present */
+ #define CMD_R1_DATA_WRITE      0x183Au /* CMD24, response R1, data present */
++#define CMD_R1_SEND_EXT_CSD    0x083Au /* CMD8, response R1, data present */
++/* CMD6 SWITCH, eMMC encoding: access=3 (write byte), index in 23:16, value in
++ * 15:8. Writing EXT_CSD[185] HS_TIMING = 1 selects high speed (52 MHz). The
++ * eMMC form has no data phase, so only R1b is set. */
++#define CMD_R1B_SWITCH         0x061Bu /* CMD6, no data, R1b */
++
++/* Host control (0x28) bus-width and speed bits. */
++#define HC_HIGH_SPEED          0x04u
++#define HC_4BIT_WIDTH          0x02u
++#define HC_8BIT_WIDTH          0x20u
+ #define TRANSFER_SINGLE_READ   0x12u   /* block count enable, read, single */
+ #define TRANSFER_MULTI_READ    0x36u   /* count enable, read, multi, auto CMD12 */
+ #define TRANSFER_SINGLE_WRITE  0x02u   /* block count enable, write, single */
+@@ -106,6 +116,7 @@
+ static char pra_emmc_partition_name[32] = "userdata";
+ static dev_t pra_emmc_bdev;
+ static bool pra_emmc_ready;
++static bool pra_emmc_reported;
+ static bool pra_emmc_writable;
+ /* Multi-block reads stay enabled unless the controller rejects one; the
+  * fallback is the old single-sector path, so a wrong guess costs one command
+@@ -120,6 +131,13 @@
+ static uint64_t pra_emmc_stat_rbytes, pra_emmc_stat_rcmds, pra_emmc_stat_rns;
+ static uint64_t pra_emmc_stat_wbytes, pra_emmc_stat_wcmds, pra_emmc_stat_wns;
+ static uint64_t pra_emmc_stat_slow, pra_emmc_stat_max_ns;
++/* Where a 512-byte read actually goes: waiting for the buffer-ready flag, or
++ * pulling the 128 words out of the 32-bit port. If the port read dominates,
++ * the limit is MMIO latency and neither a wider bus nor CMD18 can help; if the
++ * wait dominates, it is the bus or the card. Accumulated in timebase ticks so
++ * the conversion to nanoseconds happens once per report, not per request. */
++static uint64_t pra_emmc_stat_wait_ticks, pra_emmc_stat_buf_ticks;
++static uint64_t pra_emmc_stat_rread_ops;
+ static LCK_GRP_DECLARE(pra_emmc_grp, "pra_emmc");
+ static LCK_MTX_DECLARE(pra_emmc_lock, &pra_emmc_grp);
+ 
+@@ -251,6 +269,7 @@
+ 	struct pra_sdhci_saved s;
+ 	uint32_t status = 0;
+ 	int error = 0;
++	uint64_t t_wait = pra_emmc_stats ? mach_absolute_time() : 0;
+ 
+ 	if (pra_emmc_wait_ready()) {
+ 		printf("PRA eMMC: card busy, skip read lba=%u\n", lba);
+@@ -314,6 +333,11 @@
+ 		goto out;
+ 	}
+ 
++	if (pra_emmc_stats) {
++		uint64_t now = mach_absolute_time();
++		pra_emmc_stat_wait_ticks += now - t_wait;
++		t_wait = now;
++	}
+ 	{
+ 		uint32_t data[128];
+ 		for (unsigned i = 0; i < 128; i++) {
+@@ -321,6 +345,10 @@
+ 		}
+ 		memcpy(sector, data, sizeof(data));
+ 	}
++	if (pra_emmc_stats) {
++		pra_emmc_stat_buf_ticks += mach_absolute_time() - t_wait;
++		pra_emmc_stat_rread_ops++;
++	}
+ 	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS,
+ 	    NORMAL_TRANSFER_COMPLETE | NORMAL_BUFFER_READ_READY);
+ 	(void)pra_emmc_wait_ready();
+@@ -534,13 +562,25 @@
+ 		    (pra_emmc_stat_rbytes * 1000000000ull) / pra_emmc_stat_rns / 1024ull : 0;
+ 		uint64_t wkbs = pra_emmc_stat_wns ?
+ 		    (pra_emmc_stat_wbytes * 1000000000ull) / pra_emmc_stat_wns / 1024ull : 0;
++		uint64_t wait_ns = 0, buf_ns = 0;
++		uint64_t ops = pra_emmc_stat_rread_ops;
++		if (ops) {
++			absolutetime_to_nanoseconds(pra_emmc_stat_wait_ticks,
++			    &wait_ns);
++			absolutetime_to_nanoseconds(pra_emmc_stat_buf_ticks,
++			    &buf_ns);
++			wait_ns /= ops;
++			buf_ns /= ops;
++		}
+ 		printf("PRA eMMC: %llu KiB, %llu cmds, %llu KiB/s "
+ 		    "(r %llu KiB %llu cmds %llu KiB/s | w %llu KiB %llu cmds "
+-		    "%llu KiB/s | >5ms %llu max %llu us)\n",
++		    "%llu KiB/s | >5ms %llu max %llu us | wait %llu us "
++		    "buf %llu us)\n",
+ 		    kib, pra_emmc_stat_cmds, kbs,
+ 		    pra_emmc_stat_rbytes >> 10, pra_emmc_stat_rcmds, rkbs,
+ 		    pra_emmc_stat_wbytes >> 10, pra_emmc_stat_wcmds, wkbs,
+-		    pra_emmc_stat_slow, pra_emmc_stat_max_ns / 1000ull);
++		    pra_emmc_stat_slow, pra_emmc_stat_max_ns / 1000ull,
++		    wait_ns / 1000ull, buf_ns / 1000ull);
+ 		pra_emmc_stat_bytes = 0;
+ 		pra_emmc_stat_cmds = 0;
+ 		pra_emmc_stat_ns = 0;
+@@ -552,6 +592,9 @@
+ 		pra_emmc_stat_wns = 0;
+ 		pra_emmc_stat_slow = 0;
+ 		pra_emmc_stat_max_ns = 0;
++		pra_emmc_stat_wait_ticks = 0;
++		pra_emmc_stat_buf_ticks = 0;
++		pra_emmc_stat_rread_ops = 0;
+ 	}
+ }
+ 
+@@ -1128,6 +1171,186 @@
+ 	return error;
+ }
+ 
++/* Read the 512-byte EXT_CSD with CMD8. Nothing here writes; it only reports
++ * what LK left the card negotiated at (bus width, high-speed timing, device
++ * type), which is otherwise guesswork. */
++static int
++pra_emmc_read_extcsd(uint8_t *dst)
++{
++	struct pra_sdhci_saved s;
++	uint32_t status = 0;
++	int error = 0;
++
++	if (pra_emmc_wait_ready()) {
++		return EBUSY;
++	}
++	pra_emmc_save(&s);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_SIGNAL_EN, 0);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS_EN, 0x7ffu);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	pra_emmc_wr16(SDHCI_TIMEOUT_CONTROL, 0xeu);
++	pra_emmc_wr16(SDHCI_BLOCK_SIZE, 512);
++	pra_emmc_wr16(SDHCI_BLOCK_COUNT, 1);
++	pra_emmc_wr32(SDHCI_ARGUMENT, 0);
++	pra_emmc_wr16(SDHCI_TRANSFER_MODE, TRANSFER_SINGLE_READ);
++	__asm__ volatile("dsb sy" : : : "memory");
++	pra_emmc_wr16(SDHCI_COMMAND, CMD_R1_SEND_EXT_CSD);
++
++	for (unsigned i = 0; i < 2000000; i++) {
++		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & SDHCI_ERROR_BITS) {
++			error = EIO;
++			break;
++		}
++		if (status & NORMAL_CMD_COMPLETE) {
++			break;
++		}
++	}
++	if (!error && !(status & NORMAL_CMD_COMPLETE)) {
++		error = ETIMEDOUT;
++	}
++	if (!error && (pra_emmc_rd32(SDHCI_RESPONSE0) & 0xfdffe008u)) {
++		error = EIO;
++	}
++	if (!error) {
++		pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, NORMAL_CMD_COMPLETE);
++		error = ETIMEDOUT;
++		for (unsigned i = 0; i < 2000000; i++) {
++			status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++			if (status & SDHCI_ERROR_BITS) {
++				error = EIO;
++				break;
++			}
++			if (status & NORMAL_BUFFER_READ_READY) {
++				error = 0;
++				break;
++			}
++		}
++	}
++	if (!error) {
++		uint32_t data[128];
++		for (unsigned i = 0; i < 128; i++) {
++			data[i] = pra_emmc_rd32(SDHCI_BUFFER);
++		}
++		memcpy(dst, data, sizeof(data));
++	}
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	(void)pra_emmc_wait_ready();
++	pra_emmc_restore(&s);
++	return error;
++}
++
++/* CMD6 with no data phase: the response is all the answer we get. */
++static int
++pra_emmc_switch(uint32_t arg)
++{
++	struct pra_sdhci_saved s;
++	uint32_t status = 0;
++	int error = 0;
++
++	if (pra_emmc_wait_ready()) {
++		return EBUSY;
++	}
++	pra_emmc_save(&s);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_SIGNAL_EN, 0);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS_EN, 0x7ffu);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	pra_emmc_wr16(SDHCI_TIMEOUT_CONTROL, 0xeu);
++	pra_emmc_wr32(SDHCI_ARGUMENT, arg);
++	__asm__ volatile("dsb sy" : : : "memory");
++	pra_emmc_wr16(SDHCI_COMMAND, CMD_R1B_SWITCH);
++	for (unsigned i = 0; i < 2000000; i++) {
++		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & SDHCI_ERROR_BITS) {
++			error = EIO;
++			break;
++		}
++		if (status & NORMAL_CMD_COMPLETE) {
++			break;
++		}
++	}
++	if (!error && !(status & NORMAL_CMD_COMPLETE)) {
++		error = ETIMEDOUT;
++	}
++	if (!error && (pra_emmc_rd32(SDHCI_RESPONSE0) & 0xfdffe008u)) {
++		error = EIO;
++	}
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	(void)pra_emmc_wait_ready();
++	pra_emmc_restore(&s);
++	return error;
++}
++
++/* Report what the card and host are actually set to. */
++static void
++pra_emmc_report_csd(void)
++{
++	uint8_t ext[512];
++	uint32_t hc = pra_emmc_rd32(SDHCI_HOST_CONTROL);
++
++	printf("PRA eMMC: host_control=%x width=%s hs=%u\n", hc,
++	    (hc & HC_8BIT_WIDTH) ? "8bit" :
++	    (hc & HC_4BIT_WIDTH) ? "4bit" : "1bit",
++	    (hc & HC_HIGH_SPEED) ? 1 : 0);
++	if (pra_emmc_read_extcsd(ext)) {
++		printf("PRA eMMC: EXT_CSD read failed\n");
++		return;
++	}
++	printf("PRA eMMC: extcsd rev=%u bus_width=%u hs_timing=%u device_type=%x\n",
++	    ext[192], ext[183] & 0xfu, ext[185] & 0xfu, ext[196]);
++}
++
++/* Timing experiments, driven from the cmdline so a flashed image can be
++ * retried without a rebuild:
++ *   emmchsp=1    switch the card to high speed (EXT_CSD[185] HS_TIMING=1)
++ *   emmcdiv=<n>  write the 10-bit SDCLK divider and keep it only if sector 1
++ *                still reads back identically afterwards. */
++static void
++pra_emmc_tune(void)
++{
++	int hsp = 0, div = -1;
++	bool want_hsp = PE_parse_boot_argn("emmchsp", &hsp, sizeof(hsp)) && hsp != 0;
++	bool want_div = PE_parse_boot_argn("emmcdiv", &div, sizeof(div)) &&
++	    div >= 0 && div <= 1023;
++
++	if (!want_hsp && !want_div) {
++		return;
++	}
++	if (want_hsp) {
++		int error = pra_emmc_switch((3u << 24) | (185u << 16) | (1u << 8));
++		printf("PRA eMMC: HS_TIMING=1 %s (%d)\n",
++		    error ? "failed" : "ok", error);
++		if (!error) {
++			uint32_t hc = pra_emmc_rd32(SDHCI_HOST_CONTROL);
++			pra_emmc_wr32(SDHCI_HOST_CONTROL, hc | HC_HIGH_SPEED);
++		}
++	}
++	if (want_div) {
++		uint8_t before[512], after[512];
++		uint16_t old = pra_emmc_rd16(SDHCI_CLOCK_CONTROL);
++		uint16_t nv = (uint16_t)((old & 0x3fu) |
++		    (uint16_t)(((uint32_t)div & 0x3ffu) << 6));
++
++		if (pra_emmc_read_sector(1, before)) {
++			printf("PRA eMMC: emmcdiv=%d skipped, read failed\n", div);
++			return;
++		}
++		pra_emmc_wr16(SDHCI_CLOCK_CONTROL, nv);
++		for (unsigned i = 0; i < 100000; i++) {
++			__asm__ volatile("nop");
++		}
++		if (pra_emmc_read_sector(1, after) == 0 &&
++		    memcmp(before, after, sizeof(before)) == 0) {
++			printf("PRA eMMC: emmcdiv=%d kept clock=%x\n", div,
++			    pra_emmc_rd16(SDHCI_CLOCK_CONTROL));
++		} else {
++			pra_emmc_wr16(SDHCI_CLOCK_CONTROL, old);
++			printf("PRA eMMC: emmcdiv=%d rejected clock=%x\n", div,
++			    pra_emmc_rd16(SDHCI_CLOCK_CONTROL));
++		}
++	}
++}
++
+ static int
+ pra_emmc_map_host(void)
+ {
+@@ -1195,6 +1418,11 @@
+ 	}
+ 	if (!pra_emmc_map_host()) {
+ 		(void)pra_emmc_find_root_partition_keep();
++		if (!pra_emmc_reported) {
++			pra_emmc_reported = true;
++			pra_emmc_report_csd();
++			pra_emmc_tune();
++		}
+ 	}
+ }
+ 
+@@ -1285,10 +1513,12 @@
+ 		} else {
+ 			if (skip || take != 512u) {
+ 				error = pra_emmc_read_sector(lba, pra_emmc_bounce);
++				cmds++;
+ 			}
+ 			if (!error) {
+ 				memcpy(pra_emmc_bounce + skip, vaddr + n, take);
+ 				error = pra_emmc_write_sector(lba, pra_emmc_bounce);
++				cmds++;
+ 			}
+ 		}
+ 		if (error) {
