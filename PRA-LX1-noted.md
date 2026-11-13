@@ -1235,3 +1235,24 @@ watchdog killing Setup Assistant, and there is a touch driver to drive it.
    plus our `huawei/refs/r20p0_mmu.c` and `v4/v5/v6.xml`; 0243's T880 quirks
    (typed attribute descriptors, TC clock-gate override, job throttle) are
    the shape of what to look for, not the values to copy.
+
+## Post-Hello: reclaiming space by removing Setup.app (2026-11-13)
+
+Deferred until the Hello screen has been seen, by user decision. It is a space
+measurement, not a speed one.
+
+Measured from the volume header of `research/p58-20261113.img` (HFSX, 4 KiB
+blocks): 9.57 GiB total, **0.51 GiB free, 5%**, 2,409,736 files. So the volume
+is nearly full and `Setup.app` is the obvious large, unused-after-OOBE bundle;
+the user remembers ~500 MB, which would roughly double the free space.
+
+Media for the video step is 99,105,492 B (1080p) and 16,445,108 B (480p), so
+the video is not blocked on space today; the reason to delete is that at 5%
+free HFS+ allocation is fragmented, and every future write is scattered.
+
+Do it from iOS userland once it boots (`rm -rf /Applications/Setup.app`, e.g.
+through the planned injection path), not from the PC: TWRP does not mount
+HFSX, and rewriting the whole 10 GB image at 0.5 MB/s is five hours. Read
+`/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist` and
+`com.apple.mobileactivationd.plist` first - the setup-done and activation keys
+there are what decides whether SpringBoard needs Setup at all.
