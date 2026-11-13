@@ -1,5 +1,42 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## Separate PRA-LX1 handoff (Huawei; not SWEET or A5XELTE results)
+
+**Current state (2026-11-13):** Huawei PRA-LX1 is in TWRP after the 20-minute
+0151 no-progress-bar boot with no visible change. No probe kernel has been
+flashed. Keep all claims below scoped to this Huawei device.
+
+- Ring10 is `ios/ios-pra/research/pra-artifacts/ring10.txt` (gitignored). It
+  records one `exec Setup`, no `CRASH Setup`, 4 full-screen framebuffer swaps,
+  585 `exec xpcproxy` lines and 576 crash lines. Restoring launchd's original
+  disabled list lets `locationd`, `WirelessRadioManagerd`, `bluetoothd`,
+  `fairplayd.H2` and `nanotimekitcompaniond` exec; `locationd` and
+  `WirelessRadioManager` repeatedly trap with sig 5 at the same PC. The
+  datamigrator restarts; allowing the jobs did not make Setup display Hello.
+  Ring9 (the quiet boot) had 217 xpcproxy execs, 1 Setup exec and the same
+  absent UI. These observations rule out migration and launch churn as the
+  sole blocker, not as unrelated device issues.
+- Setup crash reports point to a synchronous UIKit/BoardServices XPC wait.
+  PRA-only patch `0153-pra-setup-mach-msg-probe.patch` logs the sender,
+  receiver and Mach message ID for messages involving Setup, with output
+  capped/sampled. Patch committed as `59b2d1f`.
+- CI push run `43437655574` (commit `a13788f`, which contains 0153) was
+  **in progress at last check**. It is a push event; workflow default
+  `MACHINE_CONFIG` is PRA, but confirm the job's actual target and build result
+  before packaging. Explicit dispatch `43437675161` was cancelled before any
+  steps ran. The earlier runs `43437069518`, `43437092765`, and `43437391746`
+  were also cancelled before build. Commit `a13788f` changes concurrency to
+  unique run IDs; this is intended to prevent cancellation but is not yet
+  demonstrated by a successful dispatch.
+- Next: verify CI run 43437655574 and download the kernel artifact. Confirm
+  `ARM64_BOARD_CONFIG_PRA` and that the probe is linked; do not flash a failed
+  or unverified artifact. Then, if valid, use the authorized p27/TWRP write
+  workflow and preserve p30/p32, bootloaders, recovery, modem, persist and GPT.
+  The probe is diagnostic only; it is not evidence that Hello has been reached.
+
+This section is a separate PRA handoff. The SWEET notes below remain donor
+history; nothing here is an A5XELTE/Samsung result.
+
 ## a5xelte fork handoff (2026-10-20)
 
 The Samsung SM-A510F branch has a separate dated record in `A5XELTE_PROGRESS.md` and a donor replacement map in `docs/a5xelte-migration-map.md`. Its 4 KiB XNU boots four Exynos7580 cores with SGI1 verified, mounts an iOS 16 HFSX root from USERDATA, and executes launchd, SpringBoard and backboardd. A graphical SpringBoard frame remains unverified. The latest recovered log confirms backboardd has its stock system-container XML entitlement, yet it crashes after receiving a missing container path; `lsd` also aborts in system-group container URL initialization. The HFS `RENAME_SWAP` fallback was SWEET-only despite A5XELTE usermanagerd reporting ENOTSUP for atomic keybag writes. Patch `0117` enables the existing fallback for A5XELTE, and its four-core BOOT image was written to p10; the runtime log is pending. Recovery and EFS remain untouched. The SWEET notes below are donor history, not Samsung device results.

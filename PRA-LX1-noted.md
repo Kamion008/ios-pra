@@ -1504,3 +1504,59 @@ minutes, not six hours. The slow path only explains why the *boot* is slow. Read
 `/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist` and
 `com.apple.mobileactivationd.plist` first - the setup-done and activation keys
 there are what decides whether SpringBoard needs Setup at all.
+
+## Ring9/ring10: churn and migration are not the blocker (2026-11-13)
+
+Two single-variable boots after the quiet-boot work. Both used 0151 with
+`praexecskip` removed from the cmdline; ring9 also had our `disabled.plist`
+entries, ring10 had launchd's original 6-entry list restored.
+
+| | ring8 | ring9 | ring10 |
+|---|---|---|---|
+| `exec xpcproxy` | 3002 | 217 | 585 |
+| named execs | 242 | 242 | 610 |
+| `CRASH ...` lines | few | few | 576 |
+| `exec Setup` | 1 | 1 | 1 |
+| full-screen `SWEET FB: swap` | 7 | 4 | 4 |
+
+Ring9 proves the disabled-jobs fix works (14x fewer respawns) and that the
+boot is much quieter with the same outcome: Setup execs once, SpringBoard
+creates surfaces 4..9, one more 1080x1920 present arrives, then silence.
+Removing disk contention changed nothing, so Setup is not I/O-starved.
+
+Ring10 proves the migration hypothesis wrong too. With the five jobs
+allowed, they *do* exec and then trap at once: `locationd` and
+`WirelessRadioManager` die with sig 5, code 0x600000001, at the same PC
+(0x1e5e4c894 / slide 0x1424c000), launchd prints "Too many corpses being
+created", and `com.apple.datamigrator` restarts nine times. Migration still
+cannot complete, and Setup still never requests a scene. Keeping those jobs
+disabled is therefore the better default: same result, one third the churn.
+
+Conclusion: neither disk churn nor first-boot migration nor plain slowness
+explains the missing Hello screen. The remaining evidence is Setup's own
+crash reports: its main thread sits in UIKit/BoardServices while a second
+thread is parked in `xpc_connection_send_message_with_reply_sync()`. That is
+a synchronous XPC request whose reply never comes.
+
+## 0153: name Setup's Mach peer
+
+`0153-pra-setup-mach-msg-probe.patch` logs every Mach message whose sender
+or receiver is the BSD process named `Setup`:
+
+```
+PRA MSG[3]: Setup -> backboardd id=0x1c0d bits=0x13
+```
+
+`sender` is `current_task()`, the receiver comes from the destination port's
+`ip_receiver->is_task`, and both names come from `proc_name_address()` in
+`bsd/kern/kern_proc.c` (forward-declared; osfmk needs no BSD headers).
+`ip_get_receiver_ptr_noauth()` is safe here without `ip_mq_lock()` because
+the in-flight kmsg holds a reference to the port, which keeps the receiver
+space and its task alive.
+
+Distinct `(sender, receiver, msgh_id)` triples print once and then every
+500th hit; the table is 128 entries and overflow is counted and sampled. The
+last `Setup -> X` line before the ring goes quiet is the service that never
+answered, which is the one thing none of the on-device reports could name.
+
+PRA-only (`ARM64_BOARD_CONFIG_PRA`), so the other board configs are untouched.
