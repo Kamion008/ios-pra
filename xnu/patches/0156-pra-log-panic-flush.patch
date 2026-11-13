@@ -1,0 +1,67 @@
+pra: flush the console ring synchronously on panic
+
+The flusher thread dies with the boot, so a panic loses everything
+printed since its last 10 s tick. The pe_init.c:314 panic (0153)
+left no trace in the ring for exactly this reason. Called once from
+the panic path after the paniclog is printed; best effort: skip if
+the eMMC lock is held, rewrite the whole used ring plus header.
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+index 0000000..1111111
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -921,6 +921,55 @@ pra_log_pick_explicit_lba(void)
+ 	return true;
+ }
+ 
++/* The flusher thread dies with the boot, so a panic loses everything printed
++ * since its last 10 s tick - the pe_init.c:314 panic (0153) left no trace in
++ * the ring for exactly this reason. Called once from the panic path, after
++ * the paniclog is printed and with the other CPUs parked. Best effort: if the
++ * eMMC lock is held (the flusher was interrupted mid-write) skip; rewriting
++ * the whole used ring instead of tracking the flusher's local offset keeps
++ * this independent of wherever that thread got to. */
++void
++pra_log_panic_flush(void)
++{
++	uint8_t sector[512];
++	uint64_t total, used, block;
++	int error = 0;
++
++	if (!pra_log_enabled || !pra_log_erecovery_sectors) {
++		return;
++	}
++	if (!lck_mtx_try_lock(&pra_emmc_lock)) {
++		return;
++	}
++	total = os_atomic_load(&pra_log_total, relaxed);
++	used = (total + 511u) & ~511ull;
++	if (used > PRA_LOG_SIZE) {
++		used = PRA_LOG_SIZE;
++	}
++	for (block = 0; block < used / 512u && !error; block++) {
++		memcpy(sector, pra_log_ring + (size_t)block * 512u,
++		    sizeof(sector));
++		error = pra_emmc_write_raw((uint32_t)(pra_log_erecovery_lba + 1u +
++		    block), sector);
++	}
++	if (!error) {
++		struct pra_log_header h = {
++			.magic = { 'P', 'R', 'A', 'L', 'O', 'G', '1', '\0' },
++			.version = 1,
++			.size = PRA_LOG_SIZE,
++			.total = total,
++			.seq = 0,
++		};
++		memset(sector, 0, sizeof(sector));
++		memcpy(sector, &h, sizeof(h));
++		error = pra_emmc_write_raw((uint32_t)pra_log_erecovery_lba, sector);
++	}
++	lck_mtx_unlock(&pra_emmc_lock);
++	if (error) {
++		printf("PRA LOG: panic flush failed %d\n", error);
++	}
++}
++
+ static void
+ pra_log_start(void)
+ {

@@ -1,0 +1,58 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -31,8 +31,9 @@
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+- * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+- * the first swap on (it still reaches the persistent log; panics draw).
++ * the GUI by default: boot-arg sweetfb_noconsole=1 (or a5fb_noconsole=1) stops
++ * drawing it from the first swap on (it still reaches the persistent log;
++ * panics draw).
+  */
+ #include "SweetSurface.h"
+ 
+@@ -390,11 +391,16 @@
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-		if (PE_parse_boot_argn("a5fb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+-#else
+-		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+-#endif
++		/* PRA is compiled with both ARM64_BOARD_CONFIG_PRA and
++		 * ARM64_BOARD_CONFIG_A5XELTE (0130), so this branch used to look
++		 * only for a5fb_noconsole while the comment above and every image
++		 * cmdline said sweetfb_noconsole - and the console kept drawing
++		 * over the GUI. Accept either name, on every board. */
++		bool have = PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet));
++		if (!have) {
++			have = PE_parse_boot_argn("a5fb_noconsole", &quiet, sizeof(quiet));
++		}
++		if (have && quiet != 0) {
+ 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
+@@ -613,13 +619,16 @@
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 			int keep_on = 0;
+-			if (off && PE_parse_boot_argn("a5fb_keep_on", &keep_on, sizeof(keep_on)) && keep_on) {
+-				IOLog("A5XELTE FB: display-off request ignored (a5fb_keep_on)\n");
++			/* Same dual-name trap as the console mute: accept both. */
++			bool have_keep = PE_parse_boot_argn("a5fb_keep_on", &keep_on, sizeof(keep_on));
++			if (!have_keep) {
++				have_keep = PE_parse_boot_argn("sweetfb_keep_on", &keep_on, sizeof(keep_on));
++			}
++			if (off && have_keep && keep_on) {
++				IOLog("A5XELTE FB: display-off request ignored (keep_on)\n");
+ 				break;
+ 			}
+-#endif
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;

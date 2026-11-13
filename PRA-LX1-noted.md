@@ -1584,3 +1584,39 @@ PRA-only (`ARM64_BOARD_CONFIG_PRA`), so the other board configs are untouched.
   Hello screen. The user should report whether the progress bar appears and
   moves/freezes. After the diagnostic window, collect ring11 and inspect
   `PRA MSG` peer lines around `exec Setup`.
+
+## 0153/0154: two panics, both photographed and symbolicated (2026-11-13)
+
+- Ring11 was **stale**: every "bar" boot (no `-noprogress`; CI kernels define
+  `XNU_TARGET_OS_OSX`, so `show_progress` defaults on) panicked at
+  `pe_init.c:314` (`assert(*delta >= 0)`), which runs before the log flusher's
+  first 10 s tick. The panicked boot wrote nothing to p27; the rings we pulled
+  were the tails of older boots. First proof: photo `PXL_20261113_150635091.jpg`
+  (`pe_init.c:314 Assertion failed: *delta >= 0`, `handshake structure not
+  initialized`).
+- Root cause: `shim/pra/boot_main.c` zeroed the `boot_args` page and never
+  filled `Video`; pe_init saw `display_size=0` and the progress shrink-loop ran
+  `*delta` negative on the first step. Fix: shim now fills
+  `v_baseAddr=0x5D000000, v_display=1, v_rowBytes=4320, v_width=1080,
+  v_height=1920, v_depth=32` (depth 32, rotate 0, scale bits 0 = 1x).
+- 0154 (same CI kernel `c270dfd1...` + fixed shim, SHA-256
+  `1654e54661f1c9eb6c463fe806be3eff422079fc89b6cad36472150493346daf`, flashed
+  p27 with readback match) booted far past pe_init: launchd, backboardd path,
+  IOKit drivers registered (AKS/WDT/SURF/HID/PRA charger), then panicked.
+- Panic 2 (photo `PXL_20261113_163751479.jpg`): `Kernel data abort, pc
+  0xffffff80074936b0 = _pra_charger_status+0xa30` (runtime = link -
+  0x7000000000), caller `_sleh_synchronous_sp1`, ESR `0x96000210` (SES, read),
+  `far 0xfffffffa863290f8`. `x19 = _pra_i2c + 0x38` = host 1 (`0xFDF0D000`):
+  `pra_map_hosts` mapped it and the first `COMP_VERSION` load external-aborted.
+  On the hi6250 a clock-gated controller busses errors (SES); it does not read
+  as 0/0xFFFFFFFF as the driver assumed. Host 0 answered:
+  `COMP_VERSION=3132302a COMP_TYPE=44570140` (genuine DesignWare ID).
+- Fixes (patches verified to apply with `patch -p1` against the pre-state):
+  - `0152` amended: second host probed only with `prai2c2=1` (default off);
+    host 0 is the primary candidate and answers.
+  - `0156`: `pra_log_panic_flush()` in `pra_sdhci.c` — synchronous rewrite of
+    the used ring + header from the panic path (try-lock; skip if the flusher
+    was interrupted mid-write).
+  - `0157`: `debug.c` calls it after the paniclog is complete.
+- Do not trust a missing ring tail as "no panic": without 0156, a panic loses
+  up to 10 s of text and panicked boots may leave the ring entirely stale.

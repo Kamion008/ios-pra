@@ -3,14 +3,17 @@ new file mode 100644
 index 0000000..1111111
 --- /dev/null
 +++ b/bsd/dev/pra_charger.c
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,737 @@
 +/*
 + * PRA-LX1 (hi6250) TI BQ25892 charger bring-up.
 + *
 + * The phone charges through a BQ25892 behind one of the two DesignWare
 + * I2C hosts at 0xFFD73000 (19.2 MHz input clock, reset register at
-+ * 0xFFD7E000) or 0xFDF0D000 (120 MHz, reset at 0xFFF35000). Which host
-+ * carries the chip is not established, so both are probed read-only at
++ * 0xFFD7E000) or 0xFDF0D000 (120 MHz, reset at 0xFFF35000). Host 0
++ * answers (0154: COMP_VERSION=3132302a, COMP_TYPE=44570140), host 1 is
++ * clock-gated on this boot and a read of it is a synchronous external
++ * abort, not silence - so the second host is probed only with
++ * prai2c2=1. The chip is probed read-only at
 + * both legal 7-bit addresses (0x6B for the BQ25892, 0x6A as the
 + * fallback; TI datasheet SLUSC86D "Device Comparison Table"). The
 + * bootloader runs its own charger firmware and may leave the controller
@@ -167,6 +170,7 @@ index 0000000..1111111
 +static bool pra_present;                /* chip answered */
 +static bool pra_writes;                 /* pracharger=1 */
 +static bool pra_dbg;                    /* prachgdebug=1 */
++static bool pra_probe_i2c2;             /* prai2c2=1: probe the second host */
 +static bool pra_wd_kick;                /* watchdog enabled, must kick */
 +static uint8_t pra_last0b, pra_last0c;  /* last raw status, for the log */
 +static char pra_charger_chan;
@@ -342,6 +346,18 @@ index 0000000..1111111
 +		uint32_t ver, type, rstv;
 +
 +		if (h->regs) {
++			continue;
++		}
++		if (i == 1 && !pra_probe_i2c2) {
++			/* 0154 learned the hard way that on the hi6250 a
++			 * clock-gated host does not read as silence: touching
++			 * 0xFDF0D000 while its clock is off is a synchronous
++			 * external abort (ESR 0x96000210), which no exception
++			 * handling in this driver can absorb. Host 0 answered
++			 * COMP_VERSION/COMP_TYPE, so probe only it unless
++			 * prai2c2=1 asks for the second host on purpose. */
++			printf("PRA charger: i2c %s skipped (prai2c2=0)\n",
++			    h->name);
 +			continue;
 +		}
 +		h->regs = ml_io_map((vm_offset_t)h->base, 0x1000);
@@ -666,6 +682,8 @@ index 0000000..1111111
 +	(void)PE_parse_boot_argn("pracharger", &pra_writes,
 +	    sizeof(pra_writes));
 +	(void)PE_parse_boot_argn("prachgdebug", &pra_dbg, sizeof(pra_dbg));
++	(void)PE_parse_boot_argn("prai2c2", &pra_probe_i2c2,
++	    sizeof(pra_probe_i2c2));
 +
 +	pra_map_hosts();
 +	pra_probe_chip();
@@ -723,47 +741,3 @@ index 0000000..1111111
 +	return 0;
 +}
 +#endif /* ARM64_BOARD_CONFIG_PRA */
-diff --git a/bsd/conf/files b/bsd/conf/files
---- a/bsd/conf/files
-+++ b/bsd/conf/files
-@@ -107,6 +107,7 @@
- bsd/dev/sweet_ufs.c			standard
- bsd/dev/a5xelte_emmc.c			standard
- bsd/dev/pra_sdhci.c			standard
-+bsd/dev/pra_charger.c			standard
- bsd/dev/a5xelte_keys.c			standard
- bsd/dev/a5xelte_touch.c			standard
- bsd/dev/sweet_sample.c			standard
-diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
---- a/iokit/Kernel/arm/SweetBattery.cpp
-+++ b/iokit/Kernel/arm/SweetBattery.cpp
-@@ -18,6 +18,21 @@
- extern "C" int dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
-     int *external, int *charging, int *full);
- #else
-+#if defined(ARM64_BOARD_CONFIG_PRA)
-+/* PRA-LX1: bsd/dev/pra_charger.c probes the TI BQ25892 over a polled
-+ * DesignWare I2C host and reads its status/ADC; percent is an OCV estimate.
-+ * It returns 0 only when a chip answered, so poll() keeps the static fallback
-+ * when the charger is absent or the bus is dead.  The name stays because
-+ * poll() below is shared with the DREAMLTE path. */
-+extern "C" int pra_charger_status(unsigned *percent, unsigned *mv, int *ma,
-+    int *external, int *charging, int *full);
-+static inline int
-+dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
-+    int *external, int *charging, int *full)
-+{
-+	return pra_charger_status(percent, mv, ma, external, charging, full);
-+}
-+#else
- /* PRA-LX1 has no MAX77865; the gauge implementation is DREAMLTE-only.  Report
-  * failure so poll() publishes the static fallback and never probes Exynos I2C. */
- static inline int
-@@ -29,6 +44,7 @@
- 	return -1;
- }
- #endif
-+#endif
- static inline int sweet_spmi_init(void) { return -1; }
- static inline int sweet_spmi_read(unsigned, unsigned, uint8_t *) { return -1; }
- #define SWEET_BAT_MAH 3000u

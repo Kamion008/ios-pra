@@ -1,0 +1,28 @@
+pra: hook the panic path so the console ring survives
+
+debug.c owns the end of every panic; call pra_log_panic_flush()
+there, after the paniclog is complete and before the reboot or the
+forever-spin, with the other CPUs already parked.
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 0000000..1111111
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1455,6 +1455,18 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
+ 
+ #endif /* CONFIG_KDP_INTERACTIVE_DEBUGGING */
+ 
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	/*
++	 * The periodic log flusher dies with the boot, so everything printed
++	 * since its last tick - the panic text itself - would be lost (the
++	 * pe_init.c:314 panic left no trace in the ring). The panic output is
++	 * complete at this point and the other CPUs are parked: write the
++	 * ring out synchronously. Best effort; see pra_log_panic_flush().
++	 */
++	extern void pra_log_panic_flush(void);
++	pra_log_panic_flush();
++#endif
++
+ 	if (!panicDebugging) {
+ 		kdp_machine_reboot_type(kPEPanicRestartCPU, debugger_panic_options);
+ 	}

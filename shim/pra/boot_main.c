@@ -225,6 +225,18 @@ void pra_main(uintptr_t dtb)
 	ba->topOfKernelData = ba_pa + PAGE_SIZE;
 	ba->deviceTreeP = p->virt_base + (adt_pa - p->phys_base);
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
+	/* pe_init.c walks the progress bar in from the display edge and asserts
+	 * *delta >= 0 (pe_init.c:314). With this struct zeroed that loop saw
+	 * display_size 0 and ran delta negative on the first step: the 0153
+	 * boot panicked in pe_init before launchd. Describe the same scanout
+	 * the splash uses; v_depth = depth 32, rotate 0, scale bits 0 (1x).
+	 * v_display selects kPEGraphicsMode, which the vc progress bar needs. */
+	ba->Video.v_baseAddr = FB_BASE;
+	ba->Video.v_display = 1;
+	ba->Video.v_rowBytes = FB_STRIDE_PX * 4;
+	ba->Video.v_width = FB_WIDTH;
+	ba->Video.v_height = FB_HEIGHT;
+	ba->Video.v_depth = 32;
 	for (unsigned i = 0; i < BOOT_LINE_LENGTH; ++i)
 		ba->CommandLine[i] = p->cmdline[i];
 	ba->memSizeActual = p->mem_size;
