@@ -996,3 +996,40 @@ What made the card busy in the first place is not established yet. The
 suspicion is a CMD18 that stops early (the per-block loop gives up) and is
 aborted with a CMD/DAT reset but no CMD12, leaving the card mid-stream with
 DAT asserted forever. `emmcmulti=0` is the experiment that settles it.
+
+## SpringBoard is alive; the visible loop is five impossible daemons (2026-11-13)
+
+Ring dumped from TWRP (LBA 794623, 253,341 bytes, not wrapped). The boot is
+further along than the console made it look:
+
+    hfs: mounted iOSRoot on device b(1, 0)
+    exec launchd
+    ...
+    exec SpringBoard           (once)
+    exec backboardd            (once)
+    SWEET SURF: backboardd create id 2 1080x1920 fmt 0x42475241 bpe 4 bpr 4352 ...
+    SWEET FB: swap 4 layer 0 surface 3 1080x1920 ... a 0,0 1080x1920 b 0,0 1080x1920
+
+- `SpringBoard` and `backboardd` are each exec'd **exactly once**, so neither
+  is respawning: the UI stack is up and backboardd is creating surfaces and
+  swapping frames. The "Apple logo drowned in something opaque" is the kernel
+  text console drawn over the GUI, not a display fault.
+- `exec` counts over the whole boot: fairplayd.H2 182, bluetoothd 164,
+  nanotimekitcompaniond 115, locationd 109, WirelessRadioManagerd 57. These
+  cannot succeed on this phone (no SEP, no BT controller, no telephony, no
+  GPS) and are the visible loop.
+- `datamigrator`, `migrationpluginwrapper` and `Setup` exec'd several times:
+  the first-boot migration is running, so the screen is expected to be the
+  Setup Assistant rather than a home screen.
+- `SWEET AKS: securityd sel 10 ... -> 0xe00002c7` and the same for
+  SpringBoard: keybag operations we do not implement. Impact still unknown.
+- Disk is the real drag: `PRA eMMC: 8212 KiB, 12976 cmds, 930 KiB/s`, with
+  samples as low as 31 KiB/s. Every daemon exec re-reads a multi-MB Mach-O
+  over single-sector PIO, which is why the loop looks frozen.
+
+### TWRP cannot stage files: no HFS+ driver
+
+`cat /proc/filesystems` in TWRP 3.5.2 lists no hfsplus and
+`mount -t hfsplus` returns "No such device", so p58 cannot be mounted from
+recovery. Staging has to be either a PC-side image edit plus a re-stage, or
+an in-place overwrite of an already-allocated file (no HFS+ metadata work).
