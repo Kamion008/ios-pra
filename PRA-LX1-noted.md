@@ -1209,3 +1209,29 @@ Two honest costs:
 - The userland side is not free either: OSMesa+Panfrost+shim are ~20 MB that
   every first boot must read from a 0.5 MB/s eMMC (~40 s), so it interacts
   with the I/O problem rather than sidestepping it.
+
+### GPU: pick-up checklist (parked 2026-11-13 until boot + touch work)
+
+Nothing below is worth starting until SpringBoard renders without the launch
+watchdog killing Setup Assistant, and there is a touch driver to drive it.
+
+1. Read `research/herolte-ref/xnu/patches/0225-0233` and `0239/0243` next to
+   `iokit/Kernel/arm/HeroGPU.cpp` in that tree; they are the whole template.
+   Copy the file, then replace the Exynos block in `hg_bringup()` with the
+   hi6250 one.
+2. hi6250 constants: GPU `0xE8970000` (0x4000), SPI JOB 258 / MMU 259 / GPU
+   260. Power and rate go to LPM3, not to CRG: rail `0x00030004` /
+   `0x00030104`, `clk_g3d` set-rate `0x0003030A` (devid 2). The mailbox format
+   is in Huawei's full kernel release - our local tree has DTS only, no
+   `drivers/`, so fetch the full hi6250 GPL tarball first.
+3. First boot-arg stage is read-only and gated (`pragpu=1`): read `GPU_ID` and
+   expect product `0x830`, r?p?, plus `SHADER/TILER/L2/MMU` present masks.
+   Do not touch a possibly power-gated aperture before the pmctrl domain
+   status says it is on - that is what an external abort looks like.
+4. Then one private WRITE_VALUE job, then fragment clear, then IOSurface
+   import, then the panel blit, then the user client, then Mesa/OSMesa, then
+   the EAGL shim. Each stage must be proved on the phone before the next.
+5. T830 quirk list comes from Mesa's `panfrost_gpu_init_quirks()` for `0x830`
+   plus our `huawei/refs/r20p0_mmu.c` and `v4/v5/v6.xml`; 0243's T880 quirks
+   (typed attribute descriptors, TC clock-gate override, job throttle) are
+   the shape of what to look for, not the values to copy.
