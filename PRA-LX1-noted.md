@@ -1313,12 +1313,15 @@ same failure mode. Counting spawns and exits in 7.5 minutes of it:
      35 WirelessRadioManager                  27 exit(78)
     254 spawns total, 230 "throttled by 10 seconds"
 
-The current cmdline has **no** `praexecskip`; these five fail on their own
-(exit 78 = EX_CONFIG) and launchd respawns them every 10 s because their
-plists set `KeepAlive`. At ~34 launches a minute, each re-reading a multi-MB
-Mach-O and writing a crash report, they account for essentially all of the
-859 MiB after Setup and for the write storm. Setup cannot get the disk even
-if it wanted to.
+`praexecskip` **is** active (`praexecskip: fairplayd.H2,bluetoothd,...` is
+in ring8; the launchd `boot-args =` line is truncated before it, which is
+what made an earlier reading of this assume otherwise). So `exec` is
+refused with EPERM before the Mach-O is read, xpcproxy turns that into
+`exit(78)` (EX_CONFIG), and launchd respawns each job every 10 s because its
+plist sets `KeepAlive`. At ~30-34 launches a minute, the measured cost is
+859 MiB / 2,609 spawns = ~330 KiB each (xpcproxy, the dyld cache, libxpc
+startup, and a crash report) - essentially all of the I/O after Setup, plus
+the write storm. Setup cannot get the disk even if it wanted to.
 
 Crash reports on disk (from the pre-fix boots) show the history the ring
 never printed: six `Setup-*.ips` files, all `EXC_CRASH/SIGKILL`,
