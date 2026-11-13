@@ -1,0 +1,131 @@
+pra: dump a panic backtrace to the ring, log through the fb-claim window
+
+The 0156 boot panicked twice: zone_require_panic panicked again while
+the diagnostics pass ran, so no backtrace was ever printed and the
+panic caller is unrecoverable. Dump the frame-pointer chain straight
+into the persistent ring from zone_require_panic, before panic() runs;
+pra_log_panic_flush already writes the whole ring out on the panic path
+(verified present and called from panic() in the flashed 0156 kernel).
+
+The ring also lost a window of console text around the panic while
+disableConsoleOutput was set for the framebuffer claim: _cnputs returns
+before _cnputc there, and the msgbuf replay that redraws that text goes
+straight to vcputc, so the persistent ring never sees it. Append before
+the early return; when the console is live the per-character hook in
+_cnputc keeps counting, so nothing is doubled.
+
+pra_log_panic_flush gave up silently when the periodic flusher owned
+the eMMC lock mid-write; the controller stalls for seconds at a time,
+so retry boundedly and complain loudly instead of skipping.
+
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -921,6 +921,40 @@ pra_log_pick_explicit_lba(void)
+ 	return true;
+ }
+ 
++/*
++ * Dump the frame-pointer chain into the persistent ring. The 0156 panic
++ * died a second time before the diagnostics pass printed any backtrace,
++ * so the panic caller was unrecoverable. Called from zone_require_panic
++ * before panic() runs. Direct pra_log_append, not printf: the console
++ * can be inside its disableConsoleOutput window and the msgbuf replay
++ * bypasses the ring hook entirely. Frames are validated for alignment
++ * and monotonic growth so a corrupt chain cannot loop.
++ */
++void
++pra_log_panic_backtrace(void *fp_in)
++{
++	uint64_t fp = (uint64_t)fp_in;
++	char buf[48];
++
++	for (int i = 0; i < 16 && fp != 0; i++) {
++		uint64_t *frame = (uint64_t *)fp;
++		uint64_t next = frame[0];
++		uint64_t pc = frame[1];
++		int n;
++
++		if ((next & 0xfu) != 0u || next <= fp) {
++			break;
++		}
++		n = snprintf(buf, sizeof(buf), "PRA BT: %d pc 0x%llx\n",
++		    i, pc);
++		if (n > (int)sizeof(buf)) {
++			n = (int)sizeof(buf);
++		}
++		pra_log_append(buf, n);
++		fp = next;
++	}
++}
++
+ /* The flusher thread dies with the boot, so a panic loses everything printed
+  * since its last 10 s tick - the pe_init.c:314 panic (0153) left no trace in
+  * the ring for exactly this reason. Called once from the panic path, after
+@@ -938,8 +972,21 @@ pra_log_panic_flush(void)
+ 	if (!pra_log_enabled || !pra_log_erecovery_sectors) {
+ 		return;
+ 	}
+-	if (!lck_mtx_try_lock(&pra_emmc_lock)) {
+-		return;
++	/*
++	 * A single try used to skip silently when the periodic flusher owned
++	 * the lock mid-write; the eMMC stalls for seconds at a time, and
++	 * this is the one flush that must not be skipped. Bound the wait
++	 * and complain if the lock is truly stuck (a parked CPU holding it
++	 * will never release).
++	 */
++	unsigned tries = 0;
++	while (!lck_mtx_try_lock(&pra_emmc_lock)) {
++		if (++tries > 100u) {
++			printf("PRA LOG: panic flush: lock stuck, skipping\n");
++			return;
++		}
++		for (volatile unsigned spin = 0; spin < 10000u; spin++) {
++		}
+ 	}
+ 	total = os_atomic_load(&pra_log_total, relaxed);
+ 	used = (total + 511u) & ~511ull;
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -321,6 +321,18 @@ _cnputs(char *c, int size, bool poll)
+ 	a5xelte_log_append(c, size);
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	/*
++	 * Output printed while disableConsoleOutput is set - the framebuffer
++	 * claim window - never reaches _cnputc, and the msgbuf replay that
++	 * redraws it goes straight to vcputc, so the persistent ring would
++	 * lose exactly the text around a panic. Append before the early
++	 * return; when the console is live the per-character hook in _cnputc
++	 * keeps counting, so nothing is doubled.
++	 */
++	pra_log_append(c, size);
++#endif
++
+ 	if (disableConsoleOutput) {
+ 		return;
+ 	}
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -1423,6 +1423,17 @@ zone_require_panic(zone_t zone, void *addr)
+ 	uint32_t zindex;
+ 	zone_t other;
+ 
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	/*
++	 * The panic path can die a second time before any backtrace is
++	 * printed (0156: a nested zone_require during the diagnostics
++	 * pass), so recover the frame chain into the persistent ring
++	 * before panic() runs.
++	 */
++	extern void pra_log_panic_backtrace(void *fp);
++	pra_log_panic_backtrace(__builtin_frame_address(0));
++#endif
++
+ 	if (!from_zone_map(addr, zone_elem_inner_size(zone))) {
+ 		panic("zone_require failed: address not in a zone (addr: %p)", addr);
+ 	}
