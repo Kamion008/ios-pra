@@ -1,0 +1,132 @@
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -114,6 +114,12 @@
+ static uint8_t pra_emmc_multi_buf[PRA_MULTI_MAX * 512u] __attribute__((aligned(64)));
+ static bool pra_emmc_stats;
+ static uint64_t pra_emmc_stat_bytes, pra_emmc_stat_cmds, pra_emmc_stat_ns;
++/* Reads and writes are split because they fail differently: reads are bound by
++ * the bus clock, writes by the card's program/erase time. A single combined
++ * rate cannot tell which of the two is costing the boot. */
++static uint64_t pra_emmc_stat_rbytes, pra_emmc_stat_rcmds, pra_emmc_stat_rns;
++static uint64_t pra_emmc_stat_wbytes, pra_emmc_stat_wcmds, pra_emmc_stat_wns;
++static uint64_t pra_emmc_stat_slow, pra_emmc_stat_max_ns;
+ static LCK_GRP_DECLARE(pra_emmc_grp, "pra_emmc");
+ static LCK_MTX_DECLARE(pra_emmc_lock, &pra_emmc_grp);
+ 
+@@ -487,9 +493,13 @@
+ }
+ 
+ /* emmcstats=1 reports the achieved rate, so the gain over per-sector reads is
+- * measured on the phone instead of guessed. */
++ * measured on the phone instead of guessed. Reads and writes are reported
++ * separately, with the worst single request and a count of requests over 5 ms:
++ * a uniformly slow direction means the bus or the card is the limit, while a
++ * handful of very slow requests means a hot spot, such as a journal block that
++ * is rewritten on every transaction. */
+ static void
+-pra_emmc_note_io(uint32_t bytes, uint32_t cmds, uint64_t start)
++pra_emmc_note_io(uint32_t bytes, uint32_t cmds, uint64_t start, bool is_read)
+ {
+ 	uint64_t delta, ns;
+ 
+@@ -501,15 +511,47 @@
+ 	pra_emmc_stat_bytes += bytes;
+ 	pra_emmc_stat_cmds += cmds;
+ 	pra_emmc_stat_ns += ns;
++	if (is_read) {
++		pra_emmc_stat_rbytes += bytes;
++		pra_emmc_stat_rcmds += cmds;
++		pra_emmc_stat_rns += ns;
++	} else {
++		pra_emmc_stat_wbytes += bytes;
++		pra_emmc_stat_wcmds += cmds;
++		pra_emmc_stat_wns += ns;
++	}
++	if (ns > pra_emmc_stat_max_ns) {
++		pra_emmc_stat_max_ns = ns;
++	}
++	if (ns > 5000000ull) {
++		pra_emmc_stat_slow++;
++	}
+ 	if (pra_emmc_stat_bytes >= (8u << 20)) {
+ 		uint64_t kib = pra_emmc_stat_bytes >> 10;
+ 		uint64_t kbs = pra_emmc_stat_ns ?
+ 		    (pra_emmc_stat_bytes * 1000000000ull) / pra_emmc_stat_ns / 1024ull : 0;
+-		printf("PRA eMMC: %llu KiB, %llu cmds, %llu KiB/s\n",
+-		    kib, pra_emmc_stat_cmds, kbs);
++		uint64_t rkbs = pra_emmc_stat_rns ?
++		    (pra_emmc_stat_rbytes * 1000000000ull) / pra_emmc_stat_rns / 1024ull : 0;
++		uint64_t wkbs = pra_emmc_stat_wns ?
++		    (pra_emmc_stat_wbytes * 1000000000ull) / pra_emmc_stat_wns / 1024ull : 0;
++		printf("PRA eMMC: %llu KiB, %llu cmds, %llu KiB/s "
++		    "(r %llu KiB %llu cmds %llu KiB/s | w %llu KiB %llu cmds "
++		    "%llu KiB/s | >5ms %llu max %llu us)\n",
++		    kib, pra_emmc_stat_cmds, kbs,
++		    pra_emmc_stat_rbytes >> 10, pra_emmc_stat_rcmds, rkbs,
++		    pra_emmc_stat_wbytes >> 10, pra_emmc_stat_wcmds, wkbs,
++		    pra_emmc_stat_slow, pra_emmc_stat_max_ns / 1000ull);
+ 		pra_emmc_stat_bytes = 0;
+ 		pra_emmc_stat_cmds = 0;
+ 		pra_emmc_stat_ns = 0;
++		pra_emmc_stat_rbytes = 0;
++		pra_emmc_stat_rcmds = 0;
++		pra_emmc_stat_rns = 0;
++		pra_emmc_stat_wbytes = 0;
++		pra_emmc_stat_wcmds = 0;
++		pra_emmc_stat_wns = 0;
++		pra_emmc_stat_slow = 0;
++		pra_emmc_stat_max_ns = 0;
+ 	}
+ }
+ 
+@@ -1112,12 +1154,24 @@
+ 		printf("PRA eMMC: MMIO map failed\n");
+ 		return ENOMEM;
+ 	}
++	/* Start the ring before the first print: everything this function reports
++	 * about the host is the only record of the configuration the card was
++	 * left in by LK, and until now it was printed before the ring existed,
++	 * so a wedged boot lost it. */
++	if (pra_log_pick_explicit_lba()) {
++		pra_log_start();
++	}
+ 	uint16_t version = pra_emmc_rd16(SDHCI_HOST_VERSION);
+ 	uint16_t clk = pra_emmc_rd16(SDHCI_CLOCK_CONTROL);
+ 	uint32_t present = pra_emmc_rd32(SDHCI_PRESENT_STATE);
+-	printf("PRA eMMC: host base=%llx version=%x clock=%x present=%x power=%x\n",
++	uint32_t caps = pra_emmc_rd32(SDHCI_CAPABILITIES);
++	uint32_t base_mhz = (caps >> 8) & 0xffu;
++	uint32_t div = clk >> 8;
++	printf("PRA eMMC: host base=%llx version=%x clock=%x present=%x power=%x "
++	    "caps=%x base=%u MHz div=%u\n",
+ 	    base, version, clk, present,
+-	    (uint32_t)*(volatile unsigned char *)(pra_emmc_regs + SDHCI_POWER_CONTROL));
++	    (uint32_t)*(volatile unsigned char *)(pra_emmc_regs + SDHCI_POWER_CONTROL),
++	    caps, base_mhz, div);
+ 	if ((version & 0xffu) != 2 && (version & 0xffu) != 3) {
+ 		printf("PRA eMMC: unexpected SDHCI spec version %u\n", version & 0xffu);
+ 	}
+@@ -1130,13 +1184,6 @@
+ 		pra_emmc_multi_ok = false;
+ 		printf("PRA eMMC: CMD18 disabled by boot arg\n");
+ 	}
+-	/* With an explicit LBA the ring can start here, before the GPT read, so
+-	 * a failure inside that read is still on the disk afterwards. Without
+-	 * one it starts in pra_emmc_rootdev() as before, keeping the normal
+-	 * boot path unchanged. */
+-	if (pra_log_pick_explicit_lba()) {
+-		pra_log_start();
+-	}
+ 	return 0;
+ }
+ 
+@@ -1252,7 +1299,7 @@
+ 	}
+ 	lck_mtx_unlock(&pra_emmc_lock);
+ 	buf_unmap(bp);
+-	pra_emmc_note_io(count - buf_resid(bp), cmds, t0);
++	pra_emmc_note_io(count - buf_resid(bp), cmds, t0, is_read);
+ done:
+ 	if (error) {
+ 		buf_seterror(bp, error);
