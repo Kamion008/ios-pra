@@ -1,0 +1,285 @@
+# ---------------------------------------------------------------------------
+# codemagic.yaml -- BACKUP pipeline for the PRA (hi6250 / Kirin 655) XNU kernel
+#
+# This is a port of .github/workflows/xnu.yml (GitHub Actions) to Codemagic.
+# It exists ONLY as a fallback for when GitHub Actions macOS capacity fails
+# ("The job was not acquired by Runner of type hosted even after multiple
+# attempts"). The GitHub workflow stays the primary pipeline: do NOT add
+# push/PR triggers here, and do not delete xnu.yml.
+#
+# TRIGGERING (manual only)
+#   No `triggering:` section is defined below. Per the Codemagic docs
+#   (https://docs.codemagic.io/yaml-basic-configuration/yaml-getting-started):
+#   "If no events are defined, you can start builds only manually."
+#
+#   * Codemagic UI:  codemagic.io -> this app -> "Start new build" -> pick the
+#     branch and the "xnu-pra-backup" workflow -> the four inputs below are
+#     prefilled with the same defaults as the GitHub workflow_dispatch ->
+#     "Start build".
+#   * REST API (scriptable fallback; uses the input defaults):
+#       curl -H "Content-Type: application/json" \
+#            -H "x-auth-token: <API token from Codemagic user settings>" \
+#            --data '{"appId":"<appId>","workflowId":"xnu-pra-backup","branch":"master"}' \
+#            -X POST https://api.codemagic.io/builds
+#     appId is in the Codemagic app settings URL; workflowId is the YAML key
+#     below. See https://docs.codemagic.io/rest-api/builds.
+#
+# XCODE 15.x NOTE (critical, read before changing `xcode:` below)
+#   xnu-8796 must be built with an Xcode 15.x iig: Xcode 16's iig emits
+#   IORPC.kernelContent, which xnu-8796 lacks (see the comment on the GitHub
+#   job). Codemagic removed every Xcode 15.x machine image from its shared
+#   pool on 2025-11-10
+#   (https://github.com/orgs/codemagic-ci-cd/discussions/3294); the oldest
+#   selectable image today ships a single Xcode 16.4 on macOS 15.5 Sequoia
+#   (https://docs.codemagic.io/specs-macos/xcode-16-4). There is no
+#   "Additional Xcode versions" UI option in the current docs either.
+#   Therefore: `xcode: 16.4` is used only to get a Sequoia/M2 machine to boot;
+#   the "Select Xcode" script then looks for an Xcode 15.x app on it and FAILS
+#   FAST when none is present. To make the pipeline actually produce a kernel
+#   on Codemagic today, set DXB_INSTALL_XCODE15=true together with the
+#   XCODES_USERNAME / XCODES_PASSWORD secret variables so the build downloads
+#   and installs Xcode 15.4 itself (see tools/codemagic-port.md).
+# ---------------------------------------------------------------------------
+
+workflows:
+  xnu-pra-backup:
+    name: xnu PRA kernel (Codemagic backup)
+    # mac_mini_m2 is the only Apple instance the free tier covers (500 free
+    # macOS minutes/month for individual accounts); mac_mini_m4 requires
+    # billing to be enabled.
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    # Mirrors the workflow_dispatch inputs of .github/workflows/xnu.yml. Every
+    # input has a default, so REST API starts get the GitHub defaults too.
+    inputs:
+      macos_version:
+        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
+        type: string
+        default: "13.5"
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        type: choice
+        options:
+          - DEVELOPMENT
+          - RELEASE
+          - DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG
+        type: string
+        default: PRA
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+    environment:
+      # Oldest Xcode image Codemagic still offers (macOS 15.5 Sequoia, one
+      # Xcode: 16.4 at /Applications/Xcode-16.4.app). NOT used for the build
+      # itself -- the Select Xcode script overrides DEVELOPER_DIR.
+      xcode: 16.4
+      vars:
+        DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+        DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+        # Set to "true" ONLY after adding XCODES_USERNAME / XCODES_PASSWORD
+        # (Apple ID + app-specific password) as secret variables and listing
+        # their group under `groups:` here. Adds ~20-30 min per build.
+        DXB_INSTALL_XCODE15: "false"
+    scripts:
+      - name: Configure build (workflow_dispatch-equivalent inputs)
+        script: |
+          set -euo pipefail
+          # ${{ inputs.* }} values are interpolated before the script runs.
+          # Persist everything to a file because each script section is a
+          # fresh shell: exported variables do not carry over.
+          cat > "$HOME/.xnu_build_env" <<EOF
+          MACOS_VERSION='${{ inputs.macos_version }}'
+          KERNEL_CONFIG='${{ inputs.kernel_config }}'
+          MACHINE_CONFIG='${{ inputs.machine_config }}'
+          KEEP_GOING='${{ inputs.keep_going }}'
+          DXB_REPO='${DXB_REPO}'
+          DXB_SHA='${DXB_SHA}'
+          DXB_INSTALL_XCODE15='${DXB_INSTALL_XCODE15}'
+          EOF
+          . "$HOME/.xnu_build_env"
+          echo "macos_version=$MACOS_VERSION kernel_config=$KERNEL_CONFIG machine_config=$MACHINE_CONFIG keep_going=$KEEP_GOING"
+          echo "dxb=$DXB_REPO @ $DXB_SHA  install_xcode15=$DXB_INSTALL_XCODE15"
+          sw_vers
+
+      - name: Fetch pinned darwin-xnu-build and apply PRA cross-compile sed
+        script: |
+          set -euo pipefail
+          . "$HOME/.xnu_build_env"
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          case "$MACHINE_CONFIG" in
+          A5XELTE|PRA)
+            # Cortex-A53 (Exynos7580 / hi6250 Kirin 655) is ARMv8.0: Xcode's
+            # default arm64 code generation emits LSE atomics (ldadd/cas) that
+            # trap as "Undefined kernel instruction". Same flags as
+            # tools/a5xelte-build-firehose.sh.
+            sed -i '' "s/ARCHS=\"x86_64 arm64e\" VALID_ARCHS=\"x86_64 arm64e\"/ARCHS=arm64 VALID_ARCHS=arm64 OTHER_CFLAGS='-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53 -march=armv8-a+crypto'/" dxb/build.sh
+            grep -c "VALID_ARCHS=arm64 OTHER_CFLAGS='-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53" dxb/build.sh
+            ;;
+          *)
+            sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+            grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+            ;;
+          esac
+          ls dxb/patches
+
+      - name: Deps (same as the GitHub Deps step)
+        script: |
+          set -euo pipefail
+          brew install jq gum bash cmake ninja
+          # dxb build.sh only checks that an xcodes binary exists (Xcode is
+          # preinstalled on CI images); replicate the GitHub stub unless a real
+          # xcodes is already present. The real one is only needed by the
+          # optional DXB_INSTALL_XCODE15 download path in the next step.
+          if ! command -v xcodes >/dev/null 2>&1; then
+            printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+            sudo chmod +x /usr/local/bin/xcodes
+          fi
+          ls -d /Applications/Xcode*.app
+
+      - name: Select Xcode 15.x (fail fast if the image has none)
+        script: |
+          set -euo pipefail
+          . "$HOME/.xnu_build_env"
+          XC=$(ls -d /Applications/Xcode_15*.app /Applications/Xcode-15*.app 2>/dev/null | sort -V | head -1 || true)
+          if [ -z "$XC" ] && [ "${DXB_INSTALL_XCODE15:-false}" = "true" ]; then
+            echo "No Xcode 15.x on the image; DXB_INSTALL_XCODE15=true -> downloading Xcode 15.4 via xcodes"
+            [ -n "${XCODES_USERNAME:-}" ] && [ -n "${XCODES_PASSWORD:-}" ] || {
+              echo "ERROR: DXB_INSTALL_XCODE15=true needs XCODES_USERNAME and XCODES_PASSWORD (Apple ID + app-specific password) as secret variables; unset DXB_INSTALL_XCODE15 for the fail-fast default." >&2
+              exit 1
+            }
+            command -v xcodes >/dev/null 2>&1 || brew install xcodes
+            # ~8 GB xip, roughly 15-25 min on an M2 mini; --experimental-unxip
+            # is the faster extractor.
+            xcodes install 15.4 --experimental-unxip
+            XC=$(ls -d /Applications/Xcode_15*.app /Applications/Xcode-15*.app 2>/dev/null | sort -V | head -1 || true)
+          fi
+          if [ -z "$XC" ]; then
+            echo "=====================================================================" >&2
+            echo "ERROR: no Xcode 15.x is installed on this Codemagic image:" >&2
+            ls -d /Applications/Xcode*.app >&2 || true
+            echo "xnu-8796 requires an Xcode 15.x iig: Xcode 16's iig emits" >&2
+            echo "IORPC.kernelContent, which xnu-8796 lacks." >&2
+            echo "Codemagic removed its Xcode 15.x machine images on 2025-11-10" >&2
+            echo "(https://github.com/orgs/codemagic-ci-cd/discussions/3294)." >&2
+            echo "Remedies: run with DXB_INSTALL_XCODE15=true plus the XCODES_*" >&2
+            echo "secrets (see tools/codemagic-port.md), or ask Codemagic support" >&2
+            echo "for a custom image that still carries Xcode 15.x." >&2
+            echo "=====================================================================" >&2
+            exit 1
+          fi
+          echo "Selected Xcode (lowest 15.x): $XC"
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          sudo xcode-select -s "$XC"
+          # A freshly downloaded Xcode needs license acceptance / first launch.
+          sudo xcodebuild -license accept || true
+          xcodebuild -runFirstLaunch >/dev/null 2>&1 || sudo xcodebuild -runFirstLaunch >/dev/null 2>&1 || true
+          xcodebuild -version
+          xcrun --find iig
+          # Persist for the later script sections (fresh shells).
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$HOME/.xnu_build_env"
+
+      - name: Build kernel (bash build.sh, keep going like GitHub)
+        script: |
+          set -euo pipefail
+          . "$HOME/.xnu_build_env"
+          export DEVELOPER_DIR
+          # keep going after errors so one run reports every compile failure
+          if [ "$KEEP_GOING" != "false" ]; then
+            export MAKEFLAGS=-k
+          fi
+          cd dxb
+          # A previous PRA artifact did not contain the patched locore/cswitch
+          # code even though the packaged source tree did. Force the kernel
+          # objects and destination image to be rebuilt from the patched tree.
+          rm -rf build/xnu.obj
+          rm -f fakeroot/System/Library/Kernels/kernel.*
+          bash build.sh
+    # Same files as the GitHub xnu-kernel artifact. Codemagic bundles them
+    # into <project>_<version>_artifacts.zip on the build page. Collection
+    # happens after the publishing scripts and also for failed builds
+    # (https://github.com/orgs/codemagic-ci-cd/discussions/2506), so a failing
+    # guard below does not block the kernel from being uploaded.
+    artifacts:
+      - out/kernel.development.pra
+      - out/*.lse.txt
+      - out/SHA256SUMS
+    publishing:
+      scripts:
+        # Publishing scripts run regardless of the build status -- this is the
+        # Codemagic equivalent of the GitHub `if: always()` steps. Order:
+        # collect + guards, then artifacts are gathered from out/ afterwards.
+        - name: Collect kernel, SHA256SUMS and LSE report (always)
+          script: |
+            set -euo pipefail
+            . "$HOME/.xnu_build_env" 2>/dev/null || true
+            export DEVELOPER_DIR="${DEVELOPER_DIR:-}"
+            mkdir -p out
+            cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+            ls -la out
+            (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+        - name: Verify PRA preemption diagnostics are linked (PRA only)
+          script: |
+            set -uo pipefail
+            . "$HOME/.xnu_build_env" 2>/dev/null || true
+            export DEVELOPER_DIR="${DEVELOPER_DIR:-}"
+            guard_rc=0
+            if [ "${MACHINE_CONFIG:-PRA}" != "PRA" ]; then
+              echo "MACHINE_CONFIG=${MACHINE_CONFIG:-} != PRA: preemption guard skipped"
+            elif (
+              set -euo pipefail
+              kernel=out/kernel.development.pra
+              test -f "$kernel" || { echo "ERROR: $kernel not found (build failed?)" >&2; exit 1; }
+              # Avoid grep -q closing LLVM's output pipe early. With pipefail,
+              # llvm-nm reports that expected early close as a broken-pipe error.
+              xcrun llvm-nm -n "$kernel" | grep '_pra_preempt_notzero' >/dev/null
+              strings -a "$kernel" | grep 'PRA-PREEMPT cnt=' >/dev/null
+              xcrun llvm-objdump -d "$kernel" > /tmp/pra-kernel.disasm
+              awk '/<return_to_user>:/ {inside=1} inside {print} inside && /<no_asts>:/ {exit}' /tmp/pra-kernel.disasm \
+                | grep '_pra_preempt_notzero' >/dev/null
+              echo 'PRA preemption diagnostic helper is linked and called from return_to_user.'
+              # 0155 regression guard: build.sh SKIPS patches whose git apply
+              # --check fails, so a half-regenerated patch can silently drop a
+              # whole driver (the charger was missing from one kernel while CI
+              # stayed green). Every PRA-only driver must assert its strings.
+              strings -a "$kernel" | grep 'PRA charger:' >/dev/null
+              strings -a "$kernel" | grep 'prai2c2' >/dev/null
+              xcrun llvm-nm -n "$kernel" | grep '_pra_log_panic_flush' >/dev/null
+              strings -a "$kernel" | grep 'PRA MSG' >/dev/null
+              echo 'PRA charger, panic flush and Setup probe are linked.'
+            ); then
+              echo "PRA guard: OK"
+            else
+              echo "PRA guard: FAILED (see messages above)" >&2
+              guard_rc=1
+            fi
+            # Report the guard verdict but keep going so the LSE report below
+            # is still produced, exactly like the GitHub if: always() steps.
+            [ "$guard_rc" -eq 0 ] || true
+            # Check for ARMv8.1 LSE instructions (Cortex-A53 has none).
+            # Report-only on GitHub; kept report-only here.
+            for k in out/kernel.*; do
+              [ -f "$k" ] || continue
+              case "$k" in *.link|*.dSYM) continue ;; esac
+              xcrun llvm-objdump -d --no-show-raw-insn "$k" > "$k.disasm" 2>/dev/null || continue
+              # function headers + LSE mnemonics, so each hit names its function
+              grep -E '^[0-9a-f]+ <|	(cas|casa|casal|casl|casp|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|swp)[a-z]*	' "$k.disasm" \
+                | awk '/^[0-9a-f]+ </{fn=$2; next} {n++; c[fn]++} END {printf "LSE instructions: %d\n", n+0; for (f in c) print c[f], f}' \
+                | sort -rn | head -40 | tee "$k.lse.txt"
+              rm -f "$k.disasm"
+            done
+            # Fail the build here if the guard found a regression; the kernel
+            # and the LSE report are already on disk for artifact collection.
+            exit "$guard_rc"

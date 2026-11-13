@@ -1620,3 +1620,48 @@ PRA-only (`ARM64_BOARD_CONFIG_PRA`), so the other board configs are untouched.
   - `0157`: `debug.c` calls it after the paniclog is complete.
 - Do not trust a missing ring tail as "no panic": without 0156, a panic loses
   up to 10 s of text and panicked boots may leave the ring entirely stale.
+
+## 0155 CI lesson: a skipped patch is a silent driver removal (2026-11-13)
+
+- `darwin-xnu-build`'s patches() applies each patch with `git apply --check`
+  and, on failure, only prints a warning and continues. Run 43468482136 stayed
+  green while the charger was entirely absent from the kernel: my 0152
+  regeneration had kept only the `pra_charger.c` section and dropped the
+  `bsd/conf/files` registration and the SweetBattery wiring hunks, so the file
+  existed but nothing compiled or referenced it (kernel 17,074,776 B vs
+  17,108,600 B - the missing driver is the size delta).
+- Guard added to the workflow: PRA kernels must contain `PRA charger:`,
+  `prai2c2`, `_pra_log_panic_flush` and `PRA MSG` strings/symbols.
+- 0148 (cmd12/buffer-ready) is skipped by the same mechanism
+  (`patch failed: bsd/dev/pra_sdhci.c:395`). The tree inputs feeding it are
+  byte-identical between the 0153 and 0155 builds, so it has been skipped in
+  the earlier builds too; all boots so far ran without it. Rebase it onto the
+  post-0151 pra_sdhci.c when convenient - behavior has been fine without it.
+- Rule: after regenerating any patch, verify EVERY file section applies
+  (`git apply` against reconstructed pre-states), not just the first hunk.
+
+## CI incident and 0156 flash (2026-11-13 evening)
+
+- Ring12 pull confirmed the 0154 boot wrote NOTHING to the ring (header
+  identical to the stale 235039/124): it panicked before the flusher's first
+  10 s tick, so the whole IOKit -> charger sequence ran in under 10 s.
+- CI: two consecutive "job not acquired by Runner" failures (macOS arm64
+  capacity), a workflow_dispatch on macos-15-large rejected by the account
+  spending limit (large runners are paid even for public repos), then a rerun
+  succeeded (run 43473383408, 4m49s) with the new driver-strings guard green.
+- Backup CI: subagent ported the pipeline to codemagic.yaml +
+  tools/codemagic-port.md (uncommitted by design). Key finding: Codemagic
+  removed all Xcode 15.x images on 2025-11-10; the default run fail-fasts on
+  Xcode 16 (iig IORPC.kernelContent breaks xnu-8796). Producing a kernel there
+  needs the opt-in xcodes-install-15.4 path (Apple ID, +20-30 min). Decision
+  deferred; GitHub Actions remains primary.
+- 0156: kernel 43473383408 artifact verified locally (pracharger x9, prai2c2
+  x2, 'skipped (prai2c2=0)', PRA MSG x3, panic-flush strings; size
+  17,108,664 B) + the 0154 shim (boot_args Video filled). Packaged
+  research/pra-artifacts/pra-xnu-0156-charger-panicflush.img, 6,002,688 B,
+  SHA-256 abda888a3d741b7591393f4e4d4bd989a5b32a2670919a44de40797955b1810d;
+  p27 write + readback match; battery 68%. Rebooted into it 19:20.
+- Expected 0156 screen: pe_init progress path with real geometry, IOKit
+  registrations, then 'PRA charger: i2c fdf0d000 skipped (prai2c2=0)' and a
+  host-0-only BQ25892 probe. ANY panic now lands complete in the ring
+  (0156/0157), so ring13 is authoritative even for pre-flush deaths.
