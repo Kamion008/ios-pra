@@ -1,0 +1,171 @@
+pra: put the panic backtrace on the screen, wait out the flush lock
+
+The 0158b boot finally reached the target panic, and the capture still
+lost: "PRA BT:" frames never appeared, ring15 has no backtrace, and the
+flush printed "lock stuck, skipping". Two independent causes, both
+fixed here.
+
+1. The backtrace only went into the RAM ring, and the ring only
+   survives if pra_log_panic_flush writes it to eMMC. That flush gave
+   up after ~1 ms (100 tries x 10000 spins) while the controller
+   stalls for seconds - the stats recorded 13.3 s in one write - so it
+   skipped exactly under the IO load where panics happen. The panic
+   text itself proves console output works on this path, so print the
+   frames with printf: pra_log_panic_backtrace now writes "PRA BT:"
+   lines to the screen, where a photo captures them regardless of the
+   eMMC. Direct pra_log_append drops away entirely.
+
+2. 0158 appended every _cnputs buffer to the ring *before* the
+   disableConsoleOutput check, while the per-character loop below
+   already appends via _cnputc - ring15 shows every console line
+   doubled and interleaved. The append now lives inside the
+   disableConsoleOutput branch: live console output reaches the ring
+   exactly once through _cnputc, replay text printed while the console
+   is disabled (the framebuffer-claim window) reaches it exactly once
+   through this branch. That is what makes the printf backtrace safe:
+   it hits the ring once either way.
+
+3. pra_log_panic_flush now waits up to 5 s, one delay(1000) per
+   try_lock, instead of ~1 ms of spinning - delay() is the busy-wait
+   interval from kern/clock.c, safe on the panic path. If the lock is
+   still held after 5 s it is stolen: zero the 64-bit state word
+   (opaque[1]; the bsd lck_mtx_t is opaque[2] and the arm64 MACH view
+   is tsid:type, grp, state, so index 1 is the state in both layouts),
+   which clears owner/ilocked/waiters while keeping the group pointer
+   valid, then try_lock again. A parked holder will never release, and
+   a live flusher has had far longer than a tick; the kernel halts
+   after this flush, so a racy disk copy is an acceptable price for
+   not skipping.
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -922,13 +922,16 @@ pra_log_pick_explicit_lba(void)
+ }
+ 
+ /*
+- * Dump the frame-pointer chain into the persistent ring. The 0156 panic
+- * died a second time before the diagnostics pass printed any backtrace,
+- * so the panic caller was unrecoverable. Called from zone_require_panic
+- * before panic() runs. Direct pra_log_append, not printf: the console
+- * can be inside its disableConsoleOutput window and the msgbuf replay
+- * bypasses the ring hook entirely. Frames are validated for alignment
+- * and monotonic growth so a corrupt chain cannot loop.
++ * Dump the frame-pointer chain. The 0156 panic died a second time before
++ * the diagnostics pass printed any backtrace, so the panic caller was
++ * unrecoverable. Called from zone_require_panic before panic() runs.
++ * printf, not direct pra_log_append: the panic text on screen proves the
++ * console works on this path, and since 0159 _cnputs only appends when
++ * disableConsoleOutput short-circuits the per-character loop, printf
++ * reaches the ring exactly once via _cnputc (or the disabled branch) and
++ * the screen - the screen copy is the capture that survives even when
++ * the eMMC flush loses. Frames are validated for alignment and monotonic
++ * growth so a corrupt chain cannot loop.
+  */
+ void
+ pra_log_panic_backtrace(void *fp_in)
+@@ -950,7 +953,7 @@ pra_log_panic_backtrace(void *fp_in)
+ 		if (n > (int)sizeof(buf)) {
+ 			n = (int)sizeof(buf);
+ 		}
+-		pra_log_append(buf, n);
++		printf("%s", buf);
+ 		fp = next;
+ 	}
+ }
+@@ -958,10 +961,10 @@ pra_log_panic_backtrace(void *fp_in)
+ /* The flusher thread dies with the boot, so a panic loses everything printed
+  * since its last 10 s tick - the pe_init.c:314 panic (0153) left no trace in
+  * the ring for exactly this reason. Called once from the panic path, after
+- * the paniclog is printed and with the other CPUs parked. Best effort: if the
+- * eMMC lock is held (the flusher was interrupted mid-write) skip; rewriting
+- * the whole used ring instead of tracking the flusher's local offset keeps
+- * this independent of wherever that thread got to. */
++ * the paniclog is printed. Rewriting the whole used ring instead of tracking
++ * the flusher's local offset keeps this independent of wherever that thread
++ * got to. The eMMC lock is waited for, then stolen (see below); a racy disk
++ * copy is acceptable, the screen backtrace is the guaranteed capture. */
+ void
+ pra_log_panic_flush(void)
+ {
+@@ -974,19 +977,37 @@ pra_log_panic_flush(void)
+ 	}
+ 	/*
+ 	 * A single try used to skip silently when the periodic flusher owned
+-	 * the lock mid-write; the eMMC stalls for seconds at a time, and
+-	 * this is the one flush that must not be skipped. Bound the wait
+-	 * and complain if the lock is truly stuck (a parked CPU holding it
+-	 * will never release).
++	 * the lock mid-write; the eMMC stalls for seconds at a time and this
++	 * is the one flush that must not be skipped. 0158's ~1 ms spin loop
++	 * (100 x 10000) lost exactly the boot it was built for, so wait up
++	 * to 5 s, one delay(1000) per try; delay() is the busy-wait interval
++	 * from kern/clock.c and is safe on the panic path.
++	 *
++	 * If the lock is still held after that, steal it: a parked CPU that
++	 * held the lock will never release, and a flusher stalled mid-write
++	 * on a live CPU has had 5 s - far longer than a normal tick. The bsd
++	 * view of lck_mtx_t is opaque ({uintptr_t opaque[2]}); the MACH view
++	 * is tsid:type, grp, then the 64-bit state word, so opaque[1] is the
++	 * state in either layout. Zeroing just that word clears owner,
++	 * ilocked and the wait queues while keeping the group pointer valid
++	 * for try_lock/unlock. We are panicking: a holder that ever wakes
++	 * will find the mutex moved under it, but the kernel halts after the
++	 * flush and the printf backtrace above is the capture that counts.
+ 	 */
+-	unsigned tries = 0;
++	unsigned ms = 0;
+ 	while (!lck_mtx_try_lock(&pra_emmc_lock)) {
+-		if (++tries > 100u) {
+-			printf("PRA LOG: panic flush: lock stuck, skipping\n");
+-			return;
+-		}
+-		for (volatile unsigned spin = 0; spin < 10000u; spin++) {
++		if (ms >= 5000u) {
++			printf("PRA LOG: panic flush: lock stuck, stealing\n");
++			((volatile uintptr_t *)(void *)&pra_emmc_lock)[1] = 0;
++			if (!lck_mtx_try_lock(&pra_emmc_lock)) {
++				printf("PRA LOG: panic flush: steal failed, "
++				    "skipping\n");
++				return;
++			}
++			break;
+ 		}
++		ms++;
++		delay(1000);
+ 	}
+ 	total = os_atomic_load(&pra_log_total, relaxed);
+ 	used = (total + 511u) & ~511ull;
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -321,19 +321,19 @@ _cnputs(char *c, int size, bool poll)
+ 	a5xelte_log_append(c, size);
+ #endif
+ 
++	if (disableConsoleOutput) {
+ #if defined(ARM64_BOARD_CONFIG_PRA)
+-	/*
+-	 * Output printed while disableConsoleOutput is set - the framebuffer
+-	 * claim window - never reaches _cnputc, and the msgbuf replay that
+-	 * redraws it goes straight to vcputc, so the persistent ring would
+-	 * lose exactly the text around a panic. Append before the early
+-	 * return; when the console is live the per-character hook in _cnputc
+-	 * keeps counting, so nothing is doubled.
+-	 */
+-	pra_log_append(c, size);
++		/*
++		 * Output printed while disableConsoleOutput is set - the
++		 * framebuffer claim window - never reaches _cnputc, and the
++		 * msgbuf replay that redraws it goes straight to vcputc, so
++		 * the persistent ring would lose exactly the text around a
++		 * panic. Append inside this branch, which returns before the
++		 * per-character loop: 0158 put it before the check and every
++		 * live console byte landed twice (once here, once in _cnputc).
++		 */
++		pra_log_append(c, size);
+ #endif
+-
+-	if (disableConsoleOutput) {
+ 		return;
+ 	}
+ 
