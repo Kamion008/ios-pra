@@ -793,3 +793,33 @@ family. This is separate from the current root-device boot blocker.
    boot that reviewed patch.
 5. Keep device serials and dumps out of git and retain the optional kexec
    route only as a faster iteration path.
+
+### The zone_require panic (0156-0159) was the 0153 Setup probe itself
+
+0159 (run 43616147183) put the backtrace on screen and in the ring:
+`pra_log_panic_backtrace` printf'd 9 `PRA BT:` frames, the panic flush
+waited out the 5 s bound, printed `lock stuck, stealing`, stole the
+eMMC mutex (zeroing the state word `opaque[1]`) and wrote ring16. The
+ doubling fix in `_cnputs` also landed: ring16 has no doubled lines.
+
+The frames (ring16, slide ~0, symtab resolves directly):
+
+    fleh_synchronous -> sleh_synchronous -> mach_syscall -> mach_msg2_trap
+    -> mach_msg_trap_send -> ipc_kmsg_send -> pra_msg_probe (0153)
+    -> get_bsdtask_info -> proc_require -> zone_id_require -> panic
+
+`addr 0x1a902fffff880` was the receiver task's `bsd_info`. `pra_msg_probe`
+read the destination port's receiver via `ip_get_receiver_ptr_noauth()`
+and only checked it against `IPC_SPACE_NULL`, but `ip_receiver` is a union
+with `ip_destination` and is an `ipc_space_t` only while
+`ip_in_a_space(port)`. Mid-churn the probe read a destination PORT as a
+space, took garbage at the `is_task` offset as a task, and
+`get_bsdtask_info`'s `proc_require` panicked in `zone_id_require`. Every
+`zone_require failed` panic since 0156 was this probe, not Apple code. The
+probe also ran before `ip_mq_lock(port)`, racing the union transition.
+
+0160 (commit `bd0e668`, run 43619486927) fixes it: the probe runs under
+`ip_mq_lock(port)`, extracts the receiver only when `ip_in_a_space(port)`,
+and `pra_task_comm` reads `task_get_proc_raw` (cannot panic) instead of
+`get_bsdtask_info`. Flashed as `pra-xnu-0160-probe-fix.img` (sha256
+`f74d10b5…2bfb396`), 2026-11-14 ~18:14.
