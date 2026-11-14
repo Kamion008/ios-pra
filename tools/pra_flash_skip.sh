@@ -26,6 +26,51 @@ SECTORS=$((BYTES / 512))
 WANT=$(sha256sum "$IMG" | cut -d' ' -f1)
 echo "image:   $IMG ($BYTES B, $SECTORS sectors, sha256 $WANT)"
 
+# ===========================================================================
+# !! HARD GATE: the image's cmdline must carry the critical PRA boot args.  !!
+# !! Boots without these failed on the phone, exactly, every time:          !!
+# !!   cpus=4              - cpus=1 hangs the SMP boot                      !!
+# !!   emmcmulti=0         - multi-block reads hit "card busy, skip read"   !!
+# !!                         -> root mount error (hi6250 Arasan controller) !!
+# !!   pralog=1 praloglba=794623 - no eMMC ring -> all boot evidence lost   !!
+# !!   wdt=-1              - watchdog reboots the panic off the screen      !!
+# !! This gate exists because agents keep "simplifying" the cmdline. To     !!
+# !! flash a deliberate experiment anyway: PRA_ALLOW_ANY_CMDLINE=1          !!
+# ===========================================================================
+if ! python3 - "$IMG" <<'EOF'
+import gzip, sys, zlib
+data = open(sys.argv[1], "rb").read()
+try:
+	dec = gzip.decompress(data[0x800:])
+except Exception:
+	dec = zlib.decompressobj().decompress(data[0x800:])
+i = dec.find(b"debug=0xc")
+cmd = dec[i:dec.find(b"\x00", i)] if i >= 0 else b""
+missing = [a.decode() for a in (
+	b"cpus=4", b"rd=sdhcroot0", b"emmcroot=userdata", b"emmcprobe=1",
+	b"emmcwrite=1", b"rootrw=1", b"emmcmulti=0", b"emmcstats=1",
+	b"pralog=1", b"praloglba=794623", b"wdt=-1", b"wdt_test=no_user_checkin",
+) if a not in cmd]
+print("cmdline in image (%d B): %s" % (len(cmd), cmd.decode(errors="replace")))
+if missing:
+	print("REFUSING TO FLASH: cmdline is MISSING critical args:", " ".join(missing))
+	print("  cpus=1 hangs; missing emmcmulti=0 -> card busy -> mount error;")
+	print("  missing pralog=1 -> no eMMC ring; missing wdt=-1 -> panic rebooted.")
+	print("  Re-package with tools/pra_package.sh (correct args are its default),")
+	print("  or set PRA_ALLOW_ANY_CMDLINE=1 to flash this experiment anyway.")
+	sys.exit(1)
+print("cmdline OK: all 12 critical args present")
+EOF
+then
+	if [ "${PRA_ALLOW_ANY_CMDLINE:-0}" != "1" ]; then
+		echo "=============================================================" >&2
+		echo "!!! CMDLINE GATE FAILED - see the REFUSING TO FLASH output !!!" >&2
+		echo "=============================================================" >&2
+		exit 1
+	fi
+	echo "PRA_ALLOW_ANY_CMDLINE=1 set - flashing despite cmdline mismatch"
+fi
+
 adb -s "$S" get-state >/dev/null 2>&1 || { echo "no adb device $S" >&2; exit 1; }
 
 # Do not boot XNU off a flat battery: the boot is an hour of full CPU.

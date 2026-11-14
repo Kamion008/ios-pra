@@ -2,6 +2,23 @@
 
 Updated 2026-11-12. This handoff is for continuing the Huawei PRA-LX1 / hi6250 bring-up in another model or session.
 
+## ⚠️⚠️⚠️ THE PRA BOOT COMMAND LINE — DO NOT SKIP, SHORTEN, OR "SIMPLIFY" ⚠️⚠️⚠️
+
+Every PRA kernel flash MUST use this EXACT cmdline (the proven string of every boot
+that reached the daemons). It is now the DEFAULT of `tools/pra_package.sh` (no CMDLINE
+env needed), and both `tools/pra_package.sh` and `tools/pra_flash_skip.sh` REFUSE an
+image missing any of the 12 critical args (flash-gate bypass for deliberate
+experiments only: `PRA_ALLOW_ANY_CMDLINE=1`). Failure modes, all REPRODUCED on the
+phone: `cpus=1` hangs the SMP boot; missing `emmcmulti=0` → "PRA eMMC: card busy,
+skip read" → root mount error; missing `pralog=1 praloglba=794623` → no eMMC ring →
+all boot evidence incl. panic backtraces lost; missing `wdt=-1` → watchdog reboots
+the panic off the screen. Full arg-by-arg list: `PRA-LX1_PROGRESS.md` (top block)
+and `AGENTS.md` (top block). Copy-paste verbatim:
+
+```
+debug=0xc serial=3 cpus=4 keepsyms=1 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1 emmcstats=1 emmcmulti=0 pralog=1 praloglba=794623 sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1
+```
+
 ## Objective and operating constraints
 
 - Boot the iOS 16.7.16 / iPhone X arm64 XNU build on a Huawei PRA-LX1 (Kirin 655 / hi6250), currently blocked around root-device discovery.
