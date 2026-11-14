@@ -1,0 +1,92 @@
+pra: the zone_require panic was the Setup probe reading a port as a space
+
+The 0159 boot finally captured the backtrace (ring16, and the panic
+flush stole the eMMC lock after its 5 s wait and wrote it): 9 frames,
+slide ~0, all resolving in the symtab:
+
+  fleh_synchronous -> sleh_synchronous -> mach_syscall -> mach_msg2_trap
+  -> mach_msg_trap_send -> ipc_kmsg_send -> pra_msg_probe (0153, inlined)
+  -> get_bsdtask_info -> proc_require -> zone_id_require -> panic
+
+addr 0x1a902fffff880 was the receiver task's bsd_info. The probe looked
+up the destination port's receiver with
+ip_get_receiver_ptr_noauth(port) and only checked the pointer against
+IPC_SPACE_NULL - but ip_receiver is a union with ip_destination and is
+an ipc_space_t only while ip_in_a_space(port). For a port mid-churn
+(exec storm, union holding a destination PORT) the probe read a port as
+a space, took garbage at the is_task offset as a task, and
+get_bsdtask_info's proc_require panicked in zone_id_require. Every
+zone_require panic since 0156 was this probe, not Apple code.
+
+The probe also ran before ip_mq_lock(port), so even a correct in-space
+check could race the union transition.
+
+- pra_msg_probe is now called under ip_mq_lock(port), and extracts the
+  receiver only when ip_in_a_space(port).
+- pra_task_comm reads task_get_proc_raw instead of get_bsdtask_info:
+  the raw accessor cannot panic, and NULL still means "kernel". A task
+  pinned by a locked space has bsd_info NULL or live, so the raw read
+  is safe for printing the name.
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -2895,7 +2895,18 @@ pra_task_comm(task_t task)
+ 	if (task == TASK_NULL) {
+ 		return "kernel";
+ 	}
+-	info = get_bsdtask_info(task);
++	/*
++	 * task_get_proc_raw, not get_bsdtask_info: the latter proc_requires the
++	 * pointer, and proc_require panics through zone_id_require on anything
++	 * that is not a live zone element. The 0159 boot proved the receiver of
++	 * a mid-send port can yield exactly that (panic caller chain: ipc_kmsg
++	 * send -> pra_msg_probe -> get_bsdtask_info -> proc_require -> panic,
++	 * addr 0x1a902fffff880). The probe only wants the name: read the raw
++	 * bsd_info and give up on NULL. A caller that guarantees the task is
++	 * alive (the port lock below) guarantees the raw pointer is either NULL
++	 * or a live proc, so no further validation is needed here.
++	 */
++	info = task_get_proc_raw(task);
+ 	if (info == NULL) {
+ 		return "kernel";
+ 	}
+@@ -2912,9 +2923,19 @@ pra_msg_probe(ipc_kmsg_t kmsg, ipc_port_t port)
+ 	const char *sname, *rname;
+ 	uint32_t i, free_slot = PRA_MSG_KEYS;
+ 
+-	space = (ipc_space_t)ip_get_receiver_ptr_noauth(port);
+-	if (space != IPC_SPACE_NULL) {
+-		receiver = space->is_task;
++	/*
++	 * ip_receiver is a union with ip_destination: it is an ipc_space_t only
++	 * while ip_in_a_space(port). 0159 checked the pointer against NULL
++	 * instead and read a destination PORT as a space mid-churn - the
++	 * is_task offset then holds garbage, and get_bsdtask_info panicked in
++	 * proc_require. The caller holds ip_mq_lock(port) (see ipc_kmsg_send),
++	 * so both the in-space bit and the receiver pointer are stable here.
++	 */
++	if (ip_in_a_space(port)) {
++		space = (ipc_space_t)ip_get_receiver_ptr_noauth(port);
++		if (space != IPC_SPACE_NULL) {
++			receiver = space->is_task;
++		}
+ 	}
+ 	sname = pra_task_comm(sender);
+ 	rname = pra_task_comm(receiver);
+@@ -3018,10 +3039,15 @@ ipc_kmsg_send(
+ 
+ 	port = hdr->msgh_remote_port;
+ 	assert(IP_VALID(port));
++	ip_mq_lock(port);
+ #if defined(ARM64_BOARD_CONFIG_PRA)
++	/*
++	 * Under the port lock: the probe reads ip_in_a_space/ip_receiver,
++	 * which transition exactly under ip_mq_lock. 0159 called it before
++	 * the lock and raced the space<->destination union mid-churn.
++	 */
+ 	pra_msg_probe(kmsg, port);
+ #endif
+-	ip_mq_lock(port);
+ 
+ 	/*
+ 	 * If the destination has been guarded with a reply context, and the
