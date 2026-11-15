@@ -237,6 +237,21 @@ def build():
     root.children.append(mkadt.node('pra-gpu-mem', [
         ('reg', mkadt.u64(0x31000000, 0x01a40000)),
     ]))
+    # Touch: Cypress TrueTouch Gen5 CYTT21403, HID-over-I2C at 7-bit address
+    # 0x1C on the hi6250 i2c2 DesignWare host (stock dmesg "chip_name:
+    # CYTT21403" + input path .../ffd73000.i2c/i2c-0/0-001c/). Root-level
+    # like pra-emmc: bsd/dev/pra_touch.c maps both windows itself with
+    # ml_io_map(), so the cells are absolute physical addresses, not /arm-io
+    # SoC-relative offsets. Two windows:
+    #   reg[0] = i2c2 host 0xFFD73000 0x1000 (hisi_6250_i2c.dtsi:20-33).
+    #   reg[1] = pl061 gpio28 bank 0xFFF1D000 0x1000, the touch IRQ line's
+    #     bank: Linux gpio 224 = gpio28.0 (dmesg "irq gpio is 224",
+    #     cy,irq_gpio = <&gpio28 0 0>, udp dtsi:479). The per-pin DAT slot
+    #     at bank + pin*4 is anchored on this phone by the fingerprint's
+    #     "fingerprint,irq_gpio = fff1d008" for gpio 225 = gpio28.1.
+    root.children.append(mkadt.node('pra-touch', [
+        ('reg', mkadt.u64(0xFFD73000, 0x1000, 0xFFF1D000, 0x1000)),
+    ]))
     return root
 
 

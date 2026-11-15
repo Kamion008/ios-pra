@@ -183,7 +183,16 @@ jobs:
           strings -a "$kernel" | grep -F 'Mali-T830 MP2' >/dev/null
           strings -a "$kernel" | grep -F 'PRAGPU: present: surface' >/dev/null
           strings -a "$kernel" | grep -F 'PRAGPU SELFTEST' >/dev/null
-          echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite, 0165 churn fix and 0171 GPU are linked.'
+          # 0172 touch guard: read-only CYTT21403 probe behind pratouch=1
+          # (i2c2 0xFFD73000, IRQ gpio224 = pl061 gpio28.0). ring24 had
+          # Setup blocked in MIL; with 0171 landed, Setup/lock-screen are
+          # the next wall and both need input - touch is next on the path
+          # to Hello. 'pratouch' asserts the IOFindBSDRoot wiring; the
+          # 'PRA touch:' strings are only in the driver itself.
+          strings -a "$kernel" | grep -F 'PRA touch:' >/dev/null
+          strings -a "$kernel" | grep -F 'PRA touch: HID desc' >/dev/null
+          strings -a "$kernel" | grep -F 'pratouch' >/dev/null
+          echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite, 0165 churn fix, 0171 GPU and 0172 touch probe are linked.'
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
         if: always()

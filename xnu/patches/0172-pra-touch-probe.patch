@@ -1,0 +1,893 @@
+pra: 0172 - touch probe: read-only CYTT21403 bring-up behind pratouch=1
+
+Rebased onto the landed 0171 GPU patch before landing: 0171 inserted
+bsd/dev/prague_gpu.c after pra_charger.c in bsd/conf/files and
+prague_gpu_probe() after pra_emmc_probe() in iokit/bsddev/IOKitBSDInit.cpp,
+which broke this draft's trailing context on both files (the touch
+call-site hunk still applied clean, at offset 1). Both hunks rebased
+minimally: the conf line still lands directly after pra_charger.c (the
+charger is the driver this probe shares the bus with), with prague_gpu.c
+now the first trailing context line; the extern still lands inside the
+ARM64_BOARD_CONFIG_PRA block, now after prague_gpu_probe(), with the
+hunk rewritten to the standard symmetric 3-line context (the draft's
+4-lead/3-trail shape trips GNU patch 2.8.1's --fuzz=0 matcher in this
+duplicated #endif/#if PRA region even with byte-identical context).
+Verified with GNU patch -p1 --fuzz=0 --dry-run on a freshly
+reconstructed CI tree
+(pristine xnu-8796.141.3 + the three dxb stage *.sh scripts + the full
+0001-0171 stack via git apply, 164/164 applied, zero skips; before/after
+transcripts in WORKLOG.md next to the draft).
+
+What it does (all behind pratouch=1, default OFF - a boot without the arg
+never maps a window and is byte-for-byte unaffected):
+
+- bsd/dev/pra_touch.c: NEW read-only probe driver.
+  - Maps /pra-touch ADT windows (reg[0] = i2c2 DesignWare host at
+    0xFFD73000, reg[1] = pl061 gpio28 bank at 0xFFF1D000) and validates
+    them against the dts values.
+  - Reads COMP_VERSION/COMP_TYPE once (charger pattern; this host is
+    proven live: COMP_VERSION=3132302a COMP_TYPE=44570140).
+  - Dumps the gpio28 DAT/DIR slot of the touch IRQ line (gpio224 =
+    gpio28.0, DAT at bank+0) and records the idle level.
+  - One HID-over-I2C descriptor read at reg 0x0001 (16-bit LE register
+    address, repeated-start read of 32 bytes) and prints the parsed
+    identification (bcd, input/output/command/data registers, vid/pid/
+    ver) exactly once. Known plan discrepancy: pra-touch-plan.md says
+    28-byte descriptor; mainline cyttsp5.c (the protocol source the plan
+    cites) reads and validates 32 bytes (struct + 4-byte reserved tail).
+    This driver reads 32 and prints hid_desc_len raw either way.
+  - Starts a 10 ms worker that polls the IRQ line, histograms both
+    levels, reads the touch input register when the line differs from
+    the probe-time idle level (polarity UNKNOWN, no assumption baked in)
+    plus a 1 Hz heartbeat, decodes TT5 touch reports (mainline bit
+    offsets: count = 5 bits @ bit16 from buffer+3 = bits[4:0] of byte[5];
+    records at [7+10*i]; id/x/y/p at bits 8/16/32/48), and prints at
+    most ONE line per 10 s with cumulative counters (reports/errs/
+    corrupt) and the last contact. Errors back off 1 s. Every poll is a
+    fixed-budget loop; no DMA, no interrupts, no gpio writes, no IC
+    writes (descriptor + input-register reads only).
+- bsd/conf/files + iokit/bsddev/IOKitBSDInit.cpp: registered exactly like
+  the charger (conf line after pra_charger.c; extern + boot-arg-gated
+  call after the emmcprobe block in the PRA IOFindBSDRoot section).
+
+Known hazard, documented in the driver header: the charger poll thread
+reconfigures the SAME i2c2 controller every 10 s with no arbitration;
+collisions corrupt one transaction on one side and both recover bounded.
+Acceptable for a default-off probe; the shared pra_i2c layer (plan sketch
+0162) is the first follow-up.
+
+Testing requires appending pratouch=1 to the proven cmdline (never
+shorten or reorder the 12 critical args) and the /pra-touch ADT node,
+which lands as the tools/mkadt_pra.py edit in the same repo commit (CI
+does not build tools/ - packaging regenerates adt-pra.bin).
+
+---
+ bsd/dev/pra_touch.c           | 775 (new)
+ bsd/conf/files                |   1
+ iokit/bsddev/IOKitBSDInit.cpp |  14
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 88f1d61..d2ce07f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/pra_sdhci.c			standard
+ bsd/dev/pra_charger.c			standard
++bsd/dev/pra_touch.c			standard
+ bsd/dev/prague_gpu.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+diff --git a/bsd/dev/pra_touch.c b/bsd/dev/pra_touch.c
+new file mode 100644
+index 0000000..daca88f
+--- /dev/null
++++ b/bsd/dev/pra_touch.c
+@@ -0,0 +1,775 @@
++/*
++ * PRA-LX1 (hi6250) Cypress TrueTouch Gen5 (CYTT21403) read-only touch probe.
++ *
++ * The touch IC is a Cypress TrueTouch Gen5, HID-over-I2C, at 7-bit address
++ * 0x1C on the hi6250 "i2c2" DesignWare host at 0xFFD73000 (stock kernel:
++ * "chip_name:CYTT21403", live/dmesg.txt:3894; runtime input path
++ * .../ffd73000.i2c/i2c-0/0-001c/..., live/dmesg.txt:4827). The IRQ line is
++ * Linux gpio 224 = pl061 bank gpio28 pin 0 at 0xFFF1D000 (stock dmesg "irq
++ * gpio is 224", live/dmesg.txt:3874; UDP dts cy,irq_gpio = <&gpio28 0 0>,
++ * hi6250_udp_default_config.dtsi:479; bank reg 0xfff1d000 0x1000,
++ * hisi_6250_gpio.dtsi:404-406). The reset gpio 145 (gpio18.1 @ 0xE8A1D000)
++ * is NOT driven by this driver: no reset, no output-register writes, no
++ * rail writes - the whole probe is MMIO reads plus two HID-over-I2C read
++ * transaction types (descriptor, input report).
++ *
++ * Everything is gated off by default: pra_touch_probe() is only called when
++ * the cmdline carries pratouch=1 (the IOFindBSDRoot block in
++ * iokit/bsddev/IOKitBSDInit.cpp mirrors the emmcprobe pattern), so a
++ * default boot never maps these windows and behaves byte-for-byte like the
++ * pre-patch kernel.
++ *
++ * Facts with sources; anything not proven stays an observable UNKNOWN:
++ *  - Controller identity: COMP_VERSION=3132302a COMP_TYPE=44570140 was read
++ *    from this exact host on our boots (PRA-LX1-noted.md:1609-1610). The
++ *    register map is the same DesignWare set pra_charger.c already drives
++ *    (pra_charger.c:64-77, from Linux v6.1 i2c-designware-core.h).
++ *  - Functional clock 128 MHz: dts clk_fll_src is a fixed 128 MHz clock
++ *    feeding clk_gate_i2c2 (hisi_6250_clock.dtsi:23-28,3024-3028; UDP node
++ *    clock-rate = <0 128000000>, hi6250_udp_default_config.dtsi:431; stock
++ *    dmesg "input_clock_khz value is 128000", live/dmesg.txt:902-903). The
++ *    stock dmesg ALSO prints "clock rate is 19200000" (dmesg.txt:897) -
++ *    that conflict is why the timing is computed for 128 MHz (slow if
++ *    wrong, never fast): 100 kHz from 128 MHz gives total=1280, hcnt=512,
++ *    lcnt=768. If the real clock were 19.2 MHz the bus would run ~15 kHz,
++ *    which the TT5 tolerates; the charger's 19.2 MHz math runs ~667 kHz,
++ *    the direction that breaks devices (pra-touch-plan.md 2.4).
++ *  - pl061 per-pin DAT slots: the fingerprint probe printed
++ *    "fingerprint,irq_gpio = fff1d008" for Linux gpio 225 = bank gpio28
++ *    pin 1 (live/dmesg.txt:1893-1895), i.e. the level register sits at
++ *    bank + pin*4 with the level in bit 0. Touch IRQ 224 is bank gpio28
++ *    pin 0 -> 0xFFF1D000 + 0x0. DIR at bank + 0x400 is read-only here
++ *    (standard pl061 layout; pra-touch-plan.md section 3).
++ *  - HID-over-I2C protocol: mainline Linux drivers/input/touchscreen/
++ *    cyttsp5.c (torvalds/linux master, fetched 2026-11-15): descriptor at
++ *    HID_DESC_REG 0x0001 (cyttsp5.c:42), input reports at HID_INPUT_REG
++ *    0x0003 (:43), report id at byte [2] of the input read (:706,712),
++ *    touch = report id 0x1 (:47,717), contact count = 5-bit field at bit
++ *    offset 16 counted from buffer+3, i.e. bits [4:0] of byte [5]
++ *    (:55,353,765-766 with fill_tch_abs:681-693 arithmetic), records at
++ *    [7 + 10*i] (:93-94,304,312): id 5 bits @ 8, x 16 @ 16, y 16 @ 32,
++ *    pressure 8 @ 48, major 8 @ 56, minor 8 @ 64 (:57-62,757-770). The
++ *    descriptor is 32 bytes and mainline rejects hid_desc_len != 32 or
++ *    bcd_version != 0x0100 (:176-193,672-676). NOTE: the plan
++ *    (pra-touch-plan.md rung 0/1) says "28-byte read"; 28 counts the
++ *    struct minus its 4-byte reserved tail. This driver reads 32 and
++ *    prints hid_desc_len raw, so the first boot shows which value the
++ *    silicon actually reports.
++ *  - Register addressing: the 16-bit little-endian register address is
++ *    written before each read, followed by a repeated-start read - the
++ *    form the stock Huawei cyttsp5 stack on this phone uses
++ *    (hid_desc_register=1, dmesg.txt:3876) and the HID-over-I2C spec form.
++ *    Mainline's single-byte-address read variant (cyttsp5.c:218-238 with
++ *    reg_bits=8) is the documented fallback if the first boot NACKs.
++ *  - IRQ polarity/idle level: UNKNOWN (pra-touch-plan.md section 3). The
++ *    worker histograms both levels and reads when the line differs from
++ *    the level sampled at probe, so no polarity assumption is baked in.
++ *
++ * Shared-bus hazard (documented, not solved in this draft): the charger
++ * driver (pra_charger.c) configures and reads the SAME controller at
++ * 0xFFD73000 every 10 s with no arbitration between its poll thread and
++ * this driver's worker. A collision corrupts one transaction on one side;
++ * both sides recover bounded (timeout -> re-setup on the next attempt).
++ * Acceptable for a default-off, read-only probe; the shared pra_i2c layer
++ * (pra-touch-plan.md sketch 0162) is the first follow-up before any real
++ * event plumbing.
++ *
++ * Rate limiting: at most one worker line per 10 s (with cumulative
++ * counters in it). Probe failures print exactly one line and leave the
++ * driver disabled for the boot (I2C off, only the read-only IRQ histogram
++ * continues). Every poll is a fixed-budget loop - no unbounded spin, no
++ * DMA, no interrupts, no gpio or controller writes beyond the standard
++ * DesignWare master configuration pra_charger.c already performs on this
++ * host.
++ */
++#if defined(ARM64_BOARD_CONFIG_PRA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++
++/*
++ * ADT: root-level node published by tools/mkadt_pra.py with absolute
++ * windows like /pra-emmc (reg[0] = i2c2 host, reg[1] = gpio28 bank).
++ */
++#define PRA_TOUCH_ADT_NODE      "/pra-touch"
++#define PRA_TOUCH_I2C_BASE      0xFFD73000ULL   /* hisi_6250_i2c.dtsi:21 */
++#define PRA_TOUCH_I2C_SIZE      0x1000u
++#define PRA_TOUCH_GPIO_BASE     0xFFF1D000ULL   /* hisi_6250_gpio.dtsi:406 */
++#define PRA_TOUCH_GPIO_SIZE     0x1000u
++
++/* Touch client: 7-bit address 0x1C (live/dmesg.txt:4827, UDP dtsi:446). */
++#define PRA_TOUCH_ADDR          0x1Cu
++
++/*
++ * pl061 bank layout (see header comment): level slot per pin at
++ * bank + pin*4 with the level in bit 0, direction word at bank + 0x400.
++ * Read-only here - this driver never drives the bank.
++ */
++#define PRA_TOUCH_IRQ_PIN       0u      /* gpio224 = bank gpio28 pin 0 */
++#define PRA_TOUCH_IRQ_DAT_OFF   (PRA_TOUCH_IRQ_PIN * 4u)
++#define PRA_TOUCH_IRQ_DIR_OFF   0x400u
++#define PRA_TOUCH_IRQ_BIT       0x1u
++
++/*
++ * DesignWare I2C (pra_charger.c:64-77; Linux v6.1 i2c-designware-core.h).
++ * Every offset here is exercised by the charger on this silicon except
++ * STATUS.RFNE, a standard read-only status bit (RX FIFO not empty) used
++ * because the RX threshold register is never written by anyone: RFNE is
++ * threshold-independent, RX_FULL (RAW_INTR_STAT bit 2, the charger's wait)
++ * is not, so the drain loop polls both.
++ */
++#define DW_IC_CON               0x00u
++#define DW_IC_TAR               0x04u
++#define DW_IC_DATA_CMD          0x10u
++#define DW_IC_SS_SCL_HCNT       0x14u
++#define DW_IC_SS_SCL_LCNT       0x18u
++#define DW_IC_RAW_INTR_STAT     0x34u
++#define DW_IC_CLR_TX_ABRT       0x54u   /* read-to-clear */
++#define DW_IC_CLR_STOP_DET      0x60u   /* read-to-clear */
++#define DW_IC_ENABLE            0x6Cu
++#define DW_IC_STATUS            0x70u
++#define DW_IC_TXFLR             0x74u
++#define DW_IC_ENABLE_STATUS     0x9Cu
++#define DW_IC_COMP_VERSION      0xF8u
++#define DW_IC_COMP_TYPE         0xFCu
++
++#define DW_IC_CON_MASTER        0x01u
++#define DW_IC_CON_SPEED_STD     0x02u   /* SPEED = standard (100 kHz) */
++#define DW_IC_CON_RESTART_EN    0x20u   /* repeated start on wr->rd switch */
++#define DW_IC_CON_SLAVE_DIS     0x40u
++#define DW_IC_CMD_READ          0x100u  /* DATA_CMD bit 8 */
++#define DW_IC_CMD_STOP          0x200u  /* DATA_CMD bit 9, last byte only */
++#define DW_IC_INTR_RX_FULL      (1u << 2)
++#define DW_IC_INTR_TX_ABRT      (1u << 6)
++#define DW_IC_INTR_STOP_DET     (1u << 9)
++#define DW_IC_STATUS_BUSY       0x21u   /* ACTIVITY | MASTER_ACTIVITY */
++#define DW_IC_STATUS_RFNE       0x08u   /* RX FIFO not empty */
++#define DW_IC_EN_STATUS_IC_EN   (1u << 0)
++#define DW_IC_TXFLR_PUSH        60u     /* push below this level; depth is 64
++                                         * (stock dmesg "tx_fifo_depth: 64,
++                                         * rx_fifo_depth: 64", dmesg.txt:901) */
++
++/* 100 kHz from the 128 MHz functional clock, 40% high duty like
++ * pra_charger.c:230-242; both counts fit the 16-bit SS registers. */
++#define PRA_TOUCH_CLK           128000000u
++#define PRA_TOUCH_SCL           100000u
++
++/* Bounded waits. Same per-wait budget as pra_charger.c:130 for setup and
++ * completion waits. The per-BYTE drain budget is smaller (2000 polls, a
++ * few ms) so one failed multi-byte transaction stays well under 100 ms
++ * instead of paying the full 20 ms budget 32 times. */
++#define PRA_I2C_POLLS           20000u
++#define PRA_I2C_BYTE_POLLS      2000u
++
++/* HID-over-I2C (mainline cyttsp5.c:42-96,176-193,681-693). */
++#define HID_DESC_REG            0x0001u
++#define HID_DESC_SIZE           32u     /* sizeof(struct cyttsp5_hid_desc) */
++#define HID_VERSION_BCD         0x0100u
++#define HID_TOUCH_REPORT_ID     0x01u   /* button reports (0x3) are dropped */
++#define HID_COUNT_OFS          16u      /* bit offset from buffer+3 */
++#define HID_COUNT_SIZE          5u
++#define REC_ID_OFS              8u      /* bit offsets within a 10-byte record */
++#define REC_X_OFS               16u
++#define REC_Y_OFS               32u
++#define REC_P_OFS               48u
++#define REC_MAJ_OFS             56u
++#define REC_MIN_OFS             64u
++#define REC_SIZE                10u     /* TOUCH_REPORT_SIZE */
++#define TOUCH_REC_BASE          7u      /* records start at buffer[7] */
++#define TOUCH_MIN_REPORT        8u      /* len+rid+header, zero contacts */
++
++/* Panel geometry gates (live/dmesg.txt:3900-3901: x_max 1080, y_max 1920;
++ * max_tch <= 10 expected per the plan; slots_max 32 is the Android input
++ * slot count, not the report contact count). */
++#define PANEL_X_MAX             1080u
++#define PANEL_Y_MAX             1920u
++#define MAX_CONTACTS            10u
++
++/* Report read cap. The vendor node reads at most 100 bytes per transfer
++ * (cy,i2c_read_length, hi6250_udp_default_config.dtsi:449); a full
++ * 10-contact TT5 touch report is 107 bytes. Oversize reports are counted
++ * and skipped, never drained blind. */
++#define PRA_TOUCH_MAX_REPORT    128u
++
++/* Worker cadence and rate limit. */
++#define PRA_TOUCH_TICK_MS       10u
++#define PRA_TOUCH_PRINT_S       10u
++
++static bool _Atomic pra_touch_started;  /* probe ran at most once */
++static bool pra_touch_dbg;              /* pratouchdbg=1 */
++static vm_offset_t pra_i2c_regs;        /* 0xFFD73000 window */
++static vm_offset_t pra_gpio_regs;       /* 0xFFF1D000 window */
++static uint8_t pra_tar;                 /* configured TAR, 0 = needs setup */
++static bool pra_live;                   /* descriptor parsed, reads allowed */
++static uint16_t input_reg;              /* HID input register from descriptor */
++static uint16_t report_cap;             /* max bytes one report read may pull */
++static int idle_level = -1;             /* IRQ level sampled at probe */
++static char pra_touch_chan;
++
++/* Worker-thread-only counters (no lock: the probe is a cmpxchg one-shot
++ * that finishes before the worker starts, and the worker is the only
++ * writer afterwards). */
++static uint32_t irq_lo, irq_hi;         /* line-level histogram */
++static uint32_t evt_total;              /* valid touch reports seen */
++static uint32_t err_total;              /* failed read attempts */
++static uint32_t corrupt_total;          /* reports with impossible fields */
++static bool have_contact;
++static int last_contact_slot = -1, last_contact_x = -1;
++static int last_contact_y = -1, last_contact_p = -1;
++
++static inline uint32_t
++pra_touch_rd32(vm_offset_t regs, uint32_t off)
++{
++	return *(volatile uint32_t *)(regs + off);
++}
++
++static inline void
++pra_touch_wr32(vm_offset_t regs, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(regs + off) = value;
++}
++
++static uint32_t
++pra_touch_le16(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++/* IC_EN in ENABLE_STATUS follows ENABLE a few clocks later
++ * (pra_charger.c:194-205 pattern). */
++static int
++pra_i2c_wait_enable(bool want)
++{
++	for (unsigned i = 0; i < PRA_I2C_POLLS; i++) {
++		bool have = (pra_touch_rd32(pra_i2c_regs, DW_IC_ENABLE_STATUS) &
++		    DW_IC_EN_STATUS_IC_EN) != 0;
++		if (have == want) {
++			return 0;
++		}
++	}
++	return ETIMEDOUT;
++}
++
++/* Bounded wait for an idle bus before (re)configuring or after a txn
++ * (pra_charger.c:208-216 pattern). */
++static void
++pra_i2c_wait_idle(void)
++{
++	for (unsigned i = 0; i < PRA_I2C_POLLS; i++) {
++		if (!(pra_touch_rd32(pra_i2c_regs, DW_IC_STATUS) &
++		    DW_IC_STATUS_BUSY)) {
++			break;
++		}
++	}
++}
++
++/* Take the controller from whatever the bootloader or the charger left to
++ * a known 100 kHz master pointed at the touch IC. Controller state only:
++ * the touch IC registers are never written (pra_charger.c:222-253
++ * pattern, retimed for the 128 MHz functional clock). */
++static int
++pra_i2c_setup(void)
++{
++	vm_offset_t r = pra_i2c_regs;
++	uint32_t total, hcnt;
++
++	pra_touch_wr32(r, DW_IC_ENABLE, 0);
++	if (pra_i2c_wait_enable(false)) {
++		return ETIMEDOUT;
++	}
++	(void)pra_touch_rd32(r, DW_IC_CLR_TX_ABRT);
++	(void)pra_touch_rd32(r, DW_IC_CLR_STOP_DET);
++	total = PRA_TOUCH_CLK / PRA_TOUCH_SCL;
++	if (total < 24) {
++		return EINVAL;
++	}
++	hcnt = total * 2 / 5;
++	pra_touch_wr32(r, DW_IC_SS_SCL_HCNT, hcnt);
++	pra_touch_wr32(r, DW_IC_SS_SCL_LCNT, total - hcnt);
++	pra_touch_wr32(r, DW_IC_CON, DW_IC_CON_MASTER | DW_IC_CON_SPEED_STD |
++	    DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DIS);
++	pra_touch_wr32(r, DW_IC_TAR, PRA_TOUCH_ADDR & 0x7Fu);
++	__asm__ volatile("dsb sy" : : : "memory");
++	pra_touch_wr32(r, DW_IC_ENABLE, 1);
++	if (pra_i2c_wait_enable(true)) {
++		return ETIMEDOUT;
++	}
++	pra_tar = PRA_TOUCH_ADDR;
++	return 0;
++}
++
++/*
++ * One PIO transaction: write wlen bytes, repeated start, read rlen bytes,
++ * STOP on the last. The DW DATA_CMD queue carries both directions; with
++ * IC_RESTART_EN the controller inserts the restart at the wr->rd switch.
++ * Generalizes pra_charger.c:253-296 (single-byte offset + read) to the
++ * multi-byte frames HID-over-I2C needs; every wait is a fixed-budget
++ * poll, and pushes are gated on TXFLR so a full FIFO can never wedge the
++ * CPU in a blocking DATA_CMD write.
++ */
++static int
++pra_i2c_xfer(const uint8_t *wr, unsigned wlen, uint8_t *rd, unsigned rlen)
++{
++	vm_offset_t r = pra_i2c_regs;
++	unsigned pushed = 0, got = 0;
++	int error = 0;
++
++	if (!pra_i2c_regs || pra_tar == 0) {
++		return ENXIO;
++	}
++	pra_i2c_wait_idle();
++	(void)pra_touch_rd32(r, DW_IC_CLR_TX_ABRT);
++	(void)pra_touch_rd32(r, DW_IC_CLR_STOP_DET);
++
++	while (error == 0 && pushed < wlen) {
++		bool room = false;
++		for (unsigned i = 0; i < PRA_I2C_POLLS; i++) {
++			if (pra_touch_rd32(r, DW_IC_RAW_INTR_STAT) &
++			    DW_IC_INTR_TX_ABRT) {
++				error = ENXIO;  /* address NACK: no chip */
++				break;
++			}
++			if (pra_touch_rd32(r, DW_IC_TXFLR) < DW_IC_TXFLR_PUSH) {
++				room = true;
++				break;
++			}
++		}
++		if (room) {
++			pra_touch_wr32(r, DW_IC_DATA_CMD, wr[pushed++]);
++		} else if (error == 0) {
++			error = ETIMEDOUT;
++		}
++	}
++
++	while (error == 0 && got < rlen) {
++		bool have = false;
++		for (unsigned i = 0; i < PRA_I2C_BYTE_POLLS; i++) {
++			uint32_t raw = pra_touch_rd32(r, DW_IC_RAW_INTR_STAT);
++			if (raw & DW_IC_INTR_TX_ABRT) {
++				error = ENXIO;
++				break;
++			}
++			if ((raw & DW_IC_INTR_RX_FULL) ||
++			    (pra_touch_rd32(r, DW_IC_STATUS) &
++			    DW_IC_STATUS_RFNE)) {
++				have = true;
++				break;
++			}
++		}
++		if (have) {
++			rd[got++] = (uint8_t)pra_touch_rd32(r, DW_IC_DATA_CMD);
++		} else if (error == 0) {
++			error = ETIMEDOUT;
++		}
++	}
++
++	if (error == 0) {
++		error = ETIMEDOUT;
++		for (unsigned i = 0; i < PRA_I2C_POLLS; i++) {
++			uint32_t raw = pra_touch_rd32(r, DW_IC_RAW_INTR_STAT);
++			if (raw & DW_IC_INTR_TX_ABRT) {
++				error = ENXIO;
++				break;
++			}
++			if (raw & DW_IC_INTR_STOP_DET) {
++				error = 0;
++				break;
++			}
++		}
++		if (error == 0) {
++			/* Let the controller release the bus. */
++			pra_i2c_wait_idle();
++		}
++	}
++
++	(void)pra_touch_rd32(r, DW_IC_CLR_TX_ABRT);
++	(void)pra_touch_rd32(r, DW_IC_CLR_STOP_DET);
++	if (error == ETIMEDOUT) {
++		/* Force reconfiguration before the next attempt
++		 * (pra_charger.c:292-296 sentinel pattern). */
++		pra_tar = 0;
++	}
++	return error;
++}
++
++/* HID descriptor: write the 16-bit LE register address 0x0001, repeated
++ * start, read 32 bytes (see header comment for the addressing source). */
++static int
++pra_touch_desc_read(uint8_t *desc)
++{
++	uint8_t reg[2] = {
++		(uint8_t)(HID_DESC_REG & 0xffu),
++		(uint8_t)(HID_DESC_REG >> 8),
++	};
++
++	return pra_i2c_xfer(reg, 2, desc, HID_DESC_SIZE);
++}
++
++/*
++ * Input report read, mainline cyttsp5_read semantics (cyttsp5.c:218-238):
++ * first a 2-byte length read from the input register; 0 or 2 means
++ * nothing pending. Otherwise re-read the register for the whole report -
++ * the second read includes the 2 length bytes (mainline re-parses them at
++ * :706 after the full read). Oversize reports are refused, never drained
++ * blind.
++ */
++static int
++pra_touch_input_read(uint8_t *buf, unsigned *lenp)
++{
++	uint8_t reg[2] = {
++		(uint8_t)(input_reg & 0xffu),
++		(uint8_t)(input_reg >> 8),
++	};
++	uint8_t lenb[2];
++	uint32_t size;
++	int error;
++
++	error = pra_i2c_xfer(reg, 2, lenb, 2);
++	if (error) {
++		return error;
++	}
++	size = pra_touch_le16(lenb);
++	if (size == 0 || size == 2) {
++		*lenp = 0;              /* nothing pending */
++		return 0;
++	}
++	if (size < TOUCH_MIN_REPORT || size > report_cap) {
++		return EIO;             /* counted, skipped */
++	}
++	error = pra_i2c_xfer(reg, 2, buf, size);
++	if (!error) {
++		*lenp = (unsigned)size;
++	}
++	return error;
++}
++
++/* Bit-field extraction with mainline cyttsp5_get_touch_axis semantics
++ * (cyttsp5.c:265-274): little-endian bit run, no sign, caller gates. */
++static uint32_t
++pra_touch_bitfield(const uint8_t *p, uint32_t ofs, uint32_t width)
++{
++	uint32_t v = 0;
++
++	for (uint32_t b = 0; b < width; b++) {
++		uint32_t bit = ofs + b;
++
++		v |= (uint32_t)((p[bit >> 3] >> (bit & 7u)) & 1u) << b;
++	}
++	return v;
++}
++
++/*
++ * Parse one touch report (buffer as returned by pra_touch_input_read).
++ * Returns the contact count (0 for a valid release frame), or 0 with
++ * corrupt set when a field is impossible. Buttons (report id 0x3) are
++ * dropped silently (no button node on prague, live/dmesg.txt:4817).
++ * Layout per the header comment: count = 5 bits at bit 16 from buffer+3
++ * (bits [4:0] of byte [5]), records at [7 + 10*i].
++ */
++static unsigned
++pra_touch_parse(const uint8_t *buf, unsigned len, bool *corrupt,
++    unsigned *slot, unsigned *x, unsigned *y, unsigned *p)
++{
++	unsigned count, n = 0;
++
++	*corrupt = false;
++	if (len < TOUCH_MIN_REPORT) {
++		return 0;
++	}
++	if (buf[2] != HID_TOUCH_REPORT_ID) {
++		return 0;               /* not a touch report */
++	}
++	count = pra_touch_bitfield(buf + 3, HID_COUNT_OFS, HID_COUNT_SIZE);
++	if (count > MAX_CONTACTS) {
++		*corrupt = true;
++		return 0;
++	}
++	for (unsigned i = 0; i < count; i++) {
++		const uint8_t *rec = buf + TOUCH_REC_BASE + i * REC_SIZE;
++		unsigned id, rx, ry, rp;
++
++		if (TOUCH_REC_BASE + (i + 1) * REC_SIZE > len) {
++			*corrupt = true;
++			break;
++		}
++		id = pra_touch_bitfield(rec, REC_ID_OFS, 5);
++		rx = pra_touch_bitfield(rec, REC_X_OFS, 16);
++		ry = pra_touch_bitfield(rec, REC_Y_OFS, 16);
++		rp = pra_touch_bitfield(rec, REC_P_OFS, 8);
++		if (id >= MAX_CONTACTS || rx >= PANEL_X_MAX ||
++		    ry >= PANEL_Y_MAX) {
++			*corrupt = true;
++			break;
++		}
++		*slot = id;
++		*x = rx;
++		*y = ry;
++		*p = rp;
++		n = i + 1;
++	}
++	return n;
++}
++
++static void
++pra_touch_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	unsigned tick = (unsigned)hz / 100u;
++	uint64_t loops_per_1s, loops_per_10s, loops = 0, last_print = 0;
++	uint64_t last_heartbeat = 0;
++	uint32_t evt_mark, err_mark, corrupt_mark, printed = 0;
++	unsigned backoff = 0;
++
++	if (tick < 1) {
++		tick = 1;
++	}
++	loops_per_1s = (uint64_t)hz / tick;
++	if (loops_per_1s == 0) {
++		loops_per_1s = 1;
++	}
++	loops_per_10s = loops_per_1s * PRA_TOUCH_PRINT_S;
++	evt_mark = err_mark = corrupt_mark = 0;
++
++	for (;;) {
++		uint32_t level;
++		bool do_read;
++
++		(void)tsleep(&pra_touch_chan, PZERO, "pratch", tick);
++		loops++;
++		if (!pra_gpio_regs) {
++			continue;
++		}
++		level = pra_touch_rd32(pra_gpio_regs, PRA_TOUCH_IRQ_DAT_OFF) &
++		    PRA_TOUCH_IRQ_BIT;
++		if (level) {
++			irq_hi++;
++		} else {
++			irq_lo++;
++		}
++
++		/*
++		 * Reads happen when the line differs from the level sampled
++		 * at probe (polarity UNKNOWN - both levels are histogrammed
++		 * so the boot log fixes it), plus a 1 Hz heartbeat so a dead
++		 * or muxed-away IRQ line cannot wedge the driver silently
++		 * (pra-touch-plan.md rung 3). Every error backs reads off
++		 * for 1 s, so a stuck line with a dead bus costs at most a
++		 * handful of bounded transactions per second.
++		 */
++		do_read = false;
++		if (pra_live && input_reg != 0) {
++			if ((uint32_t)idle_level != level) {
++				do_read = true;
++			} else if (loops - last_heartbeat >= loops_per_1s) {
++				do_read = true;
++				last_heartbeat = loops;
++			}
++		}
++		if (do_read && backoff == 0) {
++			uint8_t buf[PRA_TOUCH_MAX_REPORT];
++			unsigned len = 0, slot = 0, x = 0, y = 0, p = 0;
++			bool corrupt;
++			int error = pra_touch_input_read(buf, &len);
++
++			if (error) {
++				err_total++;
++				backoff = (unsigned)loops_per_1s;
++			} else if (len) {
++				unsigned n = pra_touch_parse(buf, len,
++				    &corrupt, &slot, &x, &y, &p);
++
++				if (corrupt) {
++					corrupt_total++;
++				} else {
++					evt_total++;
++					if (n) {
++						/* last record wins */
++						last_contact_slot = (int)slot;
++						last_contact_x = (int)x;
++						last_contact_y = (int)y;
++						last_contact_p = (int)p;
++						have_contact = true;
++					} else {
++						/* zero contacts = release */
++						have_contact = false;
++					}
++				}
++			}
++		}
++		if (backoff) {
++			backoff--;
++		}
++
++		/*
++		 * At most one line per 10 s, and only when something moved
++		 * (or for the first two lines, so a silent boot still
++		 * publishes the level histogram once).
++		 */
++		if (loops - last_print >= loops_per_10s &&
++		    ((evt_total != evt_mark) || (err_total != err_mark) ||
++		    (corrupt_total != corrupt_mark) || printed < 2)) {
++			printf("PRA touch: irq lo/hi=%u/%u idle=%d reports=%u "
++			    "errs=%u corrupt=%u last: slot=%d x=%d y=%d p=%d\n",
++			    irq_lo, irq_hi, idle_level, evt_total, err_total,
++			    corrupt_total,
++			    have_contact ? last_contact_slot : -1,
++			    have_contact ? last_contact_x : -1,
++			    have_contact ? last_contact_y : -1,
++			    have_contact ? last_contact_p : -1);
++			evt_mark = evt_total;
++			err_mark = err_total;
++			corrupt_mark = corrupt_total;
++			last_print = loops;
++			printed++;
++		}
++	}
++}
++
++/* One-shot entry point, called from the IOFindBSDRoot PRA block
++ * (iokit/bsddev/IOKitBSDInit.cpp) only when the cmdline has pratouch=1. */
++void
++pra_touch_probe(void)
++{
++	bool want = false;
++	uint32_t dbg = 0;
++
++	if (!os_atomic_cmpxchg(&pra_touch_started, want, true, relaxed)) {
++		return;
++	}
++	(void)PE_parse_boot_argn("pratouchdbg", &dbg, sizeof(dbg));
++	pra_touch_dbg = dbg == 1;
++
++	/*
++	 * 1. ADT windows (root-level, absolute, like /pra-emmc).
++	 */
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, PRA_TOUCH_ADT_NODE, &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) !=
++	    kSuccess || size < 4 * sizeof(uintptr_t)) {
++		printf("PRA touch: ADT node %s missing or reg window too "
++		    "small\n", PRA_TOUCH_ADT_NODE);
++		return;
++	}
++	uint64_t i2c_base = reg[0], i2c_size = reg[1];
++	uint64_t gpio_base = reg[2], gpio_size = reg[3];
++	if (i2c_base != PRA_TOUCH_I2C_BASE || gpio_base != PRA_TOUCH_GPIO_BASE) {
++		printf("PRA touch: unexpected ADT windows i2c=%llx gpio=%llx "
++		    "(want %llx/%llx)\n", i2c_base, gpio_base,
++		    PRA_TOUCH_I2C_BASE, PRA_TOUCH_GPIO_BASE);
++		return;
++	}
++	pra_i2c_regs = ml_io_map((vm_offset_t)i2c_base, (vm_size_t)i2c_size);
++	pra_gpio_regs = ml_io_map((vm_offset_t)gpio_base,
++	    (vm_size_t)gpio_size);
++	if (!pra_i2c_regs || !pra_gpio_regs) {
++		printf("PRA touch: MMIO map failed\n");
++		return;
++	}
++
++	/*
++	 * 2. Controller identity, charger pattern (pra_charger.c:369-384).
++	 */
++	uint32_t ver = pra_touch_rd32(pra_i2c_regs, DW_IC_COMP_VERSION);
++	uint32_t type = pra_touch_rd32(pra_i2c_regs, DW_IC_COMP_TYPE);
++	printf("PRA touch: i2c ffd73000 COMP_VERSION=%08x COMP_TYPE=%08x\n",
++	    ver, type);
++	if (ver == 0 || ver == 0xFFFFFFFFu || type == 0 ||
++	    type == 0xFFFFFFFFu) {
++		printf("PRA touch: i2c ffd73000 not responding, skip\n");
++		return;
++	}
++
++	/*
++	 * 3. IRQ line: dump the bank slot read-only and record the idle
++	 * level (polarity itself stays UNKNOWN until the histogram lands).
++	 */
++	uint32_t dat = pra_touch_rd32(pra_gpio_regs, PRA_TOUCH_IRQ_DAT_OFF);
++	uint32_t dir = pra_touch_rd32(pra_gpio_regs, PRA_TOUCH_IRQ_DIR_OFF);
++	idle_level = (int)(dat & PRA_TOUCH_IRQ_BIT);
++	printf("PRA touch: irq gpio28.0 dat=%x dir=%x idle=%d\n", dat, dir,
++	    idle_level);
++
++	/*
++	 * 4. Touch IC identification: one descriptor read, printed once.
++	 */
++	uint8_t desc[HID_DESC_SIZE];
++	int error = pra_touch_desc_read(desc);
++	if (error) {
++		printf("PRA touch: HID desc read failed err=%d "
++		    "(%s); irq polling continues\n", error,
++		    error == ENXIO ? "address NACK" : "bus timeout");
++	} else {
++		uint32_t dlen = pra_touch_le16(desc + 0);
++		uint32_t bcd = pra_touch_le16(desc + 4);
++		printf("PRA touch: HID desc len=%u bcd=%#x rid=%#x in=%#x "
++		    "out=%#x cmd=%#x data=%#x vid=%#x pid=%#x ver=%#x "
++		    "(err=0)\n", dlen, bcd, pra_touch_le16(desc + 8),
++		    pra_touch_le16(desc + 10), pra_touch_le16(desc + 14),
++		    pra_touch_le16(desc + 18), pra_touch_le16(desc + 20),
++		    pra_touch_le16(desc + 22), pra_touch_le16(desc + 24),
++		    pra_touch_le16(desc + 26));
++		if (pra_touch_dbg) {
++			printf("PRA touch: desc[0-15]=%02x %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
++			    "%02x\n", desc[0], desc[1], desc[2], desc[3],
++			    desc[4], desc[5], desc[6], desc[7], desc[8],
++			    desc[9], desc[10], desc[11], desc[12], desc[13],
++			    desc[14], desc[15]);
++			printf("PRA touch: desc[16-31]=%02x %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
++			    "%02x\n", desc[16], desc[17], desc[18], desc[19],
++			    desc[20], desc[21], desc[22], desc[23], desc[24],
++			    desc[25], desc[26], desc[27], desc[28], desc[29],
++			    desc[30], desc[31]);
++		}
++		if (dlen == HID_DESC_SIZE && bcd == HID_VERSION_BCD) {
++			uint32_t max_in = pra_touch_le16(desc + 12);
++
++			input_reg = (uint16_t)pra_touch_le16(desc + 10);
++			report_cap = PRA_TOUCH_MAX_REPORT;
++			if (max_in >= TOUCH_MIN_REPORT && max_in < report_cap) {
++				report_cap = (uint16_t)max_in;
++			}
++			if (input_reg == 0) {
++				printf("PRA touch: descriptor input register "
++				    "is 0, touch reads disabled\n");
++			} else {
++				pra_live = true;
++				printf("PRA touch: app mode confirmed, input "
++				    "reg %#x max_input=%u\n", input_reg,
++				    max_in);
++			}
++		} else {
++			printf("PRA touch: descriptor invalid (len=%u "
++			    "bcd=%#x), touch reads disabled\n", dlen, bcd);
++		}
++	}
++
++	/*
++	 * 5. Worker: 10 ms cadence. With pra_live it reads touch data;
++	 * without it the worker only histograms the IRQ line (read-only).
++	 */
++	thread_t thread;
++	if (kernel_thread_start(pra_touch_thread, NULL, &thread) ==
++	    KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("PRA touch: probe done, %u ms poll worker started\n",
++		    PRA_TOUCH_TICK_MS);
++	} else {
++		printf("PRA touch: poll worker unavailable\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_PRA */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index cf289dc..c7f7a03 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -75,6 +75,7 @@ extern void a5xelte_touch_probe(void);
+ #if defined(ARM64_BOARD_CONFIG_PRA)
+ extern void pra_emmc_probe(void);
+ extern void prague_gpu_probe(void);
++extern void pra_touch_probe(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -787,6 +788,19 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 			pra_emmc_probe();
+ 		}
+ 	}
++	//
++	//	PRA touch (bsd/dev/pra_touch.c): read-only CYTT21403 probe on
++	//	the i2c2 host plus a polled IRQ-line worker, opt-in exactly like
++	//	emmcprobe above. Without pratouch=1 the driver never maps a
++	//	window and the boot is unchanged.
++	//
++	{
++		uint32_t pratouch = 0;
++		PE_parse_boot_argn("pratouch", &pratouch, sizeof(pratouch));
++		if (pratouch == 1) {
++			pra_touch_probe();
++		}
++	}
+ 	if (strcmp(rdBootVar, "sdhcroot0") == 0) {
+ 		extern int pra_emmc_rootdev(dev_t *dev);
+ 		OSSafeReleaseNULL(matching);
