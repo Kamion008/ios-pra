@@ -1,0 +1,78 @@
+pra: 0165 - praexecskip also matches the vnode name; the churners die on every exec path
+
+ring22 (the 0164 boot, furthest ever: launchd spawning daemons, Setup
+exec'd, sampler ran, zero card-busy) measured praexecskip working on
+the namei path - locationd/WirelessRadioManagerd/CommCenter got 1-5
+execs, launchd gives up - but bluetoothd/fairplayd.H2/
+nanotimekitcompaniond churned 615/617/607 execs each, re-reading their
+Mach-Os over single-sector PIO in the middle of Setup's page-in. Their
+execs COMPLETE (the "exec %s" line prints from the allowed-spawn path),
+so the 0147 hook misses whatever name they arrive with.
+
+The hook now ALSO matches imgp->ip_vp->v_name (vnode_internal.h is
+already in kern_exec.c's include set; every exec has ip_vp since the
+image is read from it), so the skip fires regardless of which name
+source the spawn path carries. Blocks print one line per name (capped
+at 16, with the matched source: ndp or vp) - the next ring shows the
+mechanism, never a flood.
+
+migration + CommCenter from the donor's v12 ladder are already done
+and measured working (datamigrator: 0 execs; CommCenter: 1). With the
+churners blocked, Setup finally gets the IO and CPU the churn was
+stealing.
+
+---
+ bsd/kern/kern_exec.c | 3 hunks
+---
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 5af697b..ee9d620 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1166,9 +1166,10 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
+  * such daemons accounted for 630 execs and most of the 3 GiB read.
+  */
+ static int
+-pra_exec_skipped(const char *path)
++pra_exec_skipped(const char *path, const char *src)
+ {
+ 	static int logged;
++	static int logged_blocks;
+ 	char list[256];
+ 	const char *base = path;
+ 	char *item, *comma;
+@@ -1190,6 +1191,14 @@ pra_exec_skipped(const char *path)
+ 		comma = strchr(item, ',');
+ 		len = comma ? (size_t)(comma - item) : strlen(item);
+ 		if (len && strlen(base) == len && strncmp(base, item, len) == 0) {
++			/* 0165: ring22 measured launchd respawn-failing the same
++			 * daemons 600+ times per boot (bluetoothd, fairplayd.H2,
++			 * nanotimekitcompaniond), so each block decision is worth
++			 * a line - one per name, never a flood. */
++			if (logged_blocks < 16) {
++				logged_blocks++;
++				printf("praexecskip: blocked %s (%s)\n", base, src);
++			}
+ 			return 1;
+ 		}
+ 		if (!comma) {
+@@ -1223,8 +1232,18 @@ exec_mach_imgact(struct image_params *imgp)
+ 	char *                  userspace_coredump_name = NULL;
+ 
+ #if defined(ARM64_BOARD_CONFIG_PRA)
+-	if (imgp->ip_ndp != NULL &&
+-	    pra_exec_skipped(imgp->ip_ndp->ni_cnd.cn_nameptr)) {
++	/* 0165: ring22 measured the skip working for daemons exec'd on the
++	 * namei path (locationd, WirelessRadioManagerd, CommCenter: 1-5 execs,
++	 * launchd gives up) but bluetoothd/fairplayd.H2/nanotimekitcompaniond
++	 * churned ~600 execs each - their execs complete, so the hook misses
++	 * whatever name they arrive with. Match the vnode's component name
++	 * too: every exec has ip_vp (the image is read from it below), and
++	 * v_name is its last component (vnode_internal.h is already in the
++	 * include set). */
++	if ((imgp->ip_ndp != NULL &&
++	    pra_exec_skipped(imgp->ip_ndp->ni_cnd.cn_nameptr, "ndp")) ||
++	    (imgp->ip_vp != NULLVP && imgp->ip_vp->v_name != NULL &&
++	    pra_exec_skipped(imgp->ip_vp->v_name, "vp"))) {
+ 		error = EPERM;
+ 		goto bad;
+ 	}
