@@ -1,55 +1,49 @@
-pra: per-sector CMD17 back as the default; CMD23+CMD18 opt-in; floods made impossible
+pra: 0164 - consolidate 0148+0162+0163 into one patch generated against CI's actual tree
 
-0162 (auto CMD12) and 0162b (emmcmulti=2, explicit CMD12 stops) both
-flooded "card busy, skip read" and never mounted the root. Diagnostic
-verdict after two boots: the wedge is not in how the transfer is
-stopped - it is that CMD18 without CMD23 is an open-ended stream. The
-controller's BLOCK_COUNT register caps what the CONTROLLER accepts, the
-card does not know it, and this Arasan never delivered any stop, so the
-card streamed, held DAT, and every later command answered EBUSY until
-the next power cycle. EBUSY was exempt from the three-strike latch, so
-the skip loop never ended.
+The 0162/0162b floods were never the whole story. CI's kernel object
+proved the shipped driver was the PRE-0148 state: "CMD18 unavailable
+(%d)" (0142-era string), no stop_transfer (0x0cdb immediates: zero),
+no ladder. Root cause: patch 0148 has been silently skipped by CI
+since the day it landed ("error: patch failed:
+bsd/dev/pra_sdhci.c:395" in every run log, swallowed by build.sh's
+skip-on-fail guard), and 0162/0163 were authored against the
+0148-present lineage, so they failed too. The phone therefore ran
+0142's unfixed CMD18 (no CMD12 abort, no per-block buffer-ready clear)
+the moment 0162 dropped emmcmulti=0 from the cmdline - hence the
+"card busy, skip read" flood. The emmcmulti=2 "manual stop" diagnostic
+never existed in any shipped kernel; that experiment is void.
 
-Ring21 evidence: the pull came back byte-identical to ring20 - old GPT
-geometry (first=10715136), "CMD18 disabled by boot arg", zero card-busy
-lines. Both flood boots lost ALL log evidence because the pralog
-flusher writes through the same wedged strat path. After this patch no
-boot can flood, so the ring always survives.
+Every boot before 0162 was masked by emmcmulti=0 (per-sector CMD17 at
+runtime), which is why the skip stayed invisible for weeks.
 
-- Reads are per-sector CMD17 by default again, the exact IO path of
-  every healthy boot (0156..0161d with emmcmulti=0); no boot-arg needed.
-- emmcmulti=1 opts in to the CMD23 form: SET_BLOCK_COUNT tells the CARD
-  to stop after exactly N blocks (extcsd rev 8 => MMC 5.x, CMD23 since
-  eMMC 4.4); the auto-CMD12 bit stays clear and no stop is ever sent.
-  Ladder unchanged: 2 -> 8 -> 16 -> 32 -> 64 -> 128 sectors, printed.
-- emmcmulti=2 (manual stop) is removed: its diagnostic answer came back
-  "still wedges".
-- Any failed chunk now runs pra_emmc_recover() (CMD12 stop, CMD|DAT
-  soft reset, ready wait) and counts toward the latch regardless of the
-  error type - busy-after-a-chunk is the wedge signature, not
-  transience. Two consecutive failures latch multi off for the boot.
-- "card busy, skip read/write" prints are rate-limited to one line per
-  10 s with a running count (also in the stats line as "busy-skip
-  %llu"), so a future wedge cannot flood the screen or starve the
-  flusher even before the latch fires.
+0164 replaces 0148+0162+0163 (all removed) with ONE patch generated
+against the driver file CI actually builds (reconstructed
+deterministically from pristine xnu-8796.141.3 + the driver-lineage
+patches 0139,0140,0142,0144,0146,0149,0151,0156,0158,0159,0161 - the
+sequence CI's log shows applied). Verified: lineage + 0164 is
+byte-identical to the intended final driver (per-sector CMD17 default,
+CMD23+CMD18 opt-in via emmcmulti=1, recover-and-latch after any chunk
+failure, rate-limited busy prints). The workflow now asserts the eMMC
+markers (CMD23 lba=, busy-skip) so a silent skip can never happen
+again.
 
+Local-verification trap worth remembering: git 2.56 skip-detects
+already-applied patches (rc=0, "Skipped patch"), so local
+`git apply --check` can validate a patch CI will reject; and GNU patch
+treats the fabricated `index 0000000..1111111` lines as new-file
+markers. Verify with GNU patch --fuzz=0 on index-stripped diffs.
+
+---
+ bsd/dev/pra_sdhci.c | 446 (17 hunks, replaces 0148+0162+0163)
+---
 diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
-index 27445ec..376d57e 100644
+index d41ee5b..376d57e 100644
 --- a/bsd/dev/pra_sdhci.c
 +++ b/bsd/dev/pra_sdhci.c
-@@ -12,15 +12,27 @@
+@@ -12,6 +12,28 @@
   * partition defaults to "userdata" and can be changed with emmcroot=<name>.
   * Writes stay disabled unless emmcwrite=1 and the partition is "userdata".
   *
-- * Whole-sector reads go out as CMD18 multi-block chunks by default, with
-- * the chunk size grown on a printed ladder (2 -> 8 -> 16 -> 32 -> 64 -> 128
-- * sectors) so a wrong guess costs 1 KiB, never a boot. emmcmulti=0 forces
-- * the old per-sector path; emmcmulti=2 also disables the controller's auto
-- * CMD12 and stops each chunk with an explicit CMD12, which is the
-- * diagnostic mode for the wedge that forced emmcmulti=0 into the canonical
-- * cmdline before patch 0001 (a multi-block transfer aborted with a soft
-- * reset but no CMD12 left the card mid-stream, DAT asserted, and every
-- * later command answered "card busy" until the next power cycle).
 + * Reads are per-sector CMD17 by default - the only path every healthy boot
 + * has used. 0162 bet on CMD18 multi-block chunks (auto CMD12) and 0162b on
 + * explicit CMD12 stops; both wedged the card the same way. The mechanism is
@@ -71,10 +65,11 @@ index 27445ec..376d57e 100644
 + * card is extcsd rev 8), so there is no stop command to miss. Chunks grow
 + * on a printed ladder (2 -> 8 -> 16 -> 32 -> 64 -> 128 sectors) so a wrong
 + * guess costs 1 KiB, never the boot.
-  *
++ *
   * The UART is gated by EL3 and the framebuffer console wraps around, so the
   * last lines of a hung boot are lost. Boot-arg pralog=1 keeps console output
-@@ -99,6 +111,7 @@ extern void sweet_sample_start(void); /* bsd/dev/sweet_sample.c */
+  * in a 4 MiB ring and flushes it every 10 s to the tail of the unused
+@@ -89,6 +111,7 @@ extern void sweet_sample_start(void); /* bsd/dev/sweet_sample.c */
   * 15:8. Writing EXT_CSD[185] HS_TIMING = 1 selects high speed (52 MHz). The
   * eMMC form has no data phase, so only R1b is set. */
  #define CMD_R1B_SWITCH         0x061Bu /* CMD6, no data, R1b */
@@ -82,17 +77,40 @@ index 27445ec..376d57e 100644
  
  /* Host control (0x28) bus-width and speed bits. */
  #define HC_HIGH_SPEED          0x04u
-@@ -135,22 +148,18 @@ static dev_t pra_emmc_bdev;
+@@ -98,13 +121,19 @@ extern void sweet_sample_start(void); /* bsd/dev/sweet_sample.c */
+ #define TRANSFER_MULTI_READ    0x36u   /* count enable, read, multi, auto CMD12 */
+ #define TRANSFER_SINGLE_WRITE  0x02u   /* block count enable, write, single */
+ 
+-/* Largest read issued as one CMD18. The 24 MiB/s the card sustains is not the
+- * limit here: every 512-byte CMD17 costs a full command setup plus a poll for
+- * CMD complete and one for buffer-ready, so an iOS page-in (4 KiB, eight
+- * sectors) paid that eight times. One CMD18 per 64 KiB turns that into one
+- * command per sixteen pages. 64 KiB of bounce buffer then covers a whole
+- * 16-page cluster read. */
+-#define PRA_MULTI_MAX          64u
++/* Largest read issued as one CMD18, and the last rung of the chunk ladder.
++ * Per-command overhead, not the bus, is the measured limit: healthy
++ * intervals in ring19/ring18 show ~137 us of command setup plus card access
++ * latency and ~42 us of port drain per 512-byte CMD17 ("wait 140 us buf 42
++ * us" at 2.7 MB/s), so the per-sector path tops out near 2.7 MB/s no matter
++ * what the bus does. One CMD18 pays the ~137 us once per chunk and streams
++ * the rest at the port-drain floor: 128 32-bit reads per 512 B at the
++ * measured ~328 ns/word caps PIO at ~12 MB/s. 128 sectors = 64 KiB, one
++ * 16-page cluster read per command. (The pre-0001 comment said 64 KiB with
++ * PRA_MULTI_MAX=64; 64 sectors is 32 KiB - the old arithmetic was wrong.) */
++#define PRA_MULTI_MAX          128u
++#define PRA_MULTI_RUNGS        6u
++static const uint32_t pra_emmc_multi_ladder[PRA_MULTI_RUNGS] = { 2, 8, 16, 32, 64, 128 };
+ 
+ /* Console log: 4 MiB ring plus one header sector at the start of p27. */
+ #define PRA_LOG_SIZE           (4u << 20)
+@@ -119,10 +148,18 @@ static dev_t pra_emmc_bdev;
  static bool pra_emmc_ready;
  static bool pra_emmc_reported;
  static bool pra_emmc_writable;
--/* Multi-block reads stay enabled unless the controller rejects them; the
+-/* Multi-block reads stay enabled unless the controller rejects one; the
 - * fallback is the old single-sector path, so a wrong guess costs one command
-- * and a warning, never a boot. Chunks start at the ladder's first rung (2
-- * sectors) and one rung is gained per successful chunk, each gain printed;
-- * a failed chunk resets the ladder, and only three consecutive non-busy
-- * failures latch the whole path off for the boot. A busy card is transient
-- * and must never count against the path. */
+- * and a warning, never a boot. */
 -static bool pra_emmc_multi_ok = true;
 +/* Multi-block reads default OFF: 0162 (auto CMD12) and 0162b (manual CMD12)
 + * both wedged the card into a permanent "card busy" and flooded every later
@@ -104,18 +122,12 @@ index 27445ec..376d57e 100644
 + * is a wedged stream, not transience, so EBUSY counts too. */
 +static bool pra_emmc_multi_ok;
 +static bool pra_emmc_multi_cmd23;
- static uint32_t pra_emmc_multi_rung;
- static uint32_t pra_emmc_multi_fail_run;
--/* emmcmulti=2: no auto CMD12; after the last block is drained the chunk is
-- * stopped with the same explicit CMD12 the error path uses, and transfer
-- * complete is awaited as in the single-block path. Diagnostic mode for the
-- * pre-0001 wedge: if auto CMD12 is what wedges this controller, this flag
-- * separates it from the multi-block transfer itself. */
--static bool pra_emmc_multi_manual_stop;
++static uint32_t pra_emmc_multi_rung;
++static uint32_t pra_emmc_multi_fail_run;
  static uint8_t pra_emmc_multi_buf[PRA_MULTI_MAX * 512u] __attribute__((aligned(64)));
  static bool pra_emmc_stats;
  static uint64_t pra_emmc_stat_bytes, pra_emmc_stat_cmds, pra_emmc_stat_ns;
-@@ -239,6 +248,28 @@ pra_emmc_wait_ready(void)
+@@ -211,6 +248,28 @@ pra_emmc_wait_ready(void)
  	return -1;
  }
  
@@ -144,14 +156,39 @@ index 27445ec..376d57e 100644
  /* The bootloader leaves the SD clock running. If it gated it at handoff,
   * re-enable the internal clock and then the SD clock, keeping the divider
   * and power settings it chose. */
-@@ -429,10 +460,25 @@ pra_emmc_stop_transfer(void)
- 	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
+@@ -376,19 +435,67 @@ pra_emmc_abort_data(void)
+ 	pra_emmc_ensure_clock();
  }
  
 -/* One CMD18 for up to PRA_MULTI_MAX sectors. The block count register drives
 - * how much the card sends; auto CMD12 stops the transfer, so there is no
 - * separate STOP command. The port still has to be drained one 512-byte block
-- * at a time, but the command/response overhead is paid once per chunk.
+- * at a time, but the command/response overhead is paid once per chunk. */
++/* Tell the card to stop, before resetting the controller. A soft reset alone
++ * leaves the card mid-stream: it keeps driving DAT, the present-state DAT
++ * inhibit bit stays set, and every later command fails with EBUSY until the
++ * next power cycle. CMD12 is the abort command (command type 0b11) with a
++ * short-busy response, which is what Linux's sdhci builds for a stop. */
++static void
++pra_emmc_stop_transfer(void)
++{
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	pra_emmc_wr32(SDHCI_ARGUMENT, 0);
++	pra_emmc_wr16(SDHCI_COMMAND, 0x0cdbu);   /* CMD12, abort, R1b */
++	for (unsigned i = 0; i < 200000; i++) {
++		uint32_t status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & (NORMAL_CMD_COMPLETE | SDHCI_ERROR_BITS)) {
++			break;
++		}
++	}
++	for (unsigned i = 0; i < 200000; i++) {
++		if (!(pra_emmc_rd32(SDHCI_PRESENT_STATE) & 0x2u)) {
++			break;
++		}
++	}
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++}
++
 +/* Full recovery after a failed CMD18 chunk; strat holds pra_emmc_lock. The
 + * 0162/0162b wedge signature is the card still mid-stream after the chunk
 + * (DAT held, every later command EBUSY until power cycle), so the order
@@ -171,11 +208,20 @@ index 27445ec..376d57e 100644
 + * 0162/0162b - the controller's BLOCK_COUNT caps only the controller side).
 + * The port still has to be drained one 512-byte block at a time, but the
 + * command/response overhead is paid once per chunk.
-  *
-  * Stats: wait_ticks covers command issue to FIRST block ready (the ~137 us
-  * the per-sector path pays once per 512 B, here paid once per chunk), and
-@@ -449,7 +495,7 @@ pra_emmc_read_multi(uint32_t lba, uint8_t *dst, uint32_t nblocks)
- 	uint64_t t_wait = pra_emmc_stats ? mach_absolute_time() : 0;
++ *
++ * Stats: wait_ticks covers command issue to FIRST block ready (the ~137 us
++ * the per-sector path pays once per 512 B, here paid once per chunk), and
++ * buf_ticks covers the whole port drain of the chunk; both are divided by
++ * sectors (rread_ops += nblocks) so the printed per-sector averages stay
++ * comparable with the CMD17 baseline. */
+ static int
+ pra_emmc_read_multi(uint32_t lba, uint8_t *dst, uint32_t nblocks)
+ {
+ 	struct pra_sdhci_saved s;
+ 	uint32_t status = 0;
+ 	int error = 0;
++	bool data_started = FALSE;
++	uint64_t t_wait = pra_emmc_stats ? mach_absolute_time() : 0;
  
  	if (pra_emmc_wait_ready()) {
 -		printf("PRA eMMC: card busy, skip read lba=%u\n", lba);
@@ -183,13 +229,11 @@ index 27445ec..376d57e 100644
  		return EBUSY;
  	}
  
-@@ -461,9 +507,45 @@ pra_emmc_read_multi(uint32_t lba, uint8_t *dst, uint32_t nblocks)
+@@ -400,7 +507,45 @@ pra_emmc_read_multi(uint32_t lba, uint8_t *dst, uint32_t nblocks)
  	pra_emmc_wr16(SDHCI_BLOCK_SIZE, 512);
  	pra_emmc_wr16(SDHCI_BLOCK_COUNT, (uint16_t)nblocks);
  	pra_emmc_wr32(SDHCI_ARGUMENT, lba);
--	pra_emmc_wr16(SDHCI_TRANSFER_MODE,
--	    pra_emmc_multi_manual_stop ?
--	    (TRANSFER_MULTI_READ & ~0x4u) : TRANSFER_MULTI_READ);
+-	pra_emmc_wr16(SDHCI_TRANSFER_MODE, TRANSFER_MULTI_READ);
 +	/* The auto CMD12 bit stays clear in CMD23 mode: the card ends the
 +	 * stream itself after the CMD23 block count, no stop is ever sent. */
 +	pra_emmc_wr16(SDHCI_TRANSFER_MODE, TRANSFER_MULTI_READ & ~0x4u);
@@ -232,22 +276,63 @@ index 27445ec..376d57e 100644
  	__asm__ volatile("dsb sy" : : : "memory");
  	pra_emmc_wr16(SDHCI_COMMAND, CMD_R1_MULTI_READ);
  
-@@ -537,14 +619,6 @@ pra_emmc_read_multi(uint32_t lba, uint8_t *dst, uint32_t nblocks)
+@@ -430,6 +575,7 @@ pra_emmc_read_multi(uint32_t lba, uint8_t *dst, uint32_t nblocks)
+ 		goto out;
+ 	}
+ 	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, NORMAL_CMD_COMPLETE);
++	data_started = TRUE;
+ 
+ 	for (uint32_t b = 0; b < nblocks; b++) {
+ 		uint32_t data[128];
+@@ -451,10 +597,26 @@ pra_emmc_read_multi(uint32_t lba, uint8_t *dst, uint32_t nblocks)
+ 			    lba, b, status);
+ 			goto out;
  		}
++		if (pra_emmc_stats && b == 0) {
++			uint64_t now = mach_absolute_time();
++			pra_emmc_stat_wait_ticks += now - t_wait;
++			t_wait = now;
++		}
+ 		for (unsigned i = 0; i < 128; i++) {
+ 			data[i] = pra_emmc_rd32(SDHCI_BUFFER);
+ 		}
+ 		memcpy(dst + (uint64_t)b * 512u, data, sizeof(data));
++		/* Buffer-read-ready is level triggered and must be cleared per
++		 * block; left set, the next iteration reads the port before the
++		 * controller has the next block, which desynchronises the PIO
++		 * stream. The single-sector path clears it for the same
++		 * reason. This per-block clear is what 0142 lacked and what
++		 * desynchronised the stream then. */
++		pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, NORMAL_BUFFER_READ_READY);
++		if (pra_emmc_stats) {
++			pra_emmc_stat_buf_ticks += mach_absolute_time() - t_wait;
++			t_wait = mach_absolute_time();
++		}
  	}
  
--	if (pra_emmc_multi_manual_stop) {
--		/* emmcmulti=2: the controller's auto CMD12 is not trusted.
--		 * Stop the transfer by hand (the same CMD12 the error path
--		 * uses), then wait for transfer complete as in the
--		 * single-block path below. */
--		pra_emmc_stop_transfer();
--	}
--
  	error = ETIMEDOUT;
- 	for (unsigned i = 0; i < 2000000; i++) {
- 		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
-@@ -638,12 +712,13 @@ pra_emmc_note_io(uint32_t bytes, uint32_t cmds, uint64_t start, bool is_read)
+@@ -473,10 +635,20 @@ pra_emmc_read_multi(uint32_t lba, uint8_t *dst, uint32_t nblocks)
+ 		printf("PRA eMMC: CMD18 lba=%u transfer status=%x\n", lba, status);
+ 		goto out;
+ 	}
++	if (pra_emmc_stats) {
++		/* Counted in sectors, not chunks, so wait/buf stay per-sector
++		 * averages in the report and stay comparable with the CMD17
++		 * baseline. Error paths skip this, which skews the averages
++		 * on a chunk that failed - acceptable, they are rare. */
++		pra_emmc_stat_rread_ops += nblocks;
++	}
+ 
+ out:
+ 	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
+ 	if (error) {
++		if (data_started) {
++			pra_emmc_stop_transfer();
++		}
+ 		pra_emmc_abort_data();
+ 	} else {
+ 		(void)pra_emmc_wait_ready();
+@@ -540,12 +712,13 @@ pra_emmc_note_io(uint32_t bytes, uint32_t cmds, uint64_t start, bool is_read)
  		printf("PRA eMMC: %llu KiB, %llu cmds, %llu KiB/s "
  		    "(r %llu KiB %llu cmds %llu KiB/s | w %llu KiB %llu cmds "
  		    "%llu KiB/s | >5ms %llu max %llu us | wait %llu us "
@@ -263,7 +348,7 @@ index 27445ec..376d57e 100644
  		pra_emmc_stat_bytes = 0;
  		pra_emmc_stat_cmds = 0;
  		pra_emmc_stat_ns = 0;
-@@ -658,6 +733,7 @@ pra_emmc_note_io(uint32_t bytes, uint32_t cmds, uint64_t start, bool is_read)
+@@ -560,6 +733,7 @@ pra_emmc_note_io(uint32_t bytes, uint32_t cmds, uint64_t start, bool is_read)
  		pra_emmc_stat_wait_ticks = 0;
  		pra_emmc_stat_buf_ticks = 0;
  		pra_emmc_stat_rread_ops = 0;
@@ -271,7 +356,7 @@ index 27445ec..376d57e 100644
  	}
  }
  
-@@ -669,7 +745,7 @@ pra_emmc_write_raw(uint32_t lba, const uint8_t *sector)
+@@ -571,7 +745,7 @@ pra_emmc_write_raw(uint32_t lba, const uint8_t *sector)
  	int error = 0;
  
  	if (pra_emmc_wait_ready()) {
@@ -280,24 +365,17 @@ index 27445ec..376d57e 100644
  		return EBUSY;
  	}
  
-@@ -1579,26 +1655,31 @@ pra_emmc_map_host(void)
+@@ -1481,13 +1655,32 @@ pra_emmc_map_host(void)
  		printf("PRA eMMC: unexpected SDHCI spec version %u\n", version & 0xffu);
  	}
  	pra_emmc_ensure_clock();
--	/* CMD18 is the default: ring19/ring18 measured ~137 us of fixed cost
--	 * per 512-byte CMD17 against a ~42 us port drain, so the per-sector
--	 * path tops out near 2.7 MB/s while a CMD18 chunk pays the fixed cost
--	 * once per chunk. The chunk ladder keeps the blast radius of a wrong
--	 * guess at 1 KiB, and three consecutive non-busy failures fall back
--	 * to per-sector reads for the boot, so it is worth its keep only
--	 * while it behaves - and says so, per chunk, when it does not.
--	 * emmcmulti=0 forces the per-sector path without a rebuild;
--	 * emmcmulti=2 additionally runs without the controller's auto CMD12. */
+-	/* CMD18 is worth its keep only while it behaves: a multi-block transfer
+-	 * that leaves the DAT line asserted blocks every later command with
+-	 * EBUSY. emmcmulti=0 forces the per-sector path without a rebuild. */
 -	int multi = 1;
--	if (PE_parse_boot_argn("emmcmulti", &multi, sizeof(multi)) && multi != 1) {
--		if (multi == 0) {
--			pra_emmc_multi_ok = false;
--			printf("PRA eMMC: CMD18 disabled by boot arg\n");
+-	if (PE_parse_boot_argn("emmcmulti", &multi, sizeof(multi)) && multi == 0) {
+-		pra_emmc_multi_ok = false;
+-		printf("PRA eMMC: CMD18 disabled by boot arg\n");
 +	/* 0162 (auto CMD12) and 0162b (manual CMD12) both proved that an
 +	 * open-ended CMD18 wedges this controller+card until power cycle, and
 +	 * the flood then hides all evidence by starving the log flusher. So
@@ -314,34 +392,24 @@ index 27445ec..376d57e 100644
 +			pra_emmc_multi_cmd23 = true;
 +			printf("PRA eMMC: CMD18+CMD23 multi-block enabled by "
 +			    "boot arg\n");
- 		} else if (multi == 2) {
--			pra_emmc_multi_manual_stop = true;
--			printf("PRA eMMC: CMD18 manual-stop mode by boot arg\n");
++		} else if (multi == 2) {
 +			printf("PRA eMMC: emmcmulti=2 manual-stop removed by "
 +			    "0163; per-sector reads\n");
 +		} else if (multi != 0) {
 +			printf("PRA eMMC: unknown emmcmulti=%d, per-sector "
 +			    "reads\n", multi);
- 		} else {
--			printf("PRA eMMC: unknown emmcmulti=%d, CMD18 stays on\n",
--			    multi);
++		} else {
 +			printf("PRA eMMC: CMD18 disabled by boot arg (default "
 +			    "is per-sector)\n");
- 		}
++		}
  	}
  	return 0;
-@@ -1674,14 +1755,14 @@ pra_emmc_strategy(buf_t bp)
+ }
+@@ -1562,10 +1755,18 @@ pra_emmc_strategy(buf_t bp)
  		uint32_t skip = pos & 511u;
  		uint32_t take = MIN(count - n, 512u - skip);
  		uint32_t lba = (uint32_t)(pra_emmc_first_lba + pos / 512u);
--		/* Whole sectors on a sector boundary go out as one CMD18, sized
--		 * by the ladder: 2 sectors first, one rung per success up to
--		 * PRA_MULTI_MAX, every gain printed. A failed chunk resets the
--		 * ladder and finishes this request on the per-sector path; a
--		 * busy card is transient and never counts, while three
--		 * consecutive non-busy failures latch the whole path off. The
--		 * first failure therefore costs one small command, not the
--		 * boot. */
+-		/* Whole sectors on a sector boundary go out as one CMD18. */
 +		/* Whole sectors on a sector boundary go out as one CMD23+CMD18,
 +		 * sized by the ladder: 2 sectors first, one rung per success up
 +		 * to PRA_MULTI_MAX, every gain printed. Only reached with
@@ -352,21 +420,32 @@ index 27445ec..376d57e 100644
 +		 * failure therefore costs one small command, not the boot. */
  		if (is_read && pra_emmc_multi_ok && skip == 0 &&
  		    count - n >= 1024u) {
- 			uint32_t sectors = MIN((count - n) / 512u,
-@@ -1704,16 +1785,22 @@ pra_emmc_strategy(buf_t bp)
- 				}
+-			uint32_t sectors = MIN((count - n) / 512u, PRA_MULTI_MAX);
++			uint32_t sectors = MIN((count - n) / 512u,
++			    pra_emmc_multi_ladder[pra_emmc_multi_rung]);
+ 			error = pra_emmc_read_multi(lba, pra_emmc_multi_buf,
+ 			    sectors);
+ 			if (!error) {
+@@ -1574,16 +1775,37 @@ pra_emmc_strategy(buf_t bp)
+ 				cmds++;
+ 				n += sectors * 512u;
+ 				buf_setresid(bp, count - n);
++				pra_emmc_multi_fail_run = 0;
++				if (pra_emmc_multi_rung < PRA_MULTI_RUNGS - 1) {
++					pra_emmc_multi_rung++;
++					printf("PRA eMMC: CMD18 ladder -> %u "
++					    "sectors\n",
++					    pra_emmc_multi_ladder[
++					    pra_emmc_multi_rung]);
++				}
  				continue;
  			}
+-			/* One failure of any other kind means the controller will
+-			 * not do this at all; keep booting on per-sector reads. A
+-			 * busy card is transient and must not disable the path. */
 -			if (error != EBUSY) {
--				pra_emmc_multi_fail_run++;
--				printf("PRA eMMC: CMD18 %u-sector chunk failed "
--				    "(%d); %u consecutive\n", sectors, error,
--				    pra_emmc_multi_fail_run);
--				if (pra_emmc_multi_fail_run >= 3) {
--					printf("PRA eMMC: CMD18 unavailable, "
--					    "falling back to 512-byte reads\n");
--					pra_emmc_multi_ok = false;
--				}
+-				printf("PRA eMMC: CMD18 unavailable (%d), "
+-				    "falling back to 512-byte reads\n", error);
 +			/* ANY failure counts, EBUSY included: a busy card right
 +			 * after a chunk is the 0162/0162b wedge signature (the
 +			 * card never stopped streaming), not transience. Recover
@@ -382,7 +461,24 @@ index 27445ec..376d57e 100644
 +			if (pra_emmc_multi_fail_run >= 2) {
 +				printf("PRA eMMC: CMD18 unavailable, falling "
 +				    "back to 512-byte reads\n");
-+				pra_emmc_multi_ok = false;
+ 				pra_emmc_multi_ok = false;
  			}
- 			if (pra_emmc_multi_rung != 0) {
- 				pra_emmc_multi_rung = 0;
++			if (pra_emmc_multi_rung != 0) {
++				pra_emmc_multi_rung = 0;
++				printf("PRA eMMC: CMD18 ladder -> 2 sectors\n");
++			}
+ 			error = 0;
+ 		}
+ 		if (is_read) {
+@@ -1646,7 +1868,10 @@ pra_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		*(uint32_t *)data = pra_emmc_writable ? 1 : 0;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTREAD:
+-		*(uint64_t *)data = 1;
++		/* Sized for the CMD18 chunk, not one sector: HFS uses this to
++		 * cluster its reads, and every sector beyond one command pays
++		 * the ~137 us per-command overhead again. */
++		*(uint64_t *)data = pra_emmc_multi_ok ? PRA_MULTI_MAX : 1;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTWRITE:
+ 		*(uint64_t *)data = pra_emmc_writable ? 1 : 0;

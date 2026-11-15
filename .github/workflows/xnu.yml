@@ -158,7 +158,16 @@ jobs:
           strings -a "$kernel" | grep 'prai2c2' >/dev/null
           xcrun llvm-nm -n "$kernel" | grep '_pra_log_panic_flush' >/dev/null
           strings -a "$kernel" | grep 'PRA MSG' >/dev/null
-          echo 'PRA charger, panic flush and Setup probe are linked.'
+          # 0164 guard: 0148/0162/0163 were silently skipped for weeks
+          # (context drift; the phone flooded "card busy" on 0142's unfixed
+          # CMD18) while CI stayed green. These strings exist only in the
+          # 0164-consolidated eMMC driver - if the patch stops applying,
+          # this fails LOUDLY instead of shipping a stale driver.
+          strings -a "$kernel" | grep 'CMD18+CMD23 multi-block enabled' >/dev/null
+          strings -a "$kernel" | grep 'CMD23 lba=' >/dev/null
+          strings -a "$kernel" | grep 'busy-skip' >/dev/null
+          strings -a "$kernel" | grep 'CMD18 ladder' >/dev/null
+          echo 'PRA charger, panic flush, Setup probe and 0164 eMMC driver are linked.'
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
         if: always()
