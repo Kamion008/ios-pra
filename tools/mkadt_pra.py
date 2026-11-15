@@ -207,6 +207,36 @@ def build():
     root.children.append(mkadt.node('pra-emmc', [
         ('reg', mkadt.u64(0xFF390000, 0x1000)),
     ]))
+    # The Mali-T830 MP2 (gpu-work drafts 0001-0007). reg from the vendor DT
+    # (hi6250-kernel .../hisi_6250_gpu.dtsi:6) and live iomem
+    # ("e8970000-e8973fff : cooling_device0"); interrupts are the DT's GIC
+    # SPIs JOB/MMU/GPU 258/259/260 (dtsi:7-8, level-high - the trigger
+    # polarity is not expressible here; the driver drafts poll IRQ_RAWSTAT
+    # and never wire the GIC). Nothing in XNU reads this node today: the
+    # drafts hardcode the PA (the pra-emmc convention). It exists so the
+    # resource map lives in the boot artifact and so a future IOKit driver
+    # can IONameMatch the compatible strings instead of the hardcoded PA.
+    root.children.append(mkadt.node('pra-gpu', [
+        ('compatible', mkadt.cstr('hisilicon,hi6250-mali') +
+                       mkadt.cstr('arm,mali-midgard')),
+        ('reg', mkadt.u64(0xE8970000, 0x4000)),
+        ('interrupt', mkadt.u32(258, 259, 260)),
+        ('interrupt-names', mkadt.cstr('JOB') + mkadt.cstr('MMU') +
+                            mkadt.cstr('GPU')),
+    ]))
+    # The GPU drafts' private DRAM arena candidate: the stock kernel's
+    # /reserved-memory/graphic carveout (0x31000000..0x32A40000, 26.6 MiB,
+    # PRA-LX1_PROGRESS.md:61-62). Evidence it is safe scratch: it is inside
+    # System RAM (live/iomem.txt:2), XNU's managed RAM starts at dram-base
+    # 0x88000000 (chosen, above) so nothing allocates from it, and the
+    # diagnostic shim flooded it blue without a crash (PRA-LX1_PROGRESS.md
+    # 262-263, 317-318; the panel scans the logo buffer 0x5D000000, not
+    # this carveout). The driver still takes pragpu_pa=<hex> by boot-arg;
+    # this node only records the map. Still owed: one on-device write +
+    # readback through the shim before the first pragpu=2 boot.
+    root.children.append(mkadt.node('pra-gpu-mem', [
+        ('reg', mkadt.u64(0x31000000, 0x01a40000)),
+    ]))
     return root
 
 

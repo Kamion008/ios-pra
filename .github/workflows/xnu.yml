@@ -177,7 +177,13 @@ jobs:
           strings -a "$kernel" | grep -F 'emmctest=1 probe chunks on' >/dev/null
           strings -a "$kernel" | grep -F '[+%3llu s]' >/dev/null
           strings -a "$kernel" | grep -F 'emmcdma=1 rejected' >/dev/null
-          echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite and 0165 churn fix are linked.'
+          # 0171 GPU guard: ring24 measured Setup's main thread living in
+          # MIL (Metal) - without this driver Metal never completes and
+          # Setup never renders Hello.
+          strings -a "$kernel" | grep -F 'Mali-T830 MP2' >/dev/null
+          strings -a "$kernel" | grep -F 'PRAGPU: present: surface' >/dev/null
+          strings -a "$kernel" | grep -F 'PRAGPU SELFTEST' >/dev/null
+          echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite, 0165 churn fix and 0171 GPU are linked.'
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
         if: always()

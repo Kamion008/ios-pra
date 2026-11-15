@@ -1,0 +1,2490 @@
+pra: 0171 GPU draft - the full Mali-T830 change (stages 1-9) as ONE patch
+
+Consolidates gpu-work drafts 0001-0007+0009 (0008 is the tools/mkadt_pra.py
+ADT patch and lands as a separate repo commit - NEVER into xnu/patches):
+probe (0001), WRITE_VALUE layout experiment (0002), fragment clear (0003),
+panfrost quirks (0004), GPU present + SweetFramebuffer hook (0005),
+PragueGPU user client + IOAcceleratorES stub (0006), wait-asleep (0007),
+recovery (0009). Generated with git diff against the CI-built tree, NOT
+chain-collapsed from the drafts.
+
+Why one patch, and why it was regenerated (the 0164 lesson, GPU edition):
+the drafts were chain-apply-verified against a scratch tree whose base was
+WRONG (a local tree containing patch-stack content CI never had - the same
+trap that silently dropped the eMMC patches for weeks; CI applies with
+git apply and SKIPS any patch whose context fails, staying green while the
+phone runs stale drivers). Against the true CI tree, 0006's
+iokit/KernelConfigTables.cpp hunk failed context (its anchor was the local
+PRAPinctrl entry, which does not exist in CI's table), and 0001 was missing
+the extern declaration of prague_gpu_probe in IOKitBSDInit.cpp (a guaranteed
+compile failure git apply cannot see). Both fixed minimally in the drafts,
+then consolidated from the verified end state.
+
+Reconstruction recipe (0164 method, reproducible):
+  1. Pristine xnu-8796.141.3 tarball (apple-oss-distributions tag,
+     sha256 f08bfe045a1fb552a6cbf7450feae6a35dd003e9979edf71ea77d1a836c8dc99).
+  2. Apply xnu/patches/*.patch with GNU patch -p1 --fuzz=0, every `index `
+     line stripped (GNU patch mis-parses them as file creations). The six
+     patches CI skips (context failures on the pristine tree) are skipped:
+     0031, 0041 (need .sh-staged sources), 0097, 0099, 0127, 0129.
+     Cross-check: running the stack with NO pre-skip fails exactly those six.
+  3. Apply drafts 0001-0007+0009 onto that tree: zero offsets, zero fuzz,
+     zero rejects (see WORKLOG.md for the full transcripts).
+  4. This patch = git diff of that end state. Proof (byte-identical, all 7
+     files, full-tree diff -rq):
+       (CI tree) + this patch == (CI tree) + 0001..0007,0009
+     via BOTH arbiters: git apply (CI's actual mechanism) and GNU patch
+     --fuzz=0 on the index-stripped file. Local `git apply --check` is NOT
+     trusted: git 2.56 skip-detects already-applied patches in some states.
+  5. bsd/dev/pra_sdhci.c is untouched (sha256 identical before/after; this
+     patch has no section for it; the eMMC 0164 content is not regressed).
+
+Safe-by-construction rule unchanged from the drafts: with no boot-arg
+(pragpu=0 default, sweetfb_gpu=0 default) boot behavior is byte-identical
+to the pre-GPU kernel - every probe/job/present path is behind pragpu* /
+sweetfb_gpu boot-args, the config-table entry is inside
+#if defined(ARM64_BOARD_CONFIG_PRA), and prague_gpu.c/PragueGPU.cpp are
+wholly inside the same guard. Enable-flag names kept verbatim:
+pragpu, pragpu_pa, pragpu_fb, pragpu_wv, sweetfb_gpu,
+pragpuaccel, pragpu_selftest, pragpu_sleep_us, pragpu_sleep_present.
+
+Residual risk (see WORKLOG.md): CI's git apply is the final arbiter; the
+workflow's Verify step must gain GPU string asserts when this lands, or a
+silent skip can never be ruled out from a green run.
+
+---
+ bsd/conf/files                        |    1 +
+ bsd/dev/prague_gpu.c                  | 1663 +++++++++++++++++++++++++++++++++
+ iokit/Kernel/arm/PragueGPU.cpp        |  548 +++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |   89 ++
+ iokit/KernelConfigTables.cpp          |   11 +
+ iokit/bsddev/IOKitBSDInit.cpp         |    5 +
+ iokit/conf/files.arm64                |    1 +
+ 7 files changed, 2318 insertions(+) - 13 hunks, no pra_sdhci.c
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9d2da66..88f1d61 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/pra_sdhci.c			standard
+ bsd/dev/pra_charger.c			standard
++bsd/dev/prague_gpu.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/bsd/dev/prague_gpu.c b/bsd/dev/prague_gpu.c
+new file mode 100644
+index 0000000..5570b8a
+--- /dev/null
++++ b/bsd/dev/prague_gpu.c
+@@ -0,0 +1,1663 @@
++/*
++ * PRA-LX1 (hi6250 / Kirin 655) Mali-T830 MP2, stage 1: read-only probe.
++ *
++ * This is the 0225 herolte pattern (Galaxy S7, Mali-T880) adapted to the
++ * hi6250. Resource map is from the vendor DT
++ * (hi6250-kernel/arch/arm64/boot/dts/auto-generate/config/hi6250/hisi_6250_gpu.dtsi):
++ *
++ *   mali@E8970000: reg 0xE8970000 + 0x4000, GIC SPIs JOB 258, MMU 259, GPU 260
++ *   (level-high), clocks = <&clk_g3d>, gpu-supply = <&g3d>, OPP 120..900 MHz.
++ *
++ * Differences from herolte that this stage must respect:
++ *
++ *   - There is no known PMU-status register to pre-check. On the Exynos the
++ *     probe read 0x105C4064 first and refused to touch CMU/GPU unless the G3D
++ *     domain read 0xf ("a powered-off block can hang the bus"). On hi6250 the
++ *     G3D power domain is managed by the LPM3 MCU over IPC
++ *     (hisi_6250_powerip.dtsi:172-178, hi3xxx_to_lpm3_enable_step), and the
++ *     register interface for that is UNKNOWN here. Reading GPU_ID while the
++ *     block is power-gated may abort the machine. The probe therefore defaults
++ *     OFF: boot-arg pragpu=1 runs it, pragpu=0 (default) prints nothing.
++ *   - The GPU clock (clk_g3d) is an "xfreq" clock: rates are get/set via IPC
++ *     to the LPM3 (hisi_6250_clock.dtsi:316-325, cmd 0x0003020A/0x0003030A,
++ *     devid 2). This stage does not talk to the LPM3; it measures the live
++ *     clock the way herolte's hg_clock_report() did, with the GPU cycle
++ *     counter (GPU_COMMAND CYCLE_COUNT_START/STOP, CYCLE_COUNT 0x090/0x094),
++ *     which needs no clock-tree knowledge.
++ *   - Register offsets below are Midgard architecture registers and are the
++ *     same for the T830 as for the T880 (the job chain, MMU, power and ID
++ *     register space is architectural; herolte drove a T880 with exactly
++ *     these). Core-count differences show up in the SHADER_PRESENT mask, not
++ *     in the offsets.
++ *
++ * Nothing is written except the cycle-counter start/stop command (pragpu=1)
++ * and, with pragpu=2, the stage-2 job block below (needs pragpu_pa=..., and
++ * only touches the block the boot-arg names plus the GPU's own registers).
++ */
++#if defined(ARM64_BOARD_CONFIG_PRA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void prague_gpu_probe(void);
++/* Power L2/tiler/cores and wait (bounded) for READY; false on timeout. */
++static bool pg_power(vm_offset_t gpu, uint32_t on, uint32_t ready, uint32_t mask,
++    const char *name);
++/* GPU present, for iokit/Kernel/arm/SweetFramebuffer.cpp (herolte 0235). */
++int prague_gpu_present_slot(uint32_t id, uint64_t first_pa);
++int prague_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n);
++bool prague_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h);
++
++/* From the vendor DT (see the header comment). */
++#define PG_GPU_PA       0xe8970000u
++#define PG_GPU_BYTES    0x4000u
++
++/* Mali Midgard register offsets (identical on T880 herolte 0225; the
++ * register block is architectural across Midgard v4/v5). */
++#define GPU_ID                  0x000
++#define L2_FEATURES             0x004
++#define CORE_FEATURES           0x008
++#define TILER_FEATURES          0x00c
++#define MEM_FEATURES            0x010
++#define MMU_FEATURES            0x014
++#define AS_PRESENT              0x018
++#define JS_PRESENT              0x01c
++#define GPU_IRQ_RAWSTAT         0x020
++#define GPU_IRQ_CLEAR           0x024
++#define GPU_STATUS              0x034
++#define GPU_COMMAND             0x030
++#define GPU_FAULTSTATUS         0x03c
++#define GPU_FAULTADDR_LO        0x040
++#define CYCLE_COUNT_LO          0x090
++#define CYCLE_COUNT_HI          0x094
++#define MAX_THREADS             0x0a0
++#define THREAD_FEATURES         0x0ac
++#define TEXTURE_FEATURES0       0x0b0
++#define SHADER_PRESENT_LO       0x100
++#define TILER_PRESENT_LO        0x110
++#define L2_PRESENT_LO           0x120
++#define SHADER_READY_LO         0x140
++#define TILER_READY_LO          0x150
++#define L2_READY_LO             0x160
++#define SHADER_PWRON_LO         0x180
++#define TILER_PWRON_LO          0x190
++#define L2_PWRON_LO             0x1a0
++#define SHADER_PWROFF_LO        0x1c0
++#define TILER_PWROFF_LO         0x1d0
++#define L2_PWROFF_LO            0x1e0
++#define JOB_IRQ_RAWSTAT         0x1000
++#define JOB_IRQ_CLEAR           0x1004
++#define MMU_IRQ_RAWSTAT         0x2000
++#define MMU_IRQ_CLEAR           0x2004
++#define AS0                     0x2400  /* +0x00 TRANSTAB_LO, +0x04 HI, +0x08 MEMATTR, +0x18 COMMAND, +0x28 STATUS, +0x1c FAULTSTATUS */
++#define JS_BASE(n)              (0x1800u + (n) * 0x80u) /* +0x00 HEAD, +0x20 COMMAND, +0x24 STATUS, +0x40 HEAD_NEXT, +0x50 AFFINITY_NEXT, +0x58 CONFIG_NEXT, +0x60 COMMAND_NEXT */
++#define COHERENCY_FEATURES      0x300
++
++/* The GPU's own timebase: CYCLE_COUNT over 20 ms, as herolte 0225/0267's
++ * hg_clock_report() (its CYCLE_COUNT_START/STOP commands are 5 and 6). */
++static uint64_t pg_us_since(uint64_t start)
++{
++	uint64_t now = mach_absolute_time();
++	return now > start ? now - start : 0;
++}
++
++static uint32_t
++pg_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pg_msleep(unsigned ms)
++{
++	static int sleeper;
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&sleeper, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * Stage 7 (the 0333/0334 herolte analog): a client's job is waited for
++ * asleep, not by spinning. herolte's backboardd pushed ~1100 jobs a second
++ * through submit; delay(10) kept its submit thread on a big core for as
++ * long as the GPU worked - a third of all its samples. The first polls
++ * still spin, for the shortest jobs; pragpu_sleep_us=0 spins as before,
++ * pragpu_sleep_present=0 makes the frame's scaling job spin as before.
++ * The caller context is the same as herolte's: submit runs in a client's
++ * IOKit call, present in AppleCLCD::present() on the framebuffer work
++ * loop, both holding only pg_mtx - blocking is allowed there.
++ */
++static uint32_t pg_sleep_us = 50;
++static uint32_t pg_sleep_present = 1;
++static bool pg_run_nap;         /* set by submit and the present draw path only */
++static int pg_sleep;            /* wait channel */
++
++static void
++pg_usleep(unsigned us)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	(void)assert_wait_deadline(&pg_sleep, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Store with the herolte hg_wr() barriers (0226): oshst before, osh after. */
++static void
++pg_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/*
++ * Stage 2 (pragpu=2): power L2, shader core 0 and the tiler, then run a
++ * WRITE_VALUE job on JS1 in AS0 - the herolte 0226 recipe, register for
++ * register. The private DRAM block must be a range the XNU kernel does not
++ * allocate: give it with boot-arg pragpu_pa=<hex phys>, e.g. pragpu_pa=0x31000000
++ * (the stock /reserved-memory/graphic reservation, prague-hardware-map.md) IF a
++ * boot shows the XNU phys map leaves it free. pragpu_pa=0 (default) skips the
++ * job and prints how to pick the block. 64 KiB, mapped uncached on the CPU
++ * (no cache maintenance needed): Mali-LPAE tables at +0x0000..+0x3fff, job
++ * and output in the data pages at +0x4000, GPU VA 0x02000000.
++ *
++ * The WRITE_VALUE payload layout: this draft packs the pandecode midgard.xml
++ * offsets (Address qword 0; Type 32-bit at qword 2 = payload byte 16;
++ * Immediate at qword 4 = payload byte 32), which is what the owner's Android
++ * evidence points to (GPU_WRITEVALUE_2026-11-08.md section 5) and what Mesa's
++ * genxml uses. herolte's kernel packed type at payload byte 8 and only ever
++ * proved type 3 (Zero) - which cannot distinguish layouts, because an
++ * invalid type also completes and writes 0 (Android run, section 3.3). Set
++ * pragpu_wv=1 to flip to the herolte layout in the same boot: three jobs run
++ * (types 3, 4, 7, each to its own slot); if types 4/7 write their immediates,
++ * that layout is the real one; if they write 0 while the XML layout writes
++ * them, the XML layout wins. This is exactly the experiment
++ * GPU_WRITEVALUE_2026-11-08.md section 8 queued, now in-kernel on PRA.
++ *
++ * Stage 3 (pragpu=3): fragment clear of a green 128x128 square in the middle
++ * of the panel scanout buffer - herolte's herogpu=5 (0227/0228) with the PRA
++ * geometry. The framebuffer descriptor is the Midgard v5 MFBD (multi-target,
++ * used from the T760 on): the T720's single-target descriptor faulted
++ * DATA_INVALID_FAULT on the T880 (0228 header), and the T830 is Midgard v5
++ * like the T880, so the v5 constants below are copied from the reconstructed
++ * herolte driver (hg_job_fragment_rt) unchanged except the panel geometry.
++ * The tiler is disabled (no hierarchical tiling on Midgard v5): the job is a
++ * pure tile-buffer clear, no shader, empty polygon list. pragpu_pa must now
++ * name 128 KiB (the panel's L3 tables live in the block).
++ *
++ * Stage 4 (this patch, always on for pragpu>=2): the panfrost quirks herolte
++ * picked up in 0243, applied once after the cores come up (hg_bringup's
++ * order: power, quirks, then everything else). Also, the cores now stay
++ * powered between the stage-2 and stage-3 jobs, as herolte's hg_jobs() kept
++ * them up across all of its tests (one hg_cores_on() at the top, one
++ * hg_cores_off() after the last); 0003 powered off at the end of stage 2,
++ * which would have left the stage-3 fragment job submitting to powered-off
++ * cores when pragpu=3 ran both.
++ *
++ * Stage 5 (pragpu_pa + sweetfb_gpu=1, no pragpu level of its own): GPU
++ * present for SweetFramebuffer - herolte 0235's herolte_gpu_present_*
++ * API, drawing every full-screen iOS frame to the panel as a bilinear
++ * textured quad on all shader cores, instead of the CPU row copy. All
++ * cores are powered and left on from the first frame (hg_bringup); the
++ * shader and descriptors are the herogpu=8/9 draw (0234), re-targeted to
++ * the 1080x1920 panel. Surfaces get GPU VAs in 8 MiB slots (herolte
++ * HGP_*), keyed by IOSurface id and first page, invalidated with an MMU
++ * flush on remap so no stale TLB entry points at an old surface. The
++ * pragpu_pa arena grows: +0x100000..+0x2fffff is the scratch block
++ * (descriptors, polygon list, tiler heap, slot tables; herolte's separate
++ * 0x8fe00000 block) and +0x300000..+0x4fffff is reserved for the PragueGPU
++ * user L3 pool (0006, kept out of the scratch per the 0307 lesson), i.e.
++ * 5 MiB total for stages 5+, 128 KiB for stages 2-3. Access is
++ * serialized by pg_mtx (present runs on the vsync thread, the probe
++ * thread's stage jobs run with pragpu>=2).
++ */
++#define PG_TEST_BYTES   0x20000u
++#define PG_TEST_VA      0x02000000ull
++#define PG_DATA_OFF     0x4000u
++#define PG_OUT_OFF      0x100u
++#define PG_FBD_OFF      0x100u
++#define PG_POLY_OFF     0x1000u
++#define PG_PANEL_L3_OFF 0x10000u
++
++/* The panel scanout buffer the ABL hands to XNU (mkadt_pra.py declares
++ * pra-fbcon reg = 0x5D000000 + 1080*1920*4; PRA-LX1_PROGRESS.md:209-213).
++ * pragpu_fb overrides the base in case the boot framebuffer lands elsewhere. */
++#define PG_PANEL_VA     0x04000000ull
++#define PG_PANEL_W      1080u
++#define PG_PANEL_H      1920u
++#define PG_FB_STRIDE    (PG_PANEL_W * 4u)
++
++/* Shared state for stages 2-3: mapped by the stage-2 job entry. */
++static vm_offset_t g_gpu, g_mem;
++static uint64_t g_test_pa;
++
++/* Serializes the GPU between the present path (0005), the PragueGPU user
++ * clients (0006) and the probe thread's stage jobs (both may run at the
++ * same time; statically initialized, as herolte's hg_mtx). */
++static LCK_GRP_DECLARE(pg_grp, "prague_gpu");
++static LCK_MTX_DECLARE(pg_mtx_store, &pg_grp);
++#define pg_mtx (&pg_mtx_store)
++
++static void
++pg_panel_tables(uint64_t fb_pa)
++{
++	/* Map the whole panel at PG_PANEL_VA: one L3 table per 2 MiB, herolte
++	 * hg_tables()' panel branch. PRA panel 1080x1920x4 = 2026 pages ->
++	 * 4 tables, inside the block (PG_PANEL_L3_OFF..+0x4000). */
++	unsigned pages = (PG_PANEL_W * PG_PANEL_H * 4u + 0xfff) / 0x1000;
++	volatile uint64_t *l2t = (volatile uint64_t *)(g_mem + 0x2000);
++	for (unsigned t = 0; t * 512 < pages; t++) {
++		uint32_t table = PG_PANEL_L3_OFF + t * 0x1000;
++		volatile uint64_t *pl3 = (volatile uint64_t *)(g_mem + table);
++		l2t[((PG_PANEL_VA >> 21) & 0x1ff) + t] = (g_test_pa + table) | 3;
++		for (unsigned i = 0; i < 512 && t * 512 + i < pages; i++) {
++			pl3[i] = (fb_pa + (uint64_t)(t * 512 + i) * 0x1000) | 0x2c1;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Fragment job, JS0, clear-to-color (herolte hg_job_fragment_rt without the
++ * preload branch). herolte's scheme for a sub-rectangle: the descriptor
++ * (fb[8..10]) covers the sub-target in pixels relative to the RT base, the
++ * JOB bounds (hdr[8..9]) cover its tiles from 0, the RT base is the
++ * sub-target start and the row stride is the FULL panel stride. */
++static void
++pg_run_js0(const char *what);
++
++static void
++pg_job_fragment_clear(uint64_t pixels_va, uint32_t w, uint32_t h,
++    uint32_t color, const char *what)
++{
++	uint64_t fb_va = PG_TEST_VA + PG_FBD_OFF;
++	uint64_t poly_va = PG_TEST_VA + PG_POLY_OFF;
++	uint32_t tiles_x = (w + 15) / 16, tiles_y = (h + 15) / 16;
++	volatile uint32_t *hdr = (volatile uint32_t *)(g_mem + PG_DATA_OFF);
++	hdr[4] = 0x00010013;            /* 64-bit | FRAGMENT(9) << 1 | index 1 << 16 */
++	hdr[8] = 0;                     /* bound min tile x, y */
++	hdr[9] = ((tiles_y - 1) << 16) | (tiles_x - 1);         /* bound max tile x, y */
++	*(volatile uint64_t *)(hdr + 10) = fb_va | 1;   /* MFBD, 1 render target */
++
++	volatile uint32_t *fb = (volatile uint32_t *)(g_mem + PG_DATA_OFF + PG_FBD_OFF);
++	fb[1] = 31;                     /* Local Storage: no workgroup memory */
++	/* Parameters at +32 (word 8). */
++	fb[8] = ((h - 1) << 16) | (w - 1);              /* width - 1, height - 1 */
++	fb[9] = 0;                                      /* bound min x, y (pixels) */
++	fb[10] = ((h - 1) << 16) | (w - 1);             /* bound max x, y */
++	fb[11] = (2u << 6) |            /* tie-break MINUS_180_IN_0_OUT, as the A5 */
++	    (8u << 9) |                 /* effective tile size log2(16 * 16) */
++	    (1u << 24);                 /* color buffer allocation 1 KiB (shr 10) */
++	fb[12] = 1u << 16;              /* Z internal format D24 (Mesa, no ZS) */
++	fb[13] = 0;                     /* Z clear 0.0 */
++	/* Tiler Context at +56: disabled tiler (Midgard v5 has no hierarchical
++	 * tiling), 512-byte header only, heap start = end = the list. */
++	fb[14] = 512;
++	fb[15] = 4096;
++	*(volatile uint64_t *)(fb + 16) = poly_va;
++	*(volatile uint64_t *)(fb + 18) = poly_va + 512;
++	*(volatile uint64_t *)(fb + 20) = poly_va;
++	*(volatile uint64_t *)(fb + 22) = poly_va;
++	/* Render Target at +128 (word 32): RGBA8 linear, identity swizzle. */
++	volatile uint32_t *rt = fb + 32;
++	rt[0] = 1u << 26;               /* internal format R8G8B8A8 */
++	rt[1] = 1u |                    /* write enable */
++	    (19u << 3) |                /* writeback format R8G8B8A8 */
++	    (2u << 10) |                /* block format linear */
++	    (1u << 15) |                /* dithering, as the A5 */
++	    (0x688u << 16) |            /* identity swizzle */
++	    (1u << 31);                 /* clean pixel write */
++	*(volatile uint64_t *)(rt + 8) = pixels_va;     /* RGB base */
++	rt[10] = PG_FB_STRIDE;          /* the FULL panel row stride */
++	rt[11] = 0;                                     /* surface stride */
++	for (unsigned i = 0; i < 4; i++) {
++		rt[12 + i] = color;             /* clear color */
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pg_run_js0(what);
++}
++
++/* Submit the job chain at PG_TEST_VA on JS0 (fragment slot; core 0 only)
++ * and wait bounded, as hg_run() does for the test jobs. */
++static void
++pg_run_js0(const char *what)
++{
++	/* Submit on JS0 (fragment slot in herolte; core 0 only) and wait
++	 * bounded, as hg_run() does for the test jobs. */
++	uint32_t slot = JS_BASE(0);
++	pg_wr(g_gpu, MMU_IRQ_CLEAR, 0xffffffffu);
++	pg_wr(g_gpu, JOB_IRQ_CLEAR, 0xffffffffu);
++	__asm__ volatile ("dsb sy" ::: "memory");       /* herolte 0247 */
++	pg_wr(g_gpu, slot + 0x40, (uint32_t)PG_TEST_VA);
++	pg_wr(g_gpu, slot + 0x44, 0);
++	pg_wr(g_gpu, slot + 0x50, 1);                   /* AFFINITY: core 0 */
++	pg_wr(g_gpu, slot + 0x54, 0);
++	pg_wr(g_gpu, slot + 0x58, (8u << 16) | (3u << 8) | (3u << 12));
++	pg_wr(g_gpu, slot + 0x60, 1);
++	uint32_t jirq = 0, mirq = 0, girq = 0;
++	for (unsigned i = 0; i < 20000; i++) {
++		jirq = pg_rd(g_gpu, JOB_IRQ_RAWSTAT);
++		mirq = pg_rd(g_gpu, MMU_IRQ_RAWSTAT);
++		girq = pg_rd(g_gpu, GPU_IRQ_RAWSTAT);
++		if ((jirq & ((1u << 0) | (1u << 16))) || mirq || (girq & 0x81)) {
++			break;
++		}
++		delay(10);
++	}
++	bool ok = (jirq & (1u << 0)) && !(jirq & (1u << 16)) && !mirq && !(girq & 0x81);
++	printf("PRAGPU: %s: irq=%#x mmu=%#x gpu=%#x js_status=%#x as_fault=%#x "
++	    "exception=%#x -> %s\n", what, jirq, mirq, girq,
++	    pg_rd(g_gpu, slot + 0x24), pg_rd(g_gpu, AS0 + 0x1c),
++	    *(volatile uint32_t *)(g_mem + PG_DATA_OFF),
++	    ok ? "ran" : "failed or timed out");
++	if (jirq) {
++		pg_wr(g_gpu, JOB_IRQ_CLEAR, jirq);
++	}
++	if (mirq) {
++		pg_wr(g_gpu, MMU_IRQ_CLEAR, mirq);
++	}
++	if (girq) {
++		pg_wr(g_gpu, GPU_IRQ_CLEAR, girq);
++	}
++}
++
++static void
++pg_fragment_clear(void)
++{
++	uint64_t fb_pa = 0x5D000000ull;         /* pra-fbcon ADT reg base */
++	PE_parse_boot_argn("pragpu_fb", &fb_pa, sizeof(fb_pa));
++	if ((fb_pa & 0xfff) != 0) {
++		printf("PRAGPU: clear: pragpu_fb must be page-aligned\n");
++		return;
++	}
++	/* Defensive (stage 4): a fragment job runs on a shader core with L2 up;
++	 * stage 2 normally left them powered, but it exits early on its not-idle
++	 * or pragpu_pa guards. Idempotent: only writes PWRON when not READY. */
++	if (!(pg_rd(g_gpu, L2_READY_LO) & pg_rd(g_gpu, L2_PRESENT_LO))) {
++		pg_power(g_gpu, L2_PWRON_LO, L2_READY_LO, pg_rd(g_gpu, L2_PRESENT_LO), "L2");
++	}
++	if (!(pg_rd(g_gpu, SHADER_READY_LO) & 1)) {
++		pg_power(g_gpu, SHADER_PWRON_LO, SHADER_READY_LO, 1, "shader core 0");
++	}
++	/* Rebuild the tables: the write-value stage's L3 covers the block only;
++	 * the panel needs its own 2 MiB-level entries. */
++	volatile uint64_t *l0 = (volatile uint64_t *)g_mem;
++	volatile uint64_t *l1 = (volatile uint64_t *)(g_mem + 0x1000);
++	volatile uint64_t *l2t = (volatile uint64_t *)(g_mem + 0x2000);
++	volatile uint64_t *l3 = (volatile uint64_t *)(g_mem + 0x3000);
++	l0[0] = (g_test_pa + 0x1000) | 3;
++	l1[0] = (g_test_pa + 0x2000) | 3;
++	l2t[(PG_TEST_VA >> 21) & 0x1ff] = (g_test_pa + 0x3000) | 3;
++	for (unsigned i = 0; i < (PG_TEST_BYTES - PG_DATA_OFF) / 0x1000; i++) {
++		l3[i] = (g_test_pa + PG_DATA_OFF + i * 0x1000) | 0x2c1;
++	}
++	pg_panel_tables(fb_pa);
++	{
++		/* The GPU is assumed non-coherent (COHERENCY_FEATURES=0): clean the
++		 * CPU's dirty lines over the square first so nothing writes back
++		 * over the GPU's pixels later, and invaldate nothing (the panel is
++		 * only ever read by the display controller, not the CPU). */
++		uint32_t x = (PG_PANEL_W - 128) / 2, y = (PG_PANEL_H - 128) / 2;
++		uintptr_t kva = ml_io_map(fb_pa, PG_PANEL_W * PG_PANEL_H * 4u);
++		if (kva) {
++			uintptr_t start = kva + (uintptr_t)y * PG_FB_STRIDE + (uintptr_t)x * 4;
++			for (uintptr_t p = start & ~(uintptr_t)63; p < start + 128 * PG_FB_STRIDE; p += 64) {
++				__asm__ volatile ("dc cvac, %0" : : "r" (p) : "memory");
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++	}
++	/* Re-program AS0 (tables rebuilt), as hg_tables() forces via hg_as_ok. */
++	uint64_t transtab = g_test_pa | 0x7;
++	pg_wr(g_gpu, AS0 + 0x00, (uint32_t)transtab);
++	pg_wr(g_gpu, AS0 + 0x04, (uint32_t)(transtab >> 32));
++	pg_wr(g_gpu, AS0 + 0x08, 0x888d88);
++	pg_wr(g_gpu, AS0 + 0x0c, 0);
++	pg_wr(g_gpu, AS0 + 0x18, 1);
++	unsigned w;
++	for (w = 0; w < 10000 && (pg_rd(g_gpu, AS0 + 0x28) & 1); w++) {
++		delay(10);
++	}
++	if (w == 10000) {
++		printf("PRAGPU: clear: MMU update timeout\n");
++		return;
++	}
++	uint32_t x = (PG_PANEL_W - 128) / 2, y = (PG_PANEL_H - 128) / 2;
++	pg_job_fragment_clear(PG_PANEL_VA + (uint64_t)y * PG_FB_STRIDE + (uint64_t)x * 4,
++	    128, 128, 0xff00ff00u, "clear");
++	printf("PRAGPU: clear: if it ran, a green 128x128 square is at %ux%u of the "
++	    "panel (base %#llx)\n", x, y, fb_pa);
++}
++
++static bool
++pg_power(vm_offset_t gpu, uint32_t on, uint32_t ready, uint32_t mask, const char *name)
++{
++	pg_wr(gpu, on, mask);
++	uint32_t r = 0;
++	for (unsigned us = 0; us < 20000; us += 10) {
++		r = pg_rd(gpu, ready);
++		if ((r & mask) == mask) {
++			break;
++		}
++		delay(10);
++	}
++	printf("PRAGPU: power %s mask=%#x ready=%#x\n", name, mask, r);
++	return (r & mask) == mask;
++}
++
++/*
++ * Stage 4: Linux panfrost's quirks for this Midgard generation
++ * (panfrost_gpu_init_quirks), as herolte's 0243 hg_quirks() for the T880
++ * r2p0 (H:381-387 of the reconstructed driver): the load/store unit must
++ * accept typed attribute descriptors, or every Mesa vertex job stops with
++ * DATA_INVALID_FAULT (0x58); the texture-cache clock gate override (T76X_3953);
++ * the job throttle limit. A soft reset clears them. The bits are the same
++ * for the T830 (same 0xf00-0xf0c CONFIG space; the SC_LS bit is needed by
++ * any load/store instruction with a typed attribute descriptor, which Mesa's
++ * Midgard compiler emits for vertex attributes on all Midgard v5).
++ */
++static void
++pg_quirks(void)
++{
++	pg_wr(g_gpu, 0xf04, pg_rd(g_gpu, 0xf04) | (1u << 16));  /* SC_LS_ALLOW_ATTR_TYPES */
++	pg_wr(g_gpu, 0xf08, pg_rd(g_gpu, 0xf08) | 1u);          /* TC_CLOCK_GATE_OVERRIDE */
++	pg_wr(g_gpu, 0xf00, 0x3fu << 3);                        /* JM_JOB_THROTTLE_LIMIT */
++	printf("PRAGPU: config jm=%#x shader=%#x tiler=%#x l2_mmu=%#x\n",
++	    pg_rd(g_gpu, 0xf00), pg_rd(g_gpu, 0xf04), pg_rd(g_gpu, 0xf08), pg_rd(g_gpu, 0xf0c));
++}
++
++/*
++ * Stage 5: GPU present (herolte 0235, herogpu=8/9 draw from 0234). Every
++ * full-screen frame SweetFramebuffer hands over is the same draw as the
++ * herogpu=9 test: a full-panel triangle strip, the frame as the texture,
++ * bilinear, all shader cores, into the panel scanout buffer. Set up once,
++ * on the first frame. Everything here runs with pg_mtx held (the callers
++ * take it), so the probe thread's stage jobs cannot interleave.
++ */
++#define PG_SCR_OFF      0x100000u       /* scratch block, in the pragpu_pa arena */
++#define PG_SCR_BYTES    0x200000u       /* 2 MiB, as herolte HG_SCR_BYTES */
++#define PG_SCR_VA       0x0a000000ull
++#define PG_SCR_L3_OFF   0x1f000u        /* scratch's L3 table, in the test block */
++/* Scratch layout, herolte S_* (reconstructed driver 1014-1032). */
++#define PG_S_SHADER     0x0000u
++#define PG_S_RSD        0x0100u         /* Renderer State (64 B) + Blend (16 B) */
++#define PG_S_VIEWPORT   0x0200u
++#define PG_S_POS        0x0300u
++#define PG_S_TILER_JOB  0x0400u         /* 192 B */
++#define PG_S_FRAG_JOB   0x0600u
++#define PG_S_FBD        0x0800u         /* Framebuffer (128 B) + Render Target */
++#define PG_S_POLY       0x1000u
++#define PG_S_HEAP       0x10000u
++#define PG_S_HEAP_BYTES 0x40000u
++#define PG_S_VARY_BUF   0x0a00u         /* Attribute Buffer (16 B, align 32) */
++#define PG_S_VARY       0x0a40u         /* Attribute (8 B) */
++#define PG_S_SAMPLER    0x0a80u         /* Sampler (32 B) */
++#define PG_S_TEX_PTRS   0x0ac0u         /* one 64-bit texture descriptor pointer */
++#define PG_S_TEXDESC    0x0b00u         /* Texture (32 B) + Surface With Stride */
++#define PG_S_VARY_DATA  0x0c00u         /* 4 vertices x vec4 texel coordinates */
++#define PG_BIN_LEVEL    4u              /* 16 << 4 = 256-pixel bins */
++/* IEEE-754 single bit patterns the setup needs (the kernel has no FP). */
++#define PG_F32_0        0x00000000u
++#define PG_F32_HALF     0x3f000000u
++#define PG_F32_1        0x3f800000u
++
++/* Present slots (herolte HGP_*): surfaces get 8 MiB of GPU VA each, keyed
++ * by IOSurface id and first page; the L3 tables live in the scratch block. */
++#define PG_PRESENT_SLOTS        4u
++#define PG_PRESENT_SLOT_TABLES  4u
++#define PG_PRESENT_SLOT_PAGES   (PG_PRESENT_SLOT_TABLES * 512u)
++#define PG_PRESENT_L3_OFF       0x100000u       /* in the scratch block */
++#define PG_PRESENT_VA_BASE      0x10000000ull
++#define PG_PRESENT_VA_END       0x40000000ull   /* the one L2 table covers 1 GiB */
++/* User range (0006, herolte HGU_*): own L2 in the scratch block, L3 pool in
++ * its own arena region (the 0307 lesson). */
++#define PGU_L2_OFF      0x110000u       /* user L2 table, in the scratch block */
++#define PGU_POOL_OFF    0x300000u       /* user L3 pool, in the arena (2 MiB) */
++#define PGU_L3_MAX      512u
++#define PGU_VA_BASE     0x40000000ull
++#define PGU_VA_END      0x80000000ull
++#define PGU_CHUNK       0x10000ull      /* VA granule: 64 KiB */
++#define PGU_CHUNKS      ((unsigned)((PGU_VA_END - PGU_VA_BASE) / PGU_CHUNK))
++
++/* Textured fragment shader (herolte 0234 hg_midgard_tex_shader, unmodified:
++ * ld_vary_32 r0 / imov r28, r0 / tex r29 = texture(r28.xy) / imov r0, r29 +
++ * writeout; TAG_LOAD_STORE_4). The same code runs on a T830 (Midgard v5). */
++static const uint32_t pg_tex_shader[20] = {
++	0xc9e09885, 0x01403939, 0x00000030, 0x00000000, 0x00020038, 0x027b7018,
++	0xffae4000, 0x00000000, 0x210b12d3, 0x00e43d67, 0x00000000, 0x00000000,
++	0x0822001d, 0x841f03b8, 0x4000027b, 0x0240ffae, 0xc0a00000, 0xfffffc6f,
++	0x0000ffff, 0x00000000,
++};
++#define PG_TEX_SHADER_TAG 0x5u          /* TAG_LOAD_STORE_4 */
++
++struct pg_present_slot {
++	uint32_t        id;
++	uint64_t        first_pa;
++	uint64_t        va;
++};
++static struct pg_present_slot pg_slots[PG_PRESENT_SLOTS];
++static unsigned pg_victim;
++static uint64_t pg_next_va = PG_PRESENT_VA_BASE;
++static vm_offset_t pg_scr;
++static int pg_present_state;            /* 0 not set up, 1 ready, -1 failed */
++static int pg_present_active;           /* once up: never power the cores off */
++static uint64_t pg_frames;
++
++static bool pg_run(unsigned js, const char *what);
++
++/* IEEE-754 bits of an integer below 2^24 (exact; no FP in the kernel). */
++static uint32_t
++pg_f32(uint32_t v)
++{
++	if (v == 0) {
++		return 0;
++	}
++	uint32_t e = 31 - __builtin_clz(v);
++	return ((127 + e) << 23) | ((v << (23 - e)) & 0x7fffff);
++}
++
++static void
++pg_zero(vm_offset_t va, size_t bytes)
++{
++	volatile uint64_t *q = (volatile uint64_t *)va;
++	for (size_t i = 0; i < bytes / 8; i++) {
++		q[i] = 0;
++	}
++}
++
++static uint32_t
++pg_tiler_size(uint32_t bytes_per_tile)
++{
++	uint32_t bin = 16u << PG_BIN_LEVEL;
++	uint32_t size = 0x40 + ((PG_PANEL_W + bin - 1) / bin) * ((PG_PANEL_H + bin - 1) / bin) *
++	    bytes_per_tile;
++	return (size + 0x1ff) & ~0x1ffu;
++}
++
++/* Wait (bounded) for AS0 to finish its command. */
++static bool
++pg_as_idle(void)
++{
++	for (unsigned i = 0; i < 10000 && (pg_rd(g_gpu, AS0 + 0x28) & 1); i++) {
++		delay(1);
++	}
++	return !(pg_rd(g_gpu, AS0 + 0x28) & 1);
++}
++
++/* Lock a VA range and flush the MMU's page table caches for it, as kbase's
++ * mmu_hw_do_operation(): LOCKADDR, LOCK, FLUSH_PT (which also unlocks) -
++ * herolte hgp_mmu_flush (reconstructed driver 1419-1434). */
++static bool
++pg_mmu_flush(uint64_t va, unsigned log2_size)
++{
++	uint64_t lock = (va & ~((1ull << log2_size) - 1)) | (log2_size - 1);
++	if (!pg_as_idle()) {
++		return false;
++	}
++	pg_wr(g_gpu, AS0 + 0x10, (uint32_t)lock);               /* AS_LOCKADDR */
++	pg_wr(g_gpu, AS0 + 0x14, (uint32_t)(lock >> 32));
++	pg_wr(g_gpu, AS0 + 0x18, 2);                            /* LOCK */
++	if (!pg_as_idle()) {
++		return false;
++	}
++	pg_wr(g_gpu, AS0 + 0x18, 4);                            /* FLUSH_PT */
++	return pg_as_idle();
++}
++
++/* AS0 programmed (pg_run does it); cleared whenever the tables are rebuilt. */
++static bool pg_as_ok;
++
++/* Shared bring-up (present 0005, PragueGPU clients 0006): the arena, all
++ * cores powered and left on, quirks, and one address space for everything:
++ *   0x02000000 test pages   0x04000000 the panel   0x0a000000 scratch block
++ *   0x10000000 present slots (8 MiB each)          (0006 adds the user range)
++ * Idempotent; called with pg_mtx held. */
++static int pg_up_state;                 /* 0 not tried, 1 up, -1 failed */
++
++static bool
++pg_bringup(void)
++{
++	if (pg_up_state != 0) {
++		return pg_up_state == 1;
++	}
++	pg_up_state = -1;
++	uint64_t arena = 0;
++	PE_parse_boot_argn("pragpu_pa", &arena, sizeof(arena));
++	if (arena == 0 || (arena & 0xfff) != 0) {
++		printf("PRAGPU: present: needs pragpu_pa=<hex PA>, a 5 MiB block "
++		    "outside XNU's RAM (candidate: the /reserved-memory/graphic "
++		    "carveout 0x31000000..0x32A40000). Skipping.\n");
++		return false;
++	}
++	if (!g_gpu) {
++		g_gpu = ml_io_map(PG_GPU_PA, PG_GPU_BYTES);
++	}
++	if (!g_mem) {
++		g_mem = ml_io_map(arena, PG_TEST_BYTES);
++	}
++	pg_scr = ml_io_map(arena + PG_SCR_OFF, PG_SCR_BYTES);
++	if (!g_gpu || !g_mem || !pg_scr) {
++		printf("PRAGPU: present: mapping failed\n");
++		return false;
++	}
++	g_test_pa = arena;
++	uint32_t all = pg_rd(g_gpu, SHADER_PRESENT_LO);
++	if (!pg_power(g_gpu, L2_PWRON_LO, L2_READY_LO, pg_rd(g_gpu, L2_PRESENT_LO), "L2") ||
++	    !pg_power(g_gpu, SHADER_PWRON_LO, SHADER_READY_LO, all, "all shader cores") ||
++	    !pg_power(g_gpu, TILER_PWRON_LO, TILER_READY_LO, pg_rd(g_gpu, TILER_PRESENT_LO), "tiler")) {
++		pg_wr(g_gpu, TILER_PWROFF_LO, pg_rd(g_gpu, TILER_READY_LO));
++		pg_wr(g_gpu, SHADER_PWROFF_LO, pg_rd(g_gpu, SHADER_READY_LO));
++		pg_wr(g_gpu, L2_PWROFF_LO, pg_rd(g_gpu, L2_READY_LO));
++		return false;
++	}
++	pg_quirks();
++
++	/* Page tables: test pages, the panel (pragpu_fb, default the pra-fbcon
++	 * base), and the scratch block - the stage-3 builders with the scratch
++	 * table added (herolte hg_tables + the bringup tail). */
++	uint64_t fb_pa = 0x5D000000ull;         /* pra-fbcon ADT reg base */
++	PE_parse_boot_argn("pragpu_fb", &fb_pa, sizeof(fb_pa));
++	if ((fb_pa & 0xfff) != 0) {
++		printf("PRAGPU: present: pragpu_fb must be page-aligned\n");
++		return false;
++	}
++	pg_zero(g_mem, PG_TEST_BYTES);
++	volatile uint64_t *l0 = (volatile uint64_t *)g_mem;
++	volatile uint64_t *l1 = (volatile uint64_t *)(g_mem + 0x1000);
++	volatile uint64_t *l2t = (volatile uint64_t *)(g_mem + 0x2000);
++	volatile uint64_t *l3 = (volatile uint64_t *)(g_mem + 0x3000);
++	l0[0] = (g_test_pa + 0x1000) | 3;
++	l1[0] = (g_test_pa + 0x2000) | 3;
++	l2t[(PG_TEST_VA >> 21) & 0x1ff] = (g_test_pa + 0x3000) | 3;
++	for (unsigned i = 0; i < (PG_TEST_BYTES - PG_DATA_OFF) / 0x1000; i++) {
++		l3[i] = (g_test_pa + PG_DATA_OFF + i * 0x1000) | 0x2c1;
++	}
++	pg_panel_tables(fb_pa);
++	l2t[(PG_SCR_VA >> 21) & 0x1ff] = (g_test_pa + PG_SCR_L3_OFF) | 3;
++	volatile uint64_t *sl3 = (volatile uint64_t *)(g_mem + PG_SCR_L3_OFF);
++	for (unsigned i = 0; i < 512; i++) {
++		sl3[i] = (g_test_pa + PG_SCR_OFF + (uint64_t)i * 0x1000) | 0x2c1;
++	}
++	pg_zero(pg_scr, PG_S_HEAP + PG_S_HEAP_BYTES);
++	pg_zero(pg_scr + PG_PRESENT_L3_OFF, PG_PRESENT_SLOTS * PG_PRESENT_SLOT_TABLES * 0x1000);
++	bzero(pg_slots, sizeof(pg_slots));
++	/* 0006: the user range's own L2 table (scratch block), hung off the L1
++	 * entry for 0x40000000..0x7fffffff (herolte hg_bringup's HGU tail). */
++	pg_zero(pg_scr + PGU_L2_OFF, 0x1000);
++	l1[PGU_VA_BASE >> 30] = (g_test_pa + PG_SCR_OFF + PGU_L2_OFF) | 3;
++	pg_as_ok = false;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pg_up_state = 1;
++	printf("PRAGPU: present: up, cores %#x, arena %#llx, slots %ux%u MiB\n",
++	    all, arena, PG_PRESENT_SLOTS,
++	    (unsigned)(PG_PRESENT_SLOT_TABLES * 2));
++	return true;
++}
++
++/* One-time shader/descriptor/viewport/tiler/fragment build (herolte
++ * hgp_setup, the herogpu=8/9 draw constants), PRA panel geometry. */
++static bool
++pg_present_setup(void)
++{
++	if (!pg_bringup()) {
++		return false;
++	}
++	vm_offset_t scr = pg_scr;
++
++	/* Shader, Renderer State + Blend, Viewport: as herogpu=9. */
++	for (unsigned i = 0; i < 20; i++) {
++		*(volatile uint32_t *)(scr + PG_S_SHADER + i * 4) = pg_tex_shader[i];
++	}
++	*(volatile uint64_t *)(scr + PG_S_RSD + 0) = (PG_SCR_VA + PG_S_SHADER) | PG_TEX_SHADER_TAG;
++	*(volatile uint32_t *)(scr + PG_S_RSD + 8) = 1u | (1u << 16);   /* 1 sampler, 1 texture */
++	*(volatile uint32_t *)(scr + PG_S_RSD + 12) = 1u << 16;         /* 1 varying */
++	/* As Mesa's preload RSD on v4/v5: 4 work registers, force early-z. */
++	*(volatile uint32_t *)(scr + PG_S_RSD + 16) = (4u << 16) | (1u << 10);
++	*(volatile uint32_t *)(scr + PG_S_RSD + 32) = 0xffffu | (7u << 24);     /* sample mask, depth ALWAYS */
++	/* Stencil masks; Midgard's fixed-function alpha test must be ALWAYS
++	 * (0 = NEVER kills every fragment). */
++	*(volatile uint32_t *)(scr + PG_S_RSD + 36) = 0xffffu | (7u << 21);
++	*(volatile uint32_t *)(scr + PG_S_RSD + 40) = (7u << 16) | (0xffu << 8);
++	*(volatile uint32_t *)(scr + PG_S_RSD + 44) = (7u << 16) | (0xffu << 8);
++	/* Blend for RT0 (v5: right after the renderer state): enabled, src
++	 * replaces dst (A = 0, B = src, C = 1 - 0) for RGB and alpha, mask RGBA. */
++	*(volatile uint32_t *)(scr + PG_S_RSD + 64) = 1u << 9;
++	*(volatile uint32_t *)(scr + PG_S_RSD + 72) = 0xf0921921u;
++	/* Viewport: the whole panel. */
++	*(volatile uint32_t *)(scr + PG_S_VIEWPORT + 0) = PG_F32_0;
++	*(volatile uint32_t *)(scr + PG_S_VIEWPORT + 4) = PG_F32_0;
++	*(volatile uint32_t *)(scr + PG_S_VIEWPORT + 8) = pg_f32(PG_PANEL_W);
++	*(volatile uint32_t *)(scr + PG_S_VIEWPORT + 12) = pg_f32(PG_PANEL_H);
++	*(volatile uint32_t *)(scr + PG_S_VIEWPORT + 16) = PG_F32_0;
++	*(volatile uint32_t *)(scr + PG_S_VIEWPORT + 20) = PG_F32_1;
++	*(volatile uint32_t *)(scr + PG_S_VIEWPORT + 24) = 0;
++	*(volatile uint32_t *)(scr + PG_S_VIEWPORT + 28) = ((PG_PANEL_H - 1) << 16) | (PG_PANEL_W - 1);
++
++	/* Positions: the full-panel triangle strip; texel coordinates are
++	 * written per frame (the texture is the surface). */
++	for (unsigned v = 0; v < 4; v++) {
++		*(volatile uint32_t *)(scr + PG_S_POS + v * 16 + 0) =
++		    pg_f32(v & 1 ? PG_PANEL_W : 0);
++		*(volatile uint32_t *)(scr + PG_S_POS + v * 16 + 4) =
++		    pg_f32(v & 2 ? PG_PANEL_H : 0);
++		*(volatile uint32_t *)(scr + PG_S_POS + v * 16 + 8) = PG_F32_HALF;
++		*(volatile uint32_t *)(scr + PG_S_POS + v * 16 + 12) = PG_F32_1;
++		*(volatile uint32_t *)(scr + PG_S_VARY_DATA + v * 16 + 12) = PG_F32_1;
++	}
++	*(volatile uint64_t *)(scr + PG_S_VARY_BUF + 0) = (PG_SCR_VA + PG_S_VARY_DATA) | 1;
++	*(volatile uint32_t *)(scr + PG_S_VARY_BUF + 8) = 16;           /* stride */
++	*(volatile uint32_t *)(scr + PG_S_VARY_BUF + 12) = 16 * 4;      /* size */
++	/* Varying 0: RGB32F (RGB1 swizzle) from buffer 0, offset 0. */
++	*(volatile uint32_t *)(scr + PG_S_VARY + 0) = (1u << 9) | (((183u << 12) | 0xa88u) << 10);
++	*(volatile uint32_t *)(scr + PG_S_VARY + 4) = 0;
++	/* Sampler: bilinear, unnormalized coordinates, clamp to edge. */
++	*(volatile uint32_t *)(scr + PG_S_SAMPLER + 0) = 0;
++	*(volatile uint32_t *)(scr + PG_S_SAMPLER + 8) = 9u | (9u << 4) | (9u << 8);
++	/* Texture: RGBA8 UNORM, 2D, linear, 64-bit with strides; size/address
++	 * per frame. */
++	*(volatile uint32_t *)(scr + PG_S_TEXDESC + 8) =
++	    ((187u << 12) | 0x688u) | (2u << 22) | (2u << 24) | (3u << 28);
++	*(volatile uint32_t *)(scr + PG_S_TEXDESC + 16) = 0x688u;       /* swizzle */
++	*(volatile uint64_t *)(scr + PG_S_TEX_PTRS) = PG_SCR_VA + PG_S_TEXDESC;
++
++	/* Tiler job + Draw. */
++	uint32_t tj = PG_S_TILER_JOB, d = PG_S_TILER_JOB + 64;
++	uint64_t fbd_ptr = (PG_SCR_VA + PG_S_FBD) | 1;
++	*(volatile uint32_t *)(scr + tj + 16) = 1u | (7u << 1) | (1u << 16);
++	*(volatile uint32_t *)(scr + tj + 32) = 3;                      /* 4-vertex strip */
++	*(volatile uint32_t *)(scr + tj + 36) = (32u << 22) | (2u << 28);
++	*(volatile uint32_t *)(scr + tj + 40) = 10u | (1u << 15) | (1u << 16) | (1u << 17) | (6u << 26);
++	*(volatile uint32_t *)(scr + tj + 52) = 3;                      /* index count - 1 */
++	*(volatile uint32_t *)(scr + d + 0) = 0x7;                      /* 4 comps, 64-bit descriptors */
++	*(volatile uint64_t *)(scr + d + 16) = PG_SCR_VA + PG_S_POS;
++	*(volatile uint64_t *)(scr + d + 32) = PG_SCR_VA + PG_S_TEX_PTRS;
++	*(volatile uint64_t *)(scr + d + 40) = PG_SCR_VA + PG_S_SAMPLER;
++	*(volatile uint64_t *)(scr + d + 56) = PG_SCR_VA + PG_S_RSD;
++	*(volatile uint64_t *)(scr + d + 80) = PG_SCR_VA + PG_S_VARY_BUF;
++	*(volatile uint64_t *)(scr + d + 88) = PG_SCR_VA + PG_S_VARY;
++	*(volatile uint64_t *)(scr + d + 96) = PG_SCR_VA + PG_S_VIEWPORT;
++	*(volatile uint64_t *)(scr + d + 112) = fbd_ptr;
++
++	/* Framebuffer + render target (the panel) + fragment job: the v5 MFBD
++	 * constants of stage 3 with a live tiler context. */
++	uint32_t f = PG_S_FBD, rt = PG_S_FBD + 128;
++	uint32_t header = pg_tiler_size(8), full = pg_tiler_size(0x200);
++	*(volatile uint32_t *)(scr + f + 4) = 31;                       /* Local Storage */
++	*(volatile uint32_t *)(scr + f + 32) = ((PG_PANEL_H - 1) << 16) | (PG_PANEL_W - 1);
++	*(volatile uint32_t *)(scr + f + 40) = ((PG_PANEL_H - 1) << 16) | (PG_PANEL_W - 1);
++	*(volatile uint32_t *)(scr + f + 44) = (2u << 6) | (8u << 9) | (1u << 24);
++	*(volatile uint32_t *)(scr + f + 48) = 1u << 16;                /* Z internal D24 */
++	*(volatile uint32_t *)(scr + f + 56) = full;                    /* polygon list size */
++	*(volatile uint32_t *)(scr + f + 60) = 1u << PG_BIN_LEVEL;      /* hierarchy mask */
++	*(volatile uint64_t *)(scr + f + 64) = PG_SCR_VA + PG_S_POLY;
++	*(volatile uint64_t *)(scr + f + 72) = PG_SCR_VA + PG_S_POLY + header;
++	*(volatile uint64_t *)(scr + f + 80) = PG_SCR_VA + PG_S_HEAP;
++	*(volatile uint64_t *)(scr + f + 88) = PG_SCR_VA + PG_S_HEAP + PG_S_HEAP_BYTES;
++	*(volatile uint32_t *)(scr + rt + 0) = 1u << 26;                /* R8G8B8A8 */
++	*(volatile uint32_t *)(scr + rt + 4) =
++	    1u | (19u << 3) | (2u << 10) | (1u << 15) | (0x688u << 16) | (1u << 31);
++	*(volatile uint64_t *)(scr + rt + 32) = PG_PANEL_VA;
++	*(volatile uint32_t *)(scr + rt + 40) = PG_FB_STRIDE;
++	for (unsigned i = 0; i < 4; i++) {
++		*(volatile uint32_t *)(scr + rt + 48 + i * 4) = 0xff000000u;    /* black bars */
++	}
++	uint32_t tiles_x = (PG_PANEL_W + 15) / 16, tiles_y = (PG_PANEL_H + 15) / 16;
++	*(volatile uint32_t *)(scr + PG_S_FRAG_JOB + 16) = 0x00010013;
++	*(volatile uint32_t *)(scr + PG_S_FRAG_JOB + 36) = ((tiles_y - 1) << 16) | (tiles_x - 1);
++	*(volatile uint64_t *)(scr + PG_S_FRAG_JOB + 40) = fbd_ptr;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("PRAGPU: present: ready, cores %#x\n", pg_rd(g_gpu, SHADER_PRESENT_LO));
++	return true;
++}
++
++/* Is the surface (id, first page) mapped? Returns its slot or -1. */
++int
++prague_gpu_present_slot(uint32_t id, uint64_t first_pa)
++{
++	for (unsigned i = 0; i < PG_PRESENT_SLOTS; i++) {
++		if (pg_slots[i].id == id && pg_slots[i].first_pa == first_pa && id != 0) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* Map n 4 KiB pages of a surface into a slot (round robin); slot or -1.
++ * herolte hgp_map_locked: a remapped slot takes a fresh VA (its old L2
++ * entries are dropped), so no stale TLB entry can point at the old
++ * surface. */
++static int
++pg_present_map_locked(uint32_t id, const uint64_t *pages, unsigned n)
++{
++	if (pg_present_state == 0) {
++		pg_present_state = pg_present_setup() ? 1 : -1;
++	}
++	if (pg_present_state != 1 || n == 0 || n > PG_PRESENT_SLOT_PAGES) {
++		return -1;
++	}
++	unsigned s = pg_victim;
++	pg_victim = (pg_victim + 1) % PG_PRESENT_SLOTS;
++	if (pg_next_va + PG_PRESENT_SLOT_PAGES * 0x1000ull > PG_PRESENT_VA_END) {
++		pg_next_va = PG_PRESENT_VA_BASE;
++	}
++	uint64_t old_va = pg_slots[s].va;
++	uint64_t va = pg_next_va;
++	pg_next_va += PG_PRESENT_SLOT_PAGES * 0x1000ull;
++	volatile uint64_t *l2t = (volatile uint64_t *)(g_mem + 0x2000);
++	if (old_va) {
++		for (unsigned t = 0; t < PG_PRESENT_SLOT_TABLES; t++) {
++			l2t[((old_va >> 21) & 0x1ff) + t] = 0;
++		}
++	}
++	for (unsigned t = 0; t < PG_PRESENT_SLOT_TABLES; t++) {
++		uint32_t table = PG_PRESENT_L3_OFF + (s * PG_PRESENT_SLOT_TABLES + t) * 0x1000;
++		volatile uint64_t *l3t = (volatile uint64_t *)(pg_scr + table);
++		for (unsigned i = 0; i < 512; i++) {
++			unsigned p = t * 512 + i;
++			l3t[i] = p < n ? (pages[p] | 0x2c1) : 0;
++		}
++		l2t[((va >> 21) & 0x1ff) + t] = (g_test_pa + PG_SCR_OFF + table) | 3;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!pg_mmu_flush(PG_PRESENT_VA_BASE, 30)) {
++		printf("PRAGPU: present: MMU flush timeout\n");
++	}
++	pg_slots[s].id = id;
++	pg_slots[s].first_pa = pages[0];
++	pg_slots[s].va = va;
++	printf("PRAGPU: present: surface %u (%u pages, pa %#llx) in slot %u at VA %#llx\n",
++	    id, n, pages[0], s, va);
++	return (int)s;
++}
++
++/* The GPU job chain pg_run() starts, and its CPU mapping (for the log). */
++static uint64_t pg_job_va = PG_TEST_VA;
++static vm_offset_t pg_job_cpu;
++/* Log only failed jobs (the per-frame GPU present). */
++static bool pg_run_quiet;
++/* JS_STATUS of the last pg_run() (0 after a clean finish). */
++static uint32_t pg_last_js_status;
++/* Shader cores a job may use (JS_AFFINITY). */
++static uint32_t pg_affinity = 1;
++
++/*
++ * Stage 9 (the 0249/0258 herolte analog): recover the GPU after a job that
++ * faulted or never finished - herolte's hg_recover(), minus what hi6250
++ * cannot do. Hard-stop whatever is still on a slot (as kbase does), and if
++ * a slot stays ACTIVE, reset the GPU and bring it back (cores, quirks;
++ * pg_run re-programs AS0 - pg_as_ok is cleared below). Without this one
++ * MMU fault left the job stalled on its slot, and every later job of every
++ * client timed out behind it ("slot busy").
++ *
++ * Not portable: herolte's deepest tool, the G3D power-domain cycle (0265 -
++ * PMU register writes around a saved/restored CMU state). hi6250's G3D
++ * domain is LPM3-MCU-managed over IPC (hisi_6250_powerip.dtsi:172-178) and
++ * the IPC transport from XNU is UNKNOWN, so from the 4th consecutive read
++ * fault this draft can only hard-reset again and say so in the log.
++ */
++static uint64_t pgu_pte(uint64_t va);   /* stage-6 block */
++static unsigned pg_read_faults;         /* in a row; pg_run() clears it */
++static bool pg_probing;                 /* the read-fault probe's own jobs */
++
++/* What the state is when a job gets a read fault (herolte hg_read_fault_
++ * report's portable core): the GPU's own page tables, AS0, and the faulting
++ * job's PTE. Herolte also dumped the job's words through phystokv(); that
++ * needs this boot's physmap base (UNKNOWN for PRA - the dram window starts
++ * at 0x88000000 but the physmap base is randomized per Linux boot on the
++ * stock kernel, LINUX_HANDOFF section 15), so it is left out here. */
++static void
++pg_read_fault_report(uint64_t job_va)
++{
++	static unsigned told;
++	volatile uint64_t *tables = (volatile uint64_t *)g_mem;
++	if (told++ > 4) {
++		return;         /* thousands of lines cost more than the jobs */
++	}
++	printf("PRAGPU: read fault %u: tables l0 %#llx (expect %#llx) l1 %#llx (expect %#llx) "
++	    "l2[test] %#llx (expect %#llx) l3[0] %#llx (expect %#llx)\n",
++	    told, tables[0], (uint64_t)(g_test_pa + 0x1000) | 3,
++	    tables[0x1000 / 8], (uint64_t)(g_test_pa + 0x2000) | 3,
++	    tables[0x2000 / 8 + ((PG_TEST_VA >> 21) & 0x1ff)],
++	    (uint64_t)(g_test_pa + 0x3000) | 3, tables[0x3000 / 8],
++	    (uint64_t)(g_test_pa + PG_DATA_OFF) | 0x2c1);
++	printf("PRAGPU: AS0 transtab %#x%08x memattr %#x\n",
++	    pg_rd(g_gpu, AS0 + 0x04), pg_rd(g_gpu, AS0 + 0x00), pg_rd(g_gpu, AS0 + 0x08));
++	printf("PRAGPU: job PTE at %#llx: %#llx\n", job_va, pgu_pte(job_va));
++}
++
++/* A WRITE_VALUE job of the kernel's own, after the reset: tells a bad
++ * client chain from a GPU that has lost its way to memory (herolte
++ * hg_read_fault_probe, without the phystokv dump). */
++static void
++pg_read_fault_probe(uint64_t job_va)
++{
++	uint64_t saved_va = pg_job_va;
++	vm_offset_t saved_cpu = pg_job_cpu;
++	uint32_t saved_status = pg_last_js_status;
++	unsigned saved_faults = pg_read_faults;
++	bool saved_quiet = pg_run_quiet;
++	volatile uint8_t *mine = (volatile uint8_t *)(g_mem + PG_DATA_OFF);
++	for (unsigned i = 0; i < 64; i++) {
++		mine[i] = 0;
++	}
++	mine[16] = 1 | (2 << 1);                        /* 64-bit, WRITE_VALUE */
++	*(volatile uint16_t *)(mine + 18) = 1;
++	*(volatile uint64_t *)(mine + 32) = PG_TEST_VA + PG_OUT_OFF;
++	*(volatile uint32_t *)(mine + 48) = 3;          /* midgard.xml layout, type Zero */
++	volatile uint64_t *output = (volatile uint64_t *)(g_mem + PG_DATA_OFF + PG_OUT_OFF);
++	*output = 0xa5a5a5a55a5a5a5aull;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pg_probing = true;
++	pg_run_quiet = true;
++	pg_job_va = PG_TEST_VA;
++	pg_job_cpu = 0;
++	bool ran = pg_run(1, "probe");
++	printf("PRAGPU: a job of the kernel's after the reset: %s, status %#x, output %#llx\n",
++	    ran ? "ran" : "FAILED", pg_last_js_status, *output);
++	pg_probing = false;
++	pg_run_quiet = saved_quiet;
++	pg_job_va = saved_va;
++	pg_job_cpu = saved_cpu;
++	pg_last_js_status = saved_status;
++	pg_read_faults = saved_faults;
++}
++
++static void
++pg_recover(const char *what)
++{
++	static unsigned resets;
++	for (unsigned js = 0; js < 2; js++) {
++		uint32_t slot = JS_BASE(js);
++		if ((pg_rd(g_gpu, slot + 0x24) & 0xff) == 0x08) {
++			pg_wr(g_gpu, slot + 0x20, 3);                   /* JS_COMMAND HARD_STOP */
++			for (unsigned i = 0; i < 1000 && (pg_rd(g_gpu, slot + 0x24) & 0xff) == 0x08; i++) {
++				delay(10);
++			}
++		}
++	}
++	pg_wr(g_gpu, JOB_IRQ_CLEAR, 0xffffffffu);
++	pg_wr(g_gpu, MMU_IRQ_CLEAR, 0xffffffffu);
++	pg_as_ok = false;                       /* re-UPDATE AS0 after a fault */
++	if (pg_probing) {
++		return;
++	}
++	/*
++	 * JOB_READ_FAULT (0x42) with no MMU fault: on herolte, once it started
++	 * every later job of the boot failed the same way with nothing left
++	 * active on a slot. Reset for it too (backing off if the reset does
++	 * not help - a reset per job would stall everything).
++	 */
++	bool read_fault = (pg_last_js_status & 0xff) == 0x42;
++	if (read_fault) {
++		pg_read_faults++;
++		pg_read_fault_report(pg_job_va);
++	}
++	if (!(read_fault && (pg_read_faults <= 16 || pg_read_faults % 64 == 0)) &&
++	    (pg_rd(g_gpu, JS_BASE(0) + 0x24) & 0xff) != 0x08 &&
++	    (pg_rd(g_gpu, JS_BASE(1) + 0x24) & 0xff) != 0x08) {
++		return;
++	}
++	/* Herolte powered the whole G3D domain down and up from the 4th read
++	 * fault (0265); hi6250 has no register path to it (LPM3 IPC, UNKNOWN),
++	 * so this is hard resets all the way. */
++	pg_wr(g_gpu, GPU_IRQ_CLEAR, 0xffffffffu);
++	pg_wr(g_gpu, GPU_COMMAND, read_fault && pg_read_faults >= 2 ? 2 : 1);   /* HARD : SOFT reset */
++	unsigned w;
++	for (w = 0; w < 10000 && !(pg_rd(g_gpu, GPU_IRQ_RAWSTAT) & 0x100); w++) {
++		delay(10);
++	}
++	bool done = (pg_rd(g_gpu, GPU_IRQ_RAWSTAT) & 0x100) != 0;
++	pg_wr(g_gpu, GPU_IRQ_CLEAR, 0xffffffffu);
++	uint32_t all = pg_rd(g_gpu, SHADER_PRESENT_LO);
++	bool up = pg_power(g_gpu, L2_PWRON_LO, L2_READY_LO, pg_rd(g_gpu, L2_PRESENT_LO), "L2") &&
++	    pg_power(g_gpu, SHADER_PWRON_LO, SHADER_READY_LO, all, "all shader cores") &&
++	    pg_power(g_gpu, TILER_PWRON_LO, TILER_READY_LO, pg_rd(g_gpu, TILER_PRESENT_LO), "tiler");
++	pg_quirks();
++	if (++resets <= 32) {
++		printf("PRAGPU: %s: GPU reset #%u (%s), cores %s%s\n", what, resets,
++		    done ? "done" : "timed out", up ? "back up" : "NOT up",
++		    read_fault && pg_read_faults >= 4 ?
++		    " (domain cycle unavailable: LPM3 IPC unknown)" : "");
++	}
++	if (read_fault && pg_read_faults <= 6) {
++		pg_read_fault_probe(pg_job_va);
++	}
++}
++
++/* Program AS0, start the job at pg_job_va on slot js, wait (bounded) - the
++ * herolte hg_run() (reconstructed driver 738-830) minus the recovery ladder
++ * (0249/0258; a later draft) and minus the flush-mode trim (herolte turned
++ * the 3<<8 start flush off for quiet jobs as a measured optimization; the
++ * PRA draft keeps the safe values the stage-2/3 jobs use). */
++static bool
++pg_run(unsigned js, const char *what)
++{
++	uint32_t slot = JS_BASE(js);
++	/* JS_STATUS keeps the last fault code; only ACTIVE (0x08) is busy. */
++	if ((pg_rd(g_gpu, slot + 0x24) & 0xff) == 0x08) {
++		printf("PRAGPU: %s: slot %u busy\n", what, js);
++	}
++	pg_wr(g_gpu, MMU_IRQ_CLEAR, 0xffffffffu);
++	pg_wr(g_gpu, JOB_IRQ_CLEAR, 0xffffffffu);
++	/* AS0 keeps its configuration: program it once, again after the page
++	 * tables are rebuilt (an UPDATE per job cost herolte ~57 MMU round
++	 * trips a frame). */
++	if (!pg_as_ok) {
++		uint64_t transtab = g_test_pa | 0x7;
++		pg_wr(g_gpu, AS0 + 0x00, (uint32_t)transtab);
++		pg_wr(g_gpu, AS0 + 0x04, (uint32_t)(transtab >> 32));
++		pg_wr(g_gpu, AS0 + 0x08, 0x888d88);
++		pg_wr(g_gpu, AS0 + 0x0c, 0);
++		pg_wr(g_gpu, AS0 + 0x18, 1);            /* AS_COMMAND_UPDATE */
++		unsigned w;
++		for (w = 0; w < 10000 && (pg_rd(g_gpu, AS0 + 0x28) & 1); w++) {
++			delay(10);
++		}
++		if (pg_rd(g_gpu, AS0 + 0x28) & 1) {
++			printf("PRAGPU: %s: MMU update timeout\n", what);
++			return false;
++		}
++		pg_as_ok = true;
++	}
++	/* Job chains written through write-combined mappings: let the writes
++	 * land before the job manager reads the chain (herolte 0247; without
++	 * it ~4% of backboardd's chains stopped with JOB_READ_FAULT 0x42). */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pg_wr(g_gpu, slot + 0x40, (uint32_t)pg_job_va);         /* HEAD_NEXT */
++	pg_wr(g_gpu, slot + 0x44, (uint32_t)(pg_job_va >> 32));
++	pg_wr(g_gpu, slot + 0x50, pg_affinity);                 /* AFFINITY */
++	pg_wr(g_gpu, slot + 0x54, 0);
++	pg_wr(g_gpu, slot + 0x58, (8u << 16) | (3u << 8) | (3u << 12));
++	pg_wr(g_gpu, slot + 0x60, 1);                           /* START */
++
++	uint32_t jirq = 0, mirq = 0, girq = 0;
++	/* (0007) only submit and the present draw path are waited for asleep;
++	 * the probe thread's stage jobs keep the spin loop. */
++	unsigned nap = (pg_run_nap && pg_sleep_us >= 10 && pg_sleep_us <= 5000) ? pg_sleep_us : 0;
++	for (unsigned i = 0; i < 20000; i++) {
++		jirq = pg_rd(g_gpu, JOB_IRQ_RAWSTAT);
++		mirq = pg_rd(g_gpu, MMU_IRQ_RAWSTAT);
++		girq = pg_rd(g_gpu, GPU_IRQ_RAWSTAT);
++		if ((jirq & ((1u << js) | (1u << (js + 16)))) || mirq || (girq & 0x81)) {
++			break;
++		}
++		if (nap && i >= 4) {
++			pg_usleep(nap);
++			i += nap / 10 - 1;      /* the same ~200 ms bound as the spinning loop */
++		} else {
++			delay(10);
++		}
++	}
++	volatile uint32_t *hdr = (volatile uint32_t *)(pg_job_cpu ? pg_job_cpu : g_mem + PG_DATA_OFF);
++	bool ok = (jirq & (1u << js)) && !(jirq & (1u << (js + 16))) && !mirq && !(girq & 0x81);
++	pg_last_js_status = pg_rd(g_gpu, slot + 0x24);
++	if (ok && pg_read_faults && !pg_probing) {
++		printf("PRAGPU: jobs run again after %u read faults\n", pg_read_faults);
++		pg_read_faults = 0;
++	}
++	/* A read fault says its state in pg_read_fault_report(): keep quiet
++	 * about it here (thousands of lines cost more than the jobs, 0258). */
++	if ((!ok && (pg_last_js_status & 0xff) != 0x42) || !pg_run_quiet) {
++		/* A client's chain is not in g_mem: its header fields mean nothing
++		 * (herolte 0243's own-guard). */
++		bool own = pg_job_cpu || pg_job_va == PG_TEST_VA;
++		printf("PRAGPU: %s: irq=%#x mmu=%#x gpu=%#x js_status=%#x head=%#x%08x "
++		    "as_fault=%#x exception=%#x fault=%#x:%#x gpu_fault=%#x@%#x\n", what,
++		    jirq, mirq, girq, pg_rd(g_gpu, slot + 0x24),
++		    pg_rd(g_gpu, slot + 0x04), pg_rd(g_gpu, slot + 0x00),
++		    pg_rd(g_gpu, AS0 + 0x1c),
++		    own ? hdr[0] : 0, own ? hdr[3] : 0, own ? hdr[2] : 0,
++		    pg_rd(g_gpu, GPU_FAULTSTATUS), pg_rd(g_gpu, GPU_FAULTADDR_LO));
++	}
++	pg_wr(g_gpu, JOB_IRQ_CLEAR, 0xffffffffu);
++	pg_wr(g_gpu, MMU_IRQ_CLEAR, 0xffffffffu);
++	if (!ok) {
++		pg_recover(what);
++	}
++	return ok;
++}
++
++/*
++ * Draw the w x h rect at byte offset off (row stride bytes) of the surface
++ * in slot s to the whole panel, scaled, bilinear (herolte hgp_draw_locked
++ * without the VGR0/two-buffer branches - hi6250 has no display-controller
++ * API mapped, the panel self-scans its buffer). The caller has cleaned the
++ * rect to the point of coherency. False if the GPU failed (the caller
++ * falls back to the CPU copy).
++ */
++static bool
++pg_present_draw_locked(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
++{
++	if (pg_present_state != 1 || s < 0 || s >= (int)PG_PRESENT_SLOTS ||
++	    w == 0 || h == 0 || w > 0x10000 || h > 0x10000) {
++		return false;
++	}
++	vm_offset_t scr = pg_scr;
++	/* Keep the aspect: a frame with a different shape than the panel is
++	 * drawn full height or full width, centered between black bars (the
++	 * bars are the render target's clear) - herolte 0238's scheme. The
++	 * PRA full-screen gate (w x h == panel) never bars; smaller layers
++	 * would. */
++	uint32_t x0 = 0, x1 = PG_PANEL_W, y0 = 0, y1 = PG_PANEL_H;
++	if ((uint64_t)w * PG_PANEL_H < (uint64_t)h * PG_PANEL_W) {
++		uint32_t dw = (uint32_t)((uint64_t)w * PG_PANEL_H / h);
++		x0 = (PG_PANEL_W - dw) / 2;
++		x1 = x0 + dw;
++	} else if ((uint64_t)w * PG_PANEL_H > (uint64_t)h * PG_PANEL_W) {
++		uint32_t dh = (uint32_t)((uint64_t)h * PG_PANEL_W / w);
++		y0 = (PG_PANEL_H - dh) / 2;
++		y1 = y0 + dh;
++	}
++	for (unsigned v = 0; v < 4; v++) {
++		*(volatile uint32_t *)(scr + PG_S_POS + v * 16 + 0) =
++		    pg_f32(v & 1 ? x1 : x0);
++		*(volatile uint32_t *)(scr + PG_S_POS + v * 16 + 4) =
++		    pg_f32(v & 2 ? y1 : y0);
++	}
++	/* Unnormalized texel coordinates of the strip's corners: (0,0), (w,0),
++	 * (0,h), (w,h). */
++	uint32_t fw = pg_f32(w), fh = pg_f32(h);
++	*(volatile uint32_t *)(scr + PG_S_VARY_DATA + 1 * 16 + 0) = fw;
++	*(volatile uint32_t *)(scr + PG_S_VARY_DATA + 2 * 16 + 4) = fh;
++	*(volatile uint32_t *)(scr + PG_S_VARY_DATA + 3 * 16 + 0) = fw;
++	*(volatile uint32_t *)(scr + PG_S_VARY_DATA + 3 * 16 + 4) = fh;
++	*(volatile uint32_t *)(scr + PG_S_TEXDESC + 0) = (w - 1) | ((h - 1) << 16);
++	*(volatile uint64_t *)(scr + PG_S_TEXDESC + 32) = pg_slots[s].va + off;
++	*(volatile uint32_t *)(scr + PG_S_TEXDESC + 40) = stride;
++	*(volatile uint32_t *)(scr + PG_S_TEXDESC + 44) = stride * h;
++	pg_zero(scr + PG_S_POLY, pg_tiler_size(8));
++	for (unsigned i = 0; i < 4; i++) {
++		*(volatile uint32_t *)(scr + PG_S_TILER_JOB + i * 4) = 0;
++		*(volatile uint32_t *)(scr + PG_S_FRAG_JOB + i * 4) = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	pg_run_quiet = true;
++	/* (0007) the frame's scaling jobs are waited for asleep too: they last
++	 * a few ms a frame and the spinning kept a core busy for it (0334). */
++	pg_run_nap = pg_sleep_present != 0;
++	pg_affinity = pg_rd(g_gpu, SHADER_PRESENT_LO);
++	pg_job_va = PG_SCR_VA + PG_S_TILER_JOB;
++	pg_job_cpu = scr + PG_S_TILER_JOB;
++	bool ok = pg_run(1, "PRESENT tiler job");
++	if (ok) {
++		pg_job_va = PG_SCR_VA + PG_S_FRAG_JOB;
++		pg_job_cpu = scr + PG_S_FRAG_JOB;
++		ok = pg_run(0, "PRESENT fragment job");
++	}
++	pg_job_va = PG_TEST_VA;
++	pg_job_cpu = 0;
++	pg_affinity = 1;
++	pg_run_nap = false;
++	pg_run_quiet = false;
++	if (++pg_frames <= 3 || !ok) {
++		printf("PRAGPU: present: frame %llu %ux%u stride %u slot %d -> %s\n",
++		    pg_frames, w, h, stride, s, ok ? "ok" : "failed");
++	}
++	return ok;
++}
++
++int
++prague_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n)
++{
++	lck_mtx_lock(pg_mtx);
++	int s = pg_present_map_locked(id, pages, n);
++	if (s >= 0) {
++		pg_present_active = 1;
++	}
++	lck_mtx_unlock(pg_mtx);
++	return s;
++}
++
++bool
++prague_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h)
++{
++	lck_mtx_lock(pg_mtx);
++	bool ok = pg_present_draw_locked(s, off, stride, w, h);
++	lck_mtx_unlock(pg_mtx);
++	return ok;
++}
++
++/*
++ * Stage 6 (with iokit/Kernel/arm/PragueGPU.cpp): user-space GPU jobs, the
++ * kernel half of a Panfrost-style driver - herolte's herolte_gpu_up/reg/
++ * va_alloc/map/unmap/submit (0239). Buffers get GPU VAs in the user range
++ * (64 KiB chunks, 0x40000000..0x7fffffff, given back by unmap lowest-first
++ * so the L3 pool never grows past its block: herolte's freed-VA lesson).
++ * Buffers are wired kernel buffers or imported SweetSurfaces, mapped
++ * noncached on the GPU side; the Mali is not IO-coherent, so the CPU sees
++ * them write-combined only (herolte's BO discipline, HeroGPU.cpp header).
++ * Jobs run one at a time under pg_mtx, polled. The user range has its own
++ * L2 table (top of the scratch block) and its L3 pool lives in its own 2
++ * MiB region of the arena at +0x300000 - kept out of the scratch block per
++ * herolte 0307 (a pool table there overwrote the GPU's level-0 and every
++ * job then read-faulted).
++ */
++static vm_offset_t pgu_pool;
++static uint16_t pgu_l3_of[512];         /* user L2 index -> pool table + 1 */
++static unsigned pgu_l3_used;
++/* Chunks of the user range in use. Freed VAs are reused, lowest first: L3
++ * tables are never given back, so the range must stay compact (herolte:
++ * with VAs never reused, every 15 MB texture CoreAnimation uploads cost 8
++ * tables for good and the pool ran out after ~480 MB of allocations). */
++static uint64_t pgu_used[PGU_CHUNKS / 64];
++
++bool
++prague_gpu_up(void)
++{
++	lck_mtx_lock(pg_mtx);
++	bool ok = pg_bringup();
++	lck_mtx_unlock(pg_mtx);
++	return ok;
++}
++
++/* A GPU register (GPU_ID, *_PRESENT, *_FEATURES...), for GetParam. */
++uint32_t
++prague_gpu_reg(uint32_t off)
++{
++	if (pg_up_state != 1 || off >= 0x1000 || (off & 3)) {
++		return 0;
++	}
++	return pg_rd(g_gpu, off);
++}
++
++uint64_t
++prague_gpu_va_alloc(uint64_t bytes)
++{
++	unsigned n = (unsigned)((bytes + PGU_CHUNK - 1) / PGU_CHUNK);
++	uint64_t va = 0;
++	lck_mtx_lock(pg_mtx);
++	if (pg_up_state == 1 && n != 0 && n <= PGU_CHUNKS) {
++		unsigned run = 0;
++		for (unsigned c = 0; c < PGU_CHUNKS; c++) {
++			if (pgu_used[c / 64] & (1ull << (c % 64))) {
++				run = 0;
++			} else if (++run == n) {
++				unsigned first = c + 1 - n;
++				for (unsigned k = first; k <= c; k++) {
++					pgu_used[k / 64] |= 1ull << (k % 64);
++				}
++				va = PGU_VA_BASE + first * PGU_CHUNK;
++				break;
++			}
++		}
++	}
++	lck_mtx_unlock(pg_mtx);
++	return va;
++}
++
++/* Give back the VA of n pages at va (prague_gpu_unmap does it). Called with
++ * pg_mtx held. */
++static void
++pgu_va_free_locked(uint64_t va, unsigned n)
++{
++	if (va < PGU_VA_BASE || va >= PGU_VA_END || n == 0) {
++		return;
++	}
++	unsigned first = (unsigned)((va - PGU_VA_BASE) / PGU_CHUNK);
++	unsigned count = (unsigned)(((uint64_t)n * 0x1000 + PGU_CHUNK - 1) / PGU_CHUNK);
++	for (unsigned k = first; k < first + count && k < PGU_CHUNKS; k++) {
++		pgu_used[k / 64] &= ~(1ull << (k % 64));
++	}
++}
++
++/* PTEs for n 4 KiB pages at va (pages == NULL: unmap), then an MMU flush. */
++static bool
++pgu_set_locked(uint64_t va, const uint64_t *pages, unsigned n)
++{
++	volatile uint64_t *l2 = (volatile uint64_t *)(pg_scr + PGU_L2_OFF);
++	if (!pgu_pool) {
++		pgu_pool = ml_io_map(g_test_pa + PGU_POOL_OFF, PGU_L3_MAX * 0x1000u);
++		if (!pgu_pool) {
++			return false;
++		}
++	}
++	for (unsigned i = 0; i < n; i++) {
++		uint64_t a = va + (uint64_t)i * 0x1000;
++		if (a < PGU_VA_BASE || a >= PGU_VA_END) {
++			return false;
++		}
++		unsigned l2i = (unsigned)((a >> 21) & 0x1ff);
++		if (pgu_l3_of[l2i] == 0) {
++			if (pages == NULL) {
++				continue;
++			}
++			if (pgu_l3_used >= PGU_L3_MAX) {
++				printf("PRAGPU: user L3 pool exhausted\n");
++				return false;
++			}
++			uint32_t table = pgu_l3_used * 0x1000;
++			pg_zero(pgu_pool + table, 0x1000);
++			pgu_l3_of[l2i] = (uint16_t)(++pgu_l3_used);
++			l2[l2i] = (g_test_pa + PGU_POOL_OFF + table) | 3;
++		}
++		volatile uint64_t *l3 = (volatile uint64_t *)(pgu_pool + (pgu_l3_of[l2i] - 1u) * 0x1000);
++		l3[(a >> 12) & 0x1ff] = pages ? ((pages[i] & ~0xfffull) | 0x2c1) : 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return pg_mmu_flush(PGU_VA_BASE, 30);
++}
++
++/* The PTE of a user VA (0: none): for the read-fault report (0009). */
++static uint64_t
++pgu_pte(uint64_t va)
++{
++	if (va < PGU_VA_BASE || va >= PGU_VA_END || !pgu_pool) {
++		return 0;
++	}
++	unsigned l2i = (unsigned)((va >> 21) & 0x1ff);
++	if (pgu_l3_of[l2i] == 0) {
++		return 0;
++	}
++	return ((volatile uint64_t *)(pgu_pool + (pgu_l3_of[l2i] - 1u) * 0x1000))[(va >> 12) & 0x1ff];
++}
++
++bool
++prague_gpu_map(uint64_t va, const uint64_t *pages, unsigned n)
++{
++	lck_mtx_lock(pg_mtx);
++	bool ok = pg_up_state == 1 && pgu_set_locked(va, pages, n);
++	lck_mtx_unlock(pg_mtx);
++	return ok;
++}
++
++void
++prague_gpu_unmap(uint64_t va, unsigned n)
++{
++	lck_mtx_lock(pg_mtx);
++	if (pg_up_state == 1) {
++		(void)pgu_set_locked(va, NULL, n);
++		pgu_va_free_locked(va, n);
++	}
++	lck_mtx_unlock(pg_mtx);
++}
++
++/*
++ * Run the job chain at GPU VA jc on slot js (0: fragment, 1: vertex,
++ * tiler, compute) on all shader cores and wait (bounded). Returns 0 when
++ * it finished cleanly, else JS_STATUS (or ~0 if it never ran); *us = time.
++ */
++uint32_t
++prague_gpu_submit(unsigned js, uint64_t jc, uint64_t *us)
++{
++	if (js > 1 || jc == 0) {
++		return ~0u;
++	}
++	lck_mtx_lock(pg_mtx);
++	uint32_t status = ~0u;
++	if (pg_up_state == 1) {
++		uint64_t start = mach_absolute_time();
++		pg_affinity = pg_rd(g_gpu, SHADER_PRESENT_LO);
++		pg_job_va = jc;
++		pg_job_cpu = 0;
++		pg_run_quiet = true;
++		pg_run_nap = true;      /* (0007) a client's IOKit call: block, don't spin */
++		bool ok = pg_run(js, js ? "PRAGPU job JS1" : "PRAGPU job JS0");
++		pg_run_nap = false;
++		pg_run_quiet = false;
++		pg_job_va = PG_TEST_VA;
++		pg_affinity = 1;
++		status = ok ? 0 : (pg_last_js_status ? pg_last_js_status : ~0u);
++		if (us) {
++			*us = pg_us_since(start);
++		}
++	}
++	lck_mtx_unlock(pg_mtx);
++	return status;
++}
++
++static void
++pg_write_value_job(void)
++{
++	uint64_t test_pa = 0;
++	PE_parse_boot_argn("pragpu_pa", &test_pa, sizeof(test_pa));
++	if (test_pa == 0 || (test_pa & 0xfff) != 0) {
++		printf("PRAGPU: job: set pragpu_pa=<hex PA> to a page-aligned block the "
++		    "kernel does not allocate (stage 3 needs 128 KiB; candidate: the "
++		    "/reserved-memory/graphic region; verify against the boot log's "
++		    "phys map first). Skipping.\n");
++		return;
++	}
++	if (!g_gpu) {
++		g_gpu = ml_io_map(PG_GPU_PA, PG_GPU_BYTES);
++	}
++	if (!g_mem) {
++		g_mem = ml_io_map(test_pa, PG_TEST_BYTES);
++	}
++	if (!g_gpu || !g_mem) {
++		printf("PRAGPU: job: mapping failed\n");
++		return;
++	}
++	g_test_pa = test_pa;
++	uint32_t shaders = pg_rd(g_gpu, SHADER_PRESENT_LO);
++	uint32_t pending = pg_rd(g_gpu, JS_BASE(1) + 0x60);
++	uint32_t as0_status = pg_rd(g_gpu, AS0 + 0x28);
++	if (!(shaders & 1) || pending || (as0_status & 1) || pg_rd(g_gpu, AS0 + 0x24)) {
++		printf("PRAGPU: job: not idle shader=%#x js1_pending=%#x as0=%#x\n",
++		    shaders, pending, as0_status);
++		return;
++	}
++	if (!(pg_rd(g_gpu, L2_READY_LO) & pg_rd(g_gpu, L2_PRESENT_LO))) {
++		pg_power(g_gpu, L2_PWRON_LO, L2_READY_LO, pg_rd(g_gpu, L2_PRESENT_LO), "L2");
++	}
++	if (!(pg_rd(g_gpu, SHADER_READY_LO) & 1)) {
++		pg_power(g_gpu, SHADER_PWRON_LO, SHADER_READY_LO, 1, "shader core 0");
++	}
++	if (!(pg_rd(g_gpu, TILER_READY_LO) & pg_rd(g_gpu, TILER_PRESENT_LO))) {
++		pg_power(g_gpu, TILER_PWRON_LO, TILER_READY_LO, pg_rd(g_gpu, TILER_PRESENT_LO), "tiler");
++	}
++	pg_quirks();
++
++	/* Mali-LPAE tables: L0 -> L1 -> L2 -> L3, as herolte 0226 (the L3
++	 * attribute 0x2c1 and the internal |3 entries are its values). */
++	volatile uint64_t *q = (volatile uint64_t *)g_mem;
++	for (unsigned i = 0; i < PG_TEST_BYTES / 8; i++) {
++		q[i] = 0;
++	}
++	volatile uint64_t *l0 = (volatile uint64_t *)g_mem;
++	volatile uint64_t *l1 = (volatile uint64_t *)(g_mem + 0x1000);
++	volatile uint64_t *l2t = (volatile uint64_t *)(g_mem + 0x2000);
++	volatile uint64_t *l3 = (volatile uint64_t *)(g_mem + 0x3000);
++	l0[0] = (test_pa + 0x1000) | 3;
++	l1[0] = (test_pa + 0x2000) | 3;
++	l2t[(PG_TEST_VA >> 21) & 0x1ff] = (test_pa + 0x3000) | 3;
++	for (unsigned i = 0; i < 4; i++) {
++		l3[i] = (test_pa + PG_DATA_OFF + i * 0x1000) | 0x2c1;
++	}
++
++	/* Three jobs: type 3 (Zero, control), type 4 (IMMEDIATE_8), type 7
++	 * (IMMEDIATE_64); each writes its own slot in the first data page. */
++	int wv_layout = 0;      /* 0 = midgard.xml offsets, 1 = herolte kernel offsets */
++	PE_parse_boot_argn("pragpu_wv", &wv_layout, sizeof(wv_layout));
++	static const uint32_t types[3] = { 3, 4, 7 };
++	static const uint64_t vals[3] = { 0, 0x5a, 0xdeadbeefcafebabeull };
++	for (unsigned i = 0; i < 3; i++) {
++		volatile uint8_t *job = (volatile uint8_t *)(g_mem + PG_DATA_OFF);
++		volatile uint64_t *out = (volatile uint64_t *)(g_mem + PG_DATA_OFF + PG_OUT_OFF + i * 0x40);
++		for (unsigned w = 0; w < 96; w++) {
++			job[w] = 0;
++		}
++		job[16] = 1 | (2 << 1);                 /* 64-bit descriptor | WRITE_VALUE << 1 */
++		*(volatile uint16_t *)(job + 18) = 1;   /* index 1 */
++		*(volatile uint64_t *)(job + 32) = PG_TEST_VA + PG_OUT_OFF + i * 0x40;  /* Address */
++		if (wv_layout == 0) {
++			*(volatile uint32_t *)(job + 48) = types[i];            /* Type @ payload byte 16 */
++			*(volatile uint64_t *)(job + 64) = vals[i];             /* Immediate @ payload byte 32 */
++		} else {
++			*(volatile uint32_t *)(job + 40) = types[i];            /* Type @ payload byte 8 (herolte 0226) */
++			*(volatile uint64_t *)(job + 48) = vals[i];             /* Immediate @ payload byte 16 */
++		}
++		*out = 0xa5a5a5a55a5a5a5aull;
++		__asm__ volatile ("dsb sy" ::: "memory");
++
++		/* AS0 (once) and JS1, as herolte 0226's hg_write_value_job(). */
++		uint64_t transtab = test_pa | 0x7;
++		pg_wr(g_gpu, AS0 + 0x00, (uint32_t)transtab);
++		pg_wr(g_gpu, AS0 + 0x04, (uint32_t)(transtab >> 32));
++		pg_wr(g_gpu, AS0 + 0x08, 0x888d88);
++		pg_wr(g_gpu, AS0 + 0x0c, 0);
++		pg_wr(g_gpu, AS0 + 0x18, 1);              /* AS_COMMAND_UPDATE */
++		unsigned w;
++		for (w = 0; w < 10000 && (pg_rd(g_gpu, AS0 + 0x28) & 1); w++) {
++			delay(10);
++		}
++		if (w == 10000) {
++			printf("PRAGPU: job %u: MMU update timeout, faultstatus=%#x\n",
++			    i, pg_rd(g_gpu, AS0 + 0x1c));
++			continue;
++		}
++		pg_wr(g_gpu, MMU_IRQ_CLEAR, 0x00010001);
++		pg_wr(g_gpu, JOB_IRQ_CLEAR, 0x00020002);
++		__asm__ volatile ("dsb sy" ::: "memory");       /* herolte 0247: chains in WC memory */
++		pg_wr(g_gpu, JS_BASE(1) + 0x40, (uint32_t)PG_TEST_VA);    /* HEAD_NEXT */
++		pg_wr(g_gpu, JS_BASE(1) + 0x44, 0);
++		pg_wr(g_gpu, JS_BASE(1) + 0x50, 1);               /* AFFINITY_NEXT: core 0 */
++		pg_wr(g_gpu, JS_BASE(1) + 0x54, 0);
++		pg_wr(g_gpu, JS_BASE(1) + 0x58, (8u << 16) | (3u << 8) | (3u << 12));
++		pg_wr(g_gpu, JS_BASE(1) + 0x60, 1);               /* COMMAND_NEXT = START */
++
++		uint32_t jirq = 0, mirq = 0, girq = 0;
++		for (w = 0; w < 20000; w++) {
++			jirq = pg_rd(g_gpu, JOB_IRQ_RAWSTAT);
++			mirq = pg_rd(g_gpu, MMU_IRQ_RAWSTAT);
++			girq = pg_rd(g_gpu, GPU_IRQ_RAWSTAT);
++			if ((jirq & ((1u << 1) | (1u << 17))) || mirq || (girq & 0x81)) {
++				break;
++			}
++			delay(10);
++		}
++		bool done = (jirq & (1u << 1)) && !(jirq & (1u << 17)) && !mirq && !(girq & 0x81);
++		printf("PRAGPU: job %u type %u layout %s: irq=%#x mmu=%#x g_gpu=%#x js_status=%#x "
++		    "as_fault=%#x exception=%#x out=%#llx (want %#llx) -> %s\n",
++		    i, types[i], wv_layout ? "herolte" : "xml", jirq, mirq, girq,
++		    pg_rd(g_gpu, JS_BASE(1) + 0x24), pg_rd(g_gpu, AS0 + 0x1c),
++		    *(volatile uint32_t *)job, *out, vals[i],
++		    done ? (*out == vals[i] ? "WROTE THE VALUE" : "ran, wrong value") : "failed or timed out");
++		if (jirq) {
++			pg_wr(g_gpu, JOB_IRQ_CLEAR, jirq);
++		}
++		if (mirq) {
++			pg_wr(g_gpu, MMU_IRQ_CLEAR, mirq);
++		}
++		if (girq) {
++			pg_wr(g_gpu, GPU_IRQ_CLEAR, girq);
++		}
++	}
++}
++
++/*
++ * Read the ID and feature registers and measure the clock. Herolte checked a
++ * PMU register before any GPU read; hi6250 has no known one, so this runs
++ * only under pragpu=1 and its first GPU read IS the power-state answer:
++ * either the registers read (block on, clocked), or the access hangs the bus
++ * (block gated) - which, once reproduced, is itself the data the next stage
++ * needs (then the LPM3 IPC has to be driven before any GPU MMIO).
++ */
++static void
++pg_probe(const char *when)
++{
++	static vm_offset_t gpu;
++	if (!gpu) {
++		gpu = ml_io_map(PG_GPU_PA, PG_GPU_BYTES);
++	}
++	if (!gpu) {
++		printf("PRAGPU: %s: MMIO map of %#x failed\n", when, PG_GPU_PA);
++		return;
++	}
++
++	uint32_t id = pg_rd(gpu, GPU_ID);
++	printf("PRAGPU: %s: GPU_ID=%#x product %#x (0x830 = Mali-T830) rev r%up%u\n",
++	    when, id, id >> 16, (id >> 12) & 0xf, (id >> 4) & 0xff);
++	printf("PRAGPU: L2_FEATURES=%#x CORE=%#x TILER=%#x MEM=%#x MMU=%#x AS=%#x JS=%#x\n",
++	    pg_rd(gpu, L2_FEATURES), pg_rd(gpu, CORE_FEATURES), pg_rd(gpu, TILER_FEATURES),
++	    pg_rd(gpu, MEM_FEATURES), pg_rd(gpu, MMU_FEATURES), pg_rd(gpu, AS_PRESENT),
++	    pg_rd(gpu, JS_PRESENT));
++	uint32_t shaders = pg_rd(gpu, SHADER_PRESENT_LO);
++	printf("PRAGPU: present shader=%#x (MP%u if each bit is a core) tiler=%#x l2=%#x; "
++	    "ready shader=%#x tiler=%#x l2=%#x\n",
++	    shaders, shaders ? __builtin_popcount(shaders) : 0,
++	    pg_rd(gpu, TILER_PRESENT_LO), pg_rd(gpu, L2_PRESENT_LO),
++	    pg_rd(gpu, SHADER_READY_LO), pg_rd(gpu, TILER_READY_LO), pg_rd(gpu, L2_READY_LO));
++	printf("PRAGPU: MAX_THREADS=%#x THREAD_FEATURES=%#x TEXTURE_FEATURES0=%#x "
++	    "COHERENCY_FEATURES=%#x (0 = GPU does not snoop CPU caches)\n",
++	    pg_rd(gpu, MAX_THREADS), pg_rd(gpu, THREAD_FEATURES),
++	    pg_rd(gpu, TEXTURE_FEATURES0), pg_rd(gpu, COHERENCY_FEATURES));
++	printf("PRAGPU: GPU_STATUS=%#x IRQ_RAWSTAT=%#x; no jobs submitted\n",
++	    pg_rd(gpu, GPU_STATUS), pg_rd(gpu, GPU_IRQ_RAWSTAT));
++
++	/* Live clock via the GPU cycle counter (herolte hg_clock_report()). */
++	pg_wr(gpu, GPU_COMMAND, 5);                     /* CYCLE_COUNT_START */
++	delay(100);
++	uint64_t c0 = pg_rd(gpu, CYCLE_COUNT_LO) | ((uint64_t)pg_rd(gpu, CYCLE_COUNT_HI) << 32);
++	uint64_t t0 = mach_absolute_time();
++	delay(20000);
++	uint64_t c1 = pg_rd(gpu, CYCLE_COUNT_LO) | ((uint64_t)pg_rd(gpu, CYCLE_COUNT_HI) << 32);
++	uint64_t us = pg_us_since(t0);
++	pg_wr(gpu, GPU_COMMAND, 6);                     /* CYCLE_COUNT_STOP */
++	printf("PRAGPU: clock: %llu cycles in %llu us -> %llu MHz "
++	    "(DT OPP range 120-900 MHz, dtsi:11-20)\n",
++	    c1 - c0, us, us ? (c1 - c0) / us : 0);
++}
++
++static void
++pg_thread(void *arg, __unused wait_result_t wr)
++{
++	int mode = (int)(uintptr_t)arg;
++	/* Once early, once after the UI is up (in case something changed it),
++	 * exactly like herolte's 5 s / 60 s pair. */
++	pg_msleep(5000);
++	pg_probe("5s");
++	pg_msleep(55000);
++	pg_probe("60s");
++	if (mode >= 2) {
++		/* pg_mtx (0005): the GPU present path (sweetfb_gpu=1) can be
++		 * running while the stage jobs execute. */
++		lck_mtx_lock(pg_mtx);
++		pg_write_value_job();
++		if (mode >= 3) {
++			pg_fragment_clear();
++		}
++		/* Cores up across every job stage, then off once (herolte hg_jobs():
++		 * one hg_cores_on() for all its tests, one hg_cores_off() after).
++		 * 0003 powered off at the end of stage 2, so with pragpu=3 the
++		 * fragment job would have started on powered-off cores. But the
++		 * GPU present path (0005) leaves the cores on for good once it is
++		 * up - do not pull them from under its frames. */
++		if (pg_present_active) {
++			printf("PRAGPU: cores left on (GPU present active)\n");
++		} else {
++			pg_wr(g_gpu, TILER_PWROFF_LO, pg_rd(g_gpu, TILER_READY_LO));
++			pg_wr(g_gpu, SHADER_PWROFF_LO, pg_rd(g_gpu, SHADER_READY_LO));
++			pg_wr(g_gpu, L2_PWROFF_LO, pg_rd(g_gpu, L2_READY_LO));
++			printf("PRAGPU: cores powered off\n");
++		}
++		lck_mtx_unlock(pg_mtx);
++	}
++}
++
++void
++prague_gpu_probe(void)
++{
++	int enabled = 0;        /* default OFF: first GPU read may hang if the LPM3 has the domain gated */
++	PE_parse_boot_argn("pragpu", &enabled, sizeof(enabled));
++	/* (0007) sleep-while-waiting knobs; parsed even with pragpu=0 so the
++	 * GPU present / PragueGPU paths (which never enable pragpu) get them. */
++	PE_parse_boot_argn("pragpu_sleep_us", &pg_sleep_us, sizeof(pg_sleep_us));
++	PE_parse_boot_argn("pragpu_sleep_present", &pg_sleep_present, sizeof(pg_sleep_present));
++	if (!enabled) {
++		return;
++	}
++	thread_t thread;
++	if (kernel_thread_start(pg_thread, (void *)(uintptr_t)enabled, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_PRA */
+diff --git a/iokit/Kernel/arm/PragueGPU.cpp b/iokit/Kernel/arm/PragueGPU.cpp
+new file mode 100644
+index 0000000..0078cda
+--- /dev/null
++++ b/iokit/Kernel/arm/PragueGPU.cpp
+@@ -0,0 +1,548 @@
++/*
++ * PragueGPU: the PRA-LX1's Mali-T830 MP2 for user space, the kernel half of
++ * a Panfrost-style driver (Mesa's Panfrost/Midgard in an iOS process) - the
++ * 0239 herolte HeroGPU analog, renamed and pointed at bsd/dev/prague_gpu.c.
++ * The selector set and the Panfrost param table are unchanged, so
++ * gpu/mesa/herodrm.c (the libdrm stand-in) needs only its IOServiceMatching
++ * name changed to "PragueGPU" (0004-notes-userspace-mesa-eagl.md section 1).
++ *
++ * The GPU itself is driven by bsd/dev/prague_gpu.c (power-up, page tables,
++ * job slots; one address space, jobs run one at a time, polled). This file
++ * is the IOKit face: IOServiceMatching("PragueGPU"), open type 0, then
++ *
++ *   0 GetParam    [param]           -> [value]   Panfrost DRM param numbers
++ *   1 CreateBO    [size]            -> [handle, gpu_va, size]
++ *   2 FreeBO      [handle]
++ *   3 MapBO       [handle]          -> [user address]  (write-combined)
++ *   4 Submit      [jc_va, js]       -> [status, us]    js 0 fragment, 1 the rest
++ *   5 Log         struct: text      (to the kernel log; test programs)
++ *   6 SurfaceBO   [IOSurface id]    -> [handle, gpu_va, size, bytes per row, width,
++ *                                       height, pixel format, offset, planes]
++ *   7 SyncBO      [handle]          clean+invalidate an imported surface's CPU caches
++ *
++ * Buffers are wired kernel buffers mapped noncached on the GPU side; the
++ * Mali is not IO-coherent, so the CPU sees them write-combined only (their
++ * cacheable kernel alias is cleaned once, after zeroing, and never used
++ * again). Submit is synchronous: status 0 = the chain finished cleanly,
++ * else the job slot's status. Everything a client created goes away with it.
++ *
++ * Boot-arg pragpu_selftest=1 runs a WRITE_VALUE job through these same
++ * paths about 70 s after boot (log: "PRAGPU SELFTEST"). The payload uses
++ * the midgard.xml offsets (Type at payload byte 16, the layout 0002's
++ * pragpu_wv experiment defaults to), not herolte's kernel layout.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_PRA)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++#include "SweetSurface.h"
++
++extern "C" {
++bool prague_gpu_up(void);
++uint32_t prague_gpu_reg(uint32_t off);
++uint64_t prague_gpu_va_alloc(uint64_t bytes);
++bool prague_gpu_map(uint64_t va, const uint64_t *pages, unsigned n);
++void prague_gpu_unmap(uint64_t va, unsigned n);
++uint32_t prague_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
++}
++
++enum {
++	kPragueGPUGetParam = 0,
++	kPragueGPUCreateBO = 1,
++	kPragueGPUFreeBO   = 2,
++	kPragueGPUMapBO    = 3,
++	kPragueGPUSubmit   = 4,
++	kPragueGPULog      = 5,
++	kPragueGPUSurfaceBO = 6,
++	kPragueGPUSyncBO   = 7,
++};
++
++#define PRAGUEGPU_MAX_BOS       4096
++#define PRAGUEGPU_MAX_BO_BYTES  (256ull << 20)
++
++/* Panfrost DRM_PANFROST_PARAM_* -> Midgard register offsets. */
++static uint32_t
++praguegpu_param_reg(uint64_t param)
++{
++	static const uint16_t regs[] = {
++		0x000,  /* 0 GPU_PROD_ID (GPU_ID >> 16, below) */
++		0x000,  /* 1 GPU_REVISION (GPU_ID & 0xffff, below) */
++		0x100,  /* 2 SHADER_PRESENT */
++		0x110,  /* 3 TILER_PRESENT */
++		0x120,  /* 4 L2_PRESENT */
++		0xe00,  /* 5 STACK_PRESENT */
++		0x018,  /* 6 AS_PRESENT */
++		0x01c,  /* 7 JS_PRESENT */
++		0x004,  /* 8 L2_FEATURES */
++		0x008,  /* 9 CORE_FEATURES */
++		0x00c,  /* 10 TILER_FEATURES */
++		0x010,  /* 11 MEM_FEATURES */
++		0x014,  /* 12 MMU_FEATURES */
++		0x0ac,  /* 13 THREAD_FEATURES */
++		0x0a0,  /* 14 MAX_THREADS */
++		0x0a4,  /* 15 THREAD_MAX_WORKGROUP_SZ */
++		0x0a8,  /* 16 THREAD_MAX_BARRIER_SZ */
++		0x300,  /* 17 COHERENCY_FEATURES */
++		0x0b0, 0x0b4, 0x0b8, 0x0bc,     /* 18-21 TEXTURE_FEATURES0-3 */
++	};
++	if (param < sizeof(regs) / sizeof(regs[0])) {
++		return regs[param];
++	}
++	if (param >= 22 && param < 38) {
++		return 0x0c0 + (uint32_t)(param - 22) * 4;     /* JS_FEATURES0-15 */
++	}
++	return ~0u;
++}
++
++static uint64_t
++praguegpu_param(uint64_t param)
++{
++	uint32_t id = prague_gpu_reg(0x000);
++	switch (param) {
++	case 0:
++		return id >> 16;
++	case 1:
++		return id & 0xffff;
++	case 38:        /* NR_CORE_GROUPS: one L2 */
++		return 1;
++	case 39:        /* THREAD_TLS_ALLOC: none before v7 */
++		return 0;
++	case 40:        /* AFBC_FEATURES: v7+ only */
++		return 0;
++	}
++	uint32_t reg = praguegpu_param_reg(param);
++	return reg == ~0u ? 0 : prague_gpu_reg(reg);
++}
++
++struct praguegpu_bo {
++	IOBufferMemoryDescriptor *mem;          /* own buffer, or NULL for an imported surface */
++	SweetSurface             *surface;      /* imported IOSurface (retained), or NULL */
++	IOMemoryMap              *umap;
++	uint64_t                  va;
++	uint32_t                  pages;
++};
++
++static bool
++praguegpu_bo_used(const struct praguegpu_bo *bo)
++{
++	return bo->mem != NULL || bo->surface != NULL;
++}
++
++static IOMemoryDescriptor *
++praguegpu_bo_memory(const struct praguegpu_bo *bo)
++{
++	return bo->mem != NULL ? (IOMemoryDescriptor *)bo->mem :
++	       bo->surface != NULL ? bo->surface->memory : NULL;
++}
++
++/* Clean and invalidate the CPU caches over a surface's pixels (the Mali is
++ * not IO-coherent). */
++static void
++praguegpu_surface_sync(SweetSurface *s)
++{
++	uintptr_t k = s->kernelAddress();
++	if (k == 0) {
++		return;
++	}
++	for (uintptr_t p = k & ~(uintptr_t)63; p < k + s->allocSize; p += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * Map IOSurface `id`'s pixels into the GPU (the EAGL shim's GPU blit into
++ * backboardd's display surfaces). Kernel-allocated and physical surfaces
++ * only: wrapped client memory is not a SweetSurface buffer the GPU may
++ * write. The surface stays retained until the BO is freed.
++ */
++static bool
++praguegpu_bo_import_surface(struct praguegpu_bo *bo, uint32_t id)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL || s->memory == NULL || s->allocSize == 0) {
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	uint64_t size = ((uint64_t)s->allocSize + 0xfff) & ~0xfffull;
++	if (size > s->memory->getLength() || size > PRAGUEGPU_MAX_BO_BYTES) {
++		s->release();
++		return false;
++	}
++	bo->pages = (uint32_t)(size / 0x1000);
++	uint64_t *pa = (uint64_t *)IOMallocData(bo->pages * sizeof(uint64_t));
++	bool ok = pa != NULL;
++	for (uint32_t i = 0; ok && i < bo->pages; i++) {
++		IOByteCount len = 0;
++		pa[i] = s->memory->getPhysicalSegment((IOByteCount)i * 0x1000, &len, kIOMemoryMapperNone);
++		ok = pa[i] != 0 && (pa[i] & 0xfff) == 0;
++	}
++	bo->va = ok ? prague_gpu_va_alloc(size) : 0;
++	ok = bo->va != 0 && prague_gpu_map(bo->va, pa, bo->pages);
++	if (pa != NULL) {
++		IOFreeData(pa, bo->pages * sizeof(uint64_t));
++	}
++	if (!ok) {
++		if (bo->va != 0) {
++			prague_gpu_unmap(bo->va, bo->pages);    /* and its VA */
++		}
++		s->release();
++		bo->va = 0;
++		bo->pages = 0;
++		return false;
++	}
++	/* Dirty CPU lines written back later would land over the GPU's pixels. */
++	praguegpu_surface_sync(s);
++	bo->surface = s;
++	return true;
++}
++
++/* Allocate, zero, clean and GPU-map a buffer. */
++static bool
++praguegpu_bo_create(struct praguegpu_bo *bo, uint64_t size)
++{
++	size = (size + 0xfff) & ~0xfffull;
++	if (size == 0 || size > PRAGUEGPU_MAX_BO_BYTES) {
++		return false;
++	}
++	bo->mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
++	if (bo->mem == NULL) {
++		return false;
++	}
++	uintptr_t k = (uintptr_t)bo->mem->getBytesNoCopy();
++	bzero((void *)k, size);
++	for (uintptr_t p = k & ~(uintptr_t)63; p < k + size; p += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bo->pages = (uint32_t)(size / 0x1000);
++	uint64_t *pa = (uint64_t *)IOMallocData(bo->pages * sizeof(uint64_t));
++	bool ok = pa != NULL;
++	for (uint32_t i = 0; ok && i < bo->pages; i++) {
++		IOByteCount len = 0;
++		pa[i] = bo->mem->getPhysicalSegment((IOByteCount)i * 0x1000, &len, kIOMemoryMapperNone);
++		ok = pa[i] != 0;
++	}
++	bo->va = ok ? prague_gpu_va_alloc(size) : 0;
++	ok = bo->va != 0 && prague_gpu_map(bo->va, pa, bo->pages);
++	if (pa != NULL) {
++		IOFreeData(pa, bo->pages * sizeof(uint64_t));
++	}
++	if (!ok) {
++		if (bo->va != 0) {
++			prague_gpu_unmap(bo->va, bo->pages);    /* and its VA */
++		}
++		OSSafeReleaseNULL(bo->mem);
++		bo->va = 0;
++	}
++	return ok;
++}
++
++static void
++praguegpu_bo_free(struct praguegpu_bo *bo)
++{
++	if (!praguegpu_bo_used(bo)) {
++		return;
++	}
++	prague_gpu_unmap(bo->va, bo->pages);
++	OSSafeReleaseNULL(bo->umap);
++	OSSafeReleaseNULL(bo->mem);
++	OSSafeReleaseNULL(bo->surface);
++	bzero(bo, sizeof(*bo));
++}
++
++class PragueGPU : public IOService {
++	OSDeclareDefaultStructors(PragueGPU);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PragueGPU, IOService);
++
++/*
++ * QuartzCore polls for this class every 100 ms, up to 30 s, the first time a
++ * CoreGraphics IOSurface context flushes, and SpringBoard's main thread can
++ * end up behind that wait. It only checks that the service exists, so an
++ * empty one ends the wait. No user client: anything that tries to open it
++ * just fails.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++class PragueGPUUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(PragueGPUUserClient);
++
++	task_t             fTask;
++	IOLock            *fLock;
++	struct praguegpu_bo *fBOs;        /* handle = index + 1 */
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PragueGPUUserClient, IOUserClient);
++
++static void praguegpu_selftest(void *arg, wait_result_t wr);
++
++bool
++PragueGPU::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "PragueGPUUserClient");
++	setProperty("GPU", "Mali-T830 MP2");
++	registerService();
++	IOLog("PRAGPU: registered\n");
++	int accel = 1;
++	PE_parse_boot_argn("pragpuaccel", &accel, sizeof(accel));
++	if (accel) {
++		IOAcceleratorES *es = OSTypeAlloc(IOAcceleratorES);
++		if (es != NULL && es->init() && es->attach(this)) {
++			es->registerService();
++			IOLog("PRAGPU: IOAcceleratorES registered\n");
++		}
++		OSSafeReleaseNULL(es);
++	}
++	int selftest = 0;
++	thread_t thread;
++	if (PE_parse_boot_argn("pragpu_selftest", &selftest, sizeof(selftest)) && selftest &&
++	    kernel_thread_start(praguegpu_selftest, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	return true;
++}
++
++bool
++PragueGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fLock = IOLockAlloc();
++	fBOs = (struct praguegpu_bo *)IOMallocZeroData(PRAGUEGPU_MAX_BOS * sizeof(*fBOs));
++	return fLock != NULL && fBOs != NULL && prague_gpu_up();
++}
++
++IOReturn
++PragueGPUUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++PragueGPUUserClient::free(void)
++{
++	if (fBOs != NULL) {
++		for (unsigned i = 0; i < PRAGUEGPU_MAX_BOS; i++) {
++			praguegpu_bo_free(&fBOs[i]);
++		}
++		IOFreeData(fBOs, PRAGUEGPU_MAX_BOS * sizeof(*fBOs));
++		fBOs = NULL;
++	}
++	if (fLock != NULL) {
++		IOLockFree(fLock);
++		fLock = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++PragueGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	uint64_t out[9] = { 0 };
++	uint32_t outCount = 0;
++	IOReturn ret = kIOReturnSuccess;
++	uint64_t in0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++	uint64_t in1 = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;
++
++	IOLockLock(fLock);
++	switch (selector) {
++	case kPragueGPUGetParam:
++		out[0] = praguegpu_param(in0);
++		outCount = 1;
++		break;
++	case kPragueGPUCreateBO: {
++		unsigned i = 0;
++		while (i < PRAGUEGPU_MAX_BOS && praguegpu_bo_used(&fBOs[i])) {
++			i++;
++		}
++		if (i == PRAGUEGPU_MAX_BOS) {
++			ret = kIOReturnNoResources;
++		} else if (!praguegpu_bo_create(&fBOs[i], in0)) {
++			ret = kIOReturnNoMemory;
++		} else {
++			out[0] = i + 1;
++			out[1] = fBOs[i].va;
++			out[2] = (uint64_t)fBOs[i].pages * 0x1000;
++			outCount = 3;
++		}
++		break;
++	}
++	case kPragueGPUFreeBO:
++		if (in0 == 0 || in0 > PRAGUEGPU_MAX_BOS || !praguegpu_bo_used(&fBOs[in0 - 1])) {
++			ret = kIOReturnBadArgument;
++		} else {
++			praguegpu_bo_free(&fBOs[in0 - 1]);
++		}
++		break;
++	case kPragueGPUMapBO: {
++		struct praguegpu_bo *bo = in0 && in0 <= PRAGUEGPU_MAX_BOS ? &fBOs[in0 - 1] : NULL;
++		if (bo == NULL || !praguegpu_bo_used(bo)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (bo->umap == NULL) {
++			/* A surface keeps the cache mode its other mappings use. */
++			bo->umap = praguegpu_bo_memory(bo)->createMappingInTask(fTask, 0,
++			    kIOMapAnywhere | (bo->surface ? bo->surface->mapCache : kIOMapWriteCombineCache));
++		}
++		if (bo->umap == NULL) {
++			ret = kIOReturnNoMemory;
++		} else {
++			out[0] = bo->umap->getAddress();
++			outCount = 1;
++		}
++		break;
++	}
++	case kPragueGPUSubmit:
++		/*
++		 * Not under the client's lock: the call lasts as long as the job,
++		 * and gpu/mesa/herodrm.c queues jobs so that its other calls (log,
++		 * cache sync) go on meanwhile. The GPU has its own mutex (pg_mtx).
++		 */
++		IOLockUnlock(fLock);
++		out[0] = prague_gpu_submit(in1 ? 1 : 0, in0, &out[1]);
++		IOLockLock(fLock);
++		outCount = 2;
++		break;
++	case kPragueGPUSurfaceBO: {
++		unsigned i = 0;
++		while (i < PRAGUEGPU_MAX_BOS && praguegpu_bo_used(&fBOs[i])) {
++			i++;
++		}
++		if (i == PRAGUEGPU_MAX_BOS) {
++			ret = kIOReturnNoResources;
++		} else if (!praguegpu_bo_import_surface(&fBOs[i], (uint32_t)in0)) {
++			ret = kIOReturnNotFound;
++		} else {
++			SweetSurface *s = fBOs[i].surface;
++			out[0] = i + 1;
++			out[1] = fBOs[i].va;
++			out[2] = (uint64_t)fBOs[i].pages * 0x1000;
++			out[3] = s->bytesPerRow;
++			out[4] = s->width;
++			out[5] = s->height;
++			out[6] = s->pixelFormat;
++			out[7] = s->offset;
++			out[8] = s->planeCount;
++			outCount = 9;
++		}
++		break;
++	}
++	case kPragueGPUSyncBO: {
++		struct praguegpu_bo *bo = in0 && in0 <= PRAGUEGPU_MAX_BOS ? &fBOs[in0 - 1] : NULL;
++		if (bo == NULL || !praguegpu_bo_used(bo)) {
++			ret = kIOReturnBadArgument;
++		} else if (bo->surface != NULL) {
++			praguegpu_surface_sync(bo->surface);
++		}
++		break;
++	}
++	case kPragueGPULog:
++		/* Test programs have no console here: their lines go to the
++		 * kernel log (and the USERDATA log ring). */
++		if (args->structureInput != NULL && args->structureInputSize > 0) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("PRAGPU [%s]: %.*s\n", name,
++			    (int)(args->structureInputSize < 1024u ? args->structureInputSize : 1024u),
++			    (const char *)args->structureInput);
++		}
++		break;
++	default:
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(fLock);
++
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = i < outCount ? out[i] : 0;
++	}
++	static uint32_t logged;
++	if (selector < 32 && !(logged & (1u << selector))) {
++		logged |= 1u << selector;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("PRAGPU: %s sel %u in %u -> 0x%x\n", name, selector, args->scalarInputCount, ret);
++	}
++	return ret;
++}
++
++/*
++ * pragpu_selftest=1: a WRITE_VALUE job (64-bit zero over a canary) through
++ * the same buffer and submit paths a client uses. Payload in the
++ * midgard.xml layout (Type at payload byte 16 = job byte 48), which is what
++ * 0002's pragpu_wv experiment defaults to proving.
++ */
++static void
++praguegpu_selftest(__unused void *arg, __unused wait_result_t wr)
++{
++	IOSleep(70000);
++	if (!prague_gpu_up()) {
++		IOLog("PRAGPU SELFTEST: GPU not up\n");
++		return;
++	}
++	IOLog("PRAGPU SELFTEST: GPU_ID %#llx rev %#llx shaders %#llx tiler features %#llx "
++	    "texture features0 %#llx threads %llu\n", praguegpu_param(0), praguegpu_param(1),
++	    praguegpu_param(2), praguegpu_param(10), praguegpu_param(18), praguegpu_param(14));
++	struct praguegpu_bo bo;
++	bzero(&bo, sizeof(bo));
++	if (!praguegpu_bo_create(&bo, 0x10000)) {
++		IOLog("PRAGPU SELFTEST: buffer failed\n");
++		return;
++	}
++	/* Through a write-combined kernel mapping, as a client would. */
++	IOMemoryMap *map = bo.mem->createMappingInTask(kernel_task, 0,
++	    kIOMapAnywhere | kIOMapWriteCombineCache);
++	volatile uint8_t *job = map ? (volatile uint8_t *)map->getVirtualAddress() : NULL;
++	if (job == NULL) {
++		IOLog("PRAGPU SELFTEST: mapping failed\n");
++		praguegpu_bo_free(&bo);
++		return;
++	}
++	job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
++	*(volatile uint16_t *)(job + 18) = 1;           /* index */
++	*(volatile uint64_t *)(job + 32) = bo.va + 0x100;
++	*(volatile uint32_t *)(job + 48) = 3;           /* midgard.xml: Type at payload byte 16 (zero 64 bits) */
++	volatile uint64_t *output = (volatile uint64_t *)(job + 0x100);
++	*output = 0xa5a5a5a55a5a5a5aull;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint64_t us = 0;
++	uint32_t status = prague_gpu_submit(1, bo.va, &us);
++	IOLog("PRAGPU SELFTEST: buffer at GPU VA %#llx, status %#x in %llu us, output %#llx -> %s\n",
++	    bo.va, status, us, *output, status == 0 && *output == 0 ? "OK" : "FAILED");
++	map->release();
++	praguegpu_bo_free(&bo);
++}
++#endif /* ARM64_BOARD_CONFIG_PRA */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 05eca03..a7dbf45 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -53,6 +53,16 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++#if defined(ARM64_BOARD_CONFIG_PRA)
++/* bsd/dev/prague_gpu.c: the Mali-T830 scales a surface to the whole panel
++ * (the 0235 herolte analog; boot-arg sweetfb_gpu=1, the CPU row copy stays
++ * the fallback whenever the GPU path returns false). */
++extern "C" int prague_gpu_present_slot(uint32_t id, uint64_t first_pa);
++extern "C" int prague_gpu_present_map(uint32_t id, const uint64_t *pages, unsigned n);
++extern "C" bool prague_gpu_present_draw(int s, uint32_t off, uint32_t stride, uint32_t w, uint32_t h);
++#define SWEET_FB_GPU_MAX_PAGES 2048     /* one 8 MiB GPU slot */
++#endif
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -117,6 +127,9 @@ public:
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	bool          fGpu;             /* sweetfb_gpu: scaled by the Mali, bilinear */
++#endif
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+@@ -131,6 +144,9 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	bool gpuPresent(SweetSurface *s, int32_t sx, int32_t sy, int32_t w, int32_t h);
++#endif
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -202,6 +218,14 @@ AppleCLCD::start(IOService *provider)
+ #endif
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	/* sweetfb_gpu=1: full-screen frames go through the Mali instead
++	 * (bsd/dev/prague_gpu.c), bilinear; the CPU row copy stays the
++	 * fallback. */
++	int gpu = 0;
++	PE_parse_boot_argn("sweetfb_gpu", &gpu, sizeof(gpu));
++	fGpu = gpu != 0;
++#endif
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -473,6 +497,18 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++#if defined(ARM64_BOARD_CONFIG_PRA)
++		/* sweetfb_gpu=1: the Mali draws whole-screen frames scaled to the
++		 * panel (prague_gpu.c present slots); anything else keeps the CPU
++		 * copy. dx/dy are already panel coordinates here, and PRA presents
++		 * the native 1080x1920 panel (no logical scaling), so a full-screen
++		 * layer arrives at dx=dy=0 with the panel's size. */
++		if (src != 0 && bpe == 4 && fGpu && dx == 0 && dy == 0 &&
++		    w == (int32_t)fWidth && h == (int32_t)fHeight && gpuPresent(s, sx, sy, w, h)) {
++			s->release();
++			continue;
++		}
++#endif
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+@@ -662,4 +698,57 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	}
+ 	return ret;
+ }
++
++#if defined(ARM64_BOARD_CONFIG_PRA)
++/*
++ * sweetfb_gpu=1: the Mali draws the whole frame scaled to the panel
++ * (bsd/dev/prague_gpu.c, herolte 0235's gpuPresent). The surface is mapped
++ * into a GPU slot the first time it is shown (its pages; a slot is keyed by
++ * IOSurface id and first page). The Mali is not IO-coherent, so the frame
++ * is cleaned to the point of coherency first (dc cvac; herolte U:79-88 and
++ * the LINUX_HANDOFF section 15.5 non-coherency evidence for this SoC).
++ * Called only from present(), which the vsync timer serializes.
++ * False: use the CPU copy (also after 8 failures: the GPU stays off).
++ */
++bool
++AppleCLCD::gpuPresent(SweetSurface *s, int32_t sx, int32_t sy, int32_t w, int32_t h)
++{
++	static uint64_t pages[SWEET_FB_GPU_MAX_PAGES];
++	static uint32_t failures;
++	if (failures >= 8 || s->memory == NULL) {
++		return false;
++	}
++	IOByteCount len = 0;
++	addr64_t pa0 = s->memory->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++	int slot = pa0 ? prague_gpu_present_slot(s->id, pa0 & ~0xfffULL) : -1;
++	if (slot < 0 && pa0 != 0) {
++		unsigned n = (unsigned)((s->memory->getLength() + 0xfff) / 0x1000);
++		bool ok = n <= SWEET_FB_GPU_MAX_PAGES;
++		for (unsigned i = 0; ok && i < n; i++) {
++			addr64_t pa = s->memory->getPhysicalSegment((IOByteCount)i * 0x1000, &len,
++			    kIOMemoryMapperNone);
++			ok = pa != 0;
++			pages[i] = pa & ~0xfffULL;
++		}
++		slot = ok ? prague_gpu_present_map(s->id, pages, n) : -1;
++	}
++	if (slot < 0) {
++		failures++;
++		return false;
++	}
++	uint64_t off = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++	uintptr_t start = s->kernelAddress() + (uintptr_t)off;
++	uintptr_t end = start + (uintptr_t)(h - 1) * s->bytesPerRow + (uintptr_t)w * 4;
++	for (uintptr_t p = start & ~(uintptr_t)63; p < end; p += 64) {
++		__asm__ volatile ("dc cvac, %0" : : "r" (p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!prague_gpu_present_draw(slot, (uint32_t)off, s->bytesPerRow, (uint32_t)w, (uint32_t)h)) {
++		failures++;
++		return false;
++	}
++	return true;
++}
++#endif
++
+ #endif /* SWEET || A5XELTE */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 307f948..e33dbbf 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -107,6 +107,17 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
+ #endif
++#if defined(ARM64_BOARD_CONFIG_PRA)
++    /* bsd/dev/prague_gpu.c + PragueGPU.cpp (the 0239 herolte analog): the
++     * Mali-T830 service userland's Panfrost stack opens. Matched on
++     * IOResources like herolte's HeroGPU; clients do
++     * IOServiceMatching("PragueGPU"), open type 0. */
++    "   {"
++    "     'IOClass'         = PragueGPU;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = PragueGPU;"
++    "   },"
++#endif
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index d8a960c..cf289dc 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -74,6 +74,7 @@ extern void a5xelte_touch_probe(void);
+ #endif
+ #if defined(ARM64_BOARD_CONFIG_PRA)
+ extern void pra_emmc_probe(void);
++extern void prague_gpu_probe(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -804,6 +805,10 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	/* Mali-T830 read-only probe (bsd/dev/prague_gpu.c), boot-arg pragpu=1. */
++	prague_gpu_probe();
++#endif
+ 	{
+ 	uint32_t emmcprobe = 0;
+ 	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..fc07cef 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/PragueGPU.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
