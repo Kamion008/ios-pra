@@ -1,0 +1,374 @@
+pra: 0168 - emmctest=1 telemetry mode: one CMD23+CMD18 probe per request, always per-sector
+
+DRAFT (not committed; produced by the eMMC speed-work agent). STACKS ON
+0003 + 0004. Generated against the reconstructed CI-built tree (pristine
+xnu-8796.141.3 + 0001..0165 with pre-skips 0031/0041/0097/0099/0127/0129,
+GNU patch -p1 --fuzz=0, index lines stripped). Verify with GNU
+`patch -p1 --fuzz=0 --dry-run`, NOT git apply.
+
+PROBLEM: the CMD23+CMD18 question (does SET_BLOCK_COUNT close the stream
+on this Arasan+card, or does the 0162-class wedge return through the CMD23
+door?) needs per-chunk forensics from a REAL boot. emmcmulti=1 collects it
+but risks the boot (latch caps it at 2 strikes - evidence, then per-sector
+for the rest of the boot, with the ladder never climbed past the first
+failure). There was no way to sample multi behaviour continuously while
+guaranteeing multi never stays on.
+
+CHANGES - boot-arg emmctest=1 (default OFF; without it the boot is
+byte-identical to the 0004 state):
+
+- On the FIRST whole-sector read of >= 2 sectors of every strategy
+  request, strat attempts ONE CMD23+CMD18 chunk at the current ladder
+  rung, REGARDLESS of the latch (pra_emmc_multi_ok stays false all boot;
+  fail_run untouched). The probe's data is DISCARDED - the request then
+  reads the same sectors through the proven per-sector CMD17 path - so
+  even a subtly corrupt stream (the 0142 stale-FIFO class) cannot reach
+  the filesystem. Zero boot risk by construction.
+- The ladder rung still climbs on probe success and resets on probe
+  failure, so one boot covers every rung 2..128: if the wedge is
+  rung-dependent (a stream that survives 2 sectors but wedges at 64), the
+  telemetry will show exactly where.
+- Any probe failure runs the escalated pra_emmc_recover() (0004: a/b/c)
+  and one rate-limited strat ring flush (0003), then the request
+  continues per-sector - the lifeline survives.
+- Full per-chunk telemetry, one line: rung (sectors), err, stage
+  (0 ok / 1 CMD23 / 2 CMD18 command / 3 block / 4 transfer-complete /
+  5 busy-at-entry), last status word, first failing block, recovery
+  level recover() reached, elapsed us, running totals
+  (chunks/ok/fail). First 32 lines always print (covers the ladder
+  climb); afterwards at most one line per 10 s with a suppressed count -
+  a wedged probe per request cannot flood the console.
+- read_multi records pra_emmc_multi_stage/stage_block at every phase
+  exit (cheap, unconditional - also improves the 0003 failure line's
+  evidence for future forensics).
+
+WHAT A WEDGE WOULD LOOK LIKE (emmctest=1): "test chunk ... err=EIO
+stage=1 status=..." (CMD23 rejected - card does not take SET_BLOCK_COUNT)
+or "err=EBUSY stage=3 block=N" mid-drain then "recover(a) STILL BUSY" +
+"recover(b) ...", "recover(c) ..." - i.e. the 0162 signature returning
+through the CMD23 door, with the status words the 0162 boots lost.
+Success shape: "test chunk ... err=0 stage=0" with sectors climbing
+2 -> 128 and the request still completing per-sector.
+
+COST: every whole-sector request >= 1 KiB pays one extra chunk attempt
+(2 sectors ~ 0.4 ms at PIO rates, more on a failing card) plus - on probe
+failure - one bounded recover. The boot gets slower; it never gets dead.
+Do not ship this mode with a release image: it is a diagnostics boot.
+
+DEFAULT BOOT (no emmctest arg): byte-identical - the only unconditional
+code changes are stage/status bookkeeping inside read_multi's existing
+error paths (stores to statics, no prints, no IO).
+
+---
+ bsd/dev/pra_sdhci.c | 14 hunks
+---
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -58,6 +58,19 @@
+  * when per-sector reads are already dead, so it cannot make a live boot
+  * worse - and every level prints its outcome.
+  *
++ * Telemetry mode (0005): boot-arg emmctest=1 is the zero-risk forensics
++ * experiment. On the FIRST whole-sector read of at least 2 sectors of every
++ * strategy request, strat attempts ONE CMD23+CMD18 chunk at the current
++ * ladder rung regardless of the latch, with full per-chunk telemetry (rung,
++ * stage and status after CMD23 and after CMD18, first failing block, wait/
++ * recover outcome, elapsed us), and then ALWAYS finishes that request on the
++ * per-sector path - the probe chunk's data is discarded, so even a subtly
++ * corrupt multi-block stream (the 0142 failure class) can never reach the
++ * filesystem. pra_emmc_multi_ok stays false for the whole boot; nothing in
++ * this mode can turn multi on. The ladder rung still climbs on success and
++ * resets on failure, so a full boot covers every rung 2..128 - the data the
++ * CMD23 wedge root-cause needs, collected on a real boot at zero boot risk.
++ *
+  * The UART is gated by EL3 and the framebuffer console wraps around, so the
+  * last lines of a hung boot are lost. Boot-arg pralog=1 keeps console output
+  * in a 4 MiB ring and flushes it every 10 s to the tail of the unused
+@@ -190,6 +203,16 @@
+  * non-EBUSY errno = command/response timeout, DAT/CMD inhibit bits set =
+  * the card is still mid-stream, the 0162 wedge signature). */
+ static uint32_t pra_emmc_multi_last_status;
++/* emmctest=1 telemetry (0005): which phase a chunk reached - 0 ok,
++ * 1 CMD23, 2 CMD18 command, 3 block data, 4 transfer-complete, 5 busy at
++ * entry (no chunk command was sent) - and the first failing block. The
++ * strat telemetry line reads both. */
++static uint32_t pra_emmc_multi_stage;
++static uint32_t pra_emmc_multi_stage_block;
++static bool pra_emmc_test_mode;
++static uint32_t pra_emmc_test_chunks, pra_emmc_test_ok, pra_emmc_test_fail;
++static uint32_t pra_emmc_test_lines, pra_emmc_test_suppressed;
++static uint64_t pra_emmc_test_print_at;
+ static uint8_t pra_emmc_multi_buf[PRA_MULTI_MAX * 512u] __attribute__((aligned(64)));
+ static bool pra_emmc_stats;
+ static uint64_t pra_emmc_stat_bytes, pra_emmc_stat_cmds, pra_emmc_stat_ns;
+@@ -520,6 +543,8 @@
+ 	if (pra_emmc_wait_ready()) {
+ 		pra_emmc_multi_last_status =
+ 		    pra_emmc_rd32(SDHCI_PRESENT_STATE) & 0x3u;
++		pra_emmc_multi_stage = 5;
++		pra_emmc_multi_stage_block = 0;
+ 		pra_emmc_busy_note("reads", lba);
+ 		return EBUSY;
+ 	}
+@@ -561,12 +586,14 @@
+ 		if (error) {
+ 			printf("PRA eMMC: CMD23 lba=%u status=%x\n", lba, status);
+ 			pra_emmc_multi_last_status = status;
++			pra_emmc_multi_stage = 1;
+ 			goto out;
+ 		}
+ 		if (pra_emmc_rd32(SDHCI_RESPONSE0) & 0xfdffe008u) {
+ 			printf("PRA eMMC: CMD23 lba=%u card error r1=%x\n",
+ 			    lba, pra_emmc_rd32(SDHCI_RESPONSE0));
+ 			pra_emmc_multi_last_status = pra_emmc_rd32(SDHCI_RESPONSE0);
++			pra_emmc_multi_stage = 1;
+ 			error = EIO;
+ 			goto out;
+ 		}
+@@ -589,11 +616,13 @@
+ 	if (error) {
+ 		printf("PRA eMMC: CMD18 lba=%u command error status=%x\n", lba, status);
+ 		pra_emmc_multi_last_status = status;
++		pra_emmc_multi_stage = 2;
+ 		goto out;
+ 	}
+ 	if (!(status & NORMAL_CMD_COMPLETE)) {
+ 		printf("PRA eMMC: CMD18 lba=%u command timeout status=%x\n", lba, status);
+ 		pra_emmc_multi_last_status = status;
++		pra_emmc_multi_stage = 2;
+ 		error = ETIMEDOUT;
+ 		goto out;
+ 	}
+@@ -601,6 +630,7 @@
+ 		printf("PRA eMMC: CMD18 lba=%u card error r1=%x\n",
+ 		    lba, pra_emmc_rd32(SDHCI_RESPONSE0));
+ 		pra_emmc_multi_last_status = pra_emmc_rd32(SDHCI_RESPONSE0);
++		pra_emmc_multi_stage = 2;
+ 		error = EIO;
+ 		goto out;
+ 	}
+@@ -626,6 +656,8 @@
+ 			printf("PRA eMMC: CMD18 lba=%u block %u status=%x\n",
+ 			    lba, b, status);
+ 			pra_emmc_multi_last_status = status;
++			pra_emmc_multi_stage = 3;
++			pra_emmc_multi_stage_block = b;
+ 			goto out;
+ 		}
+ 		if (pra_emmc_stats && b == 0) {
+@@ -665,6 +697,7 @@
+ 	if (error) {
+ 		printf("PRA eMMC: CMD18 lba=%u transfer status=%x\n", lba, status);
+ 		pra_emmc_multi_last_status = status;
++		pra_emmc_multi_stage = 4;
+ 		goto out;
+ 	}
+ 	if (pra_emmc_stats) {
+@@ -675,6 +708,8 @@
+ 		pra_emmc_stat_rread_ops += nblocks;
+ 	}
+ 	pra_emmc_multi_last_status = 0;
++	pra_emmc_multi_stage = 0;
++	pra_emmc_multi_stage_block = 0;
+ 
+ out:
+ 	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
+@@ -2020,6 +2055,21 @@
+ 			    "is per-sector)\n");
+ 		}
+ 	}
++	/* emmctest=1 (0005): probe one CMD23+CMD18 chunk per request with full
++	 * telemetry, then always fall back to per-sector. Never combined with
++	 * emmcmulti=1 - that path already prints everything and latches; the
++	 * telemetry mode exists for boots where multi must stay OFF. */
++	int test = 0;
++	if (PE_parse_boot_argn("emmctest", &test, sizeof(test)) && test == 1) {
++		if (pra_emmc_multi_ok) {
++			printf("PRA eMMC: emmctest=1 ignored, emmcmulti=1 "
++			    "already enables the chunk path\n");
++		} else {
++			pra_emmc_test_mode = true;
++			printf("PRA eMMC: emmctest=1 probe chunks on, multi "
++			    "stays off, probe data discarded\n");
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -2056,6 +2106,37 @@
+ static uint32_t pra_emmc_secsize = 512;
+ static uint8_t pra_emmc_bounce[512];
+ 
++/* One line per emmctest=1 probe chunk (0005): rung, which phase the chunk
++ * reached, its last status word, first failing block, the recovery level
++ * recover() escalated to, elapsed time. The first 32 chunks print
++ * unconditionally - that covers the ladder climb 2 -> 128 - afterwards at
++ * most one line per 10 s with the suppressed count: a wedged probe on
++ * every request must not flood the console; the running totals travel on
++ * every printed line. */
++static void
++pra_emmc_test_report(uint32_t lba, uint32_t sectors, int error,
++    uint64_t t_chunk)
++{
++	uint64_t now = mach_absolute_time();
++
++	if (pra_emmc_test_lines >= 32 && pra_emmc_test_print_at &&
++	    now - pra_emmc_test_print_at < 10ULL * 1920000ULL) {
++		pra_emmc_test_suppressed++;
++		return;
++	}
++	pra_emmc_test_print_at = now;
++	printf("PRA eMMC: test chunk lba=%u sectors=%u err=%d stage=%u "
++	    "status=%x block=%u rec=%d %lluus (chunks=%u ok=%u fail=%u)%s\n",
++	    lba, sectors, error, pra_emmc_multi_stage,
++	    pra_emmc_multi_last_status, pra_emmc_multi_stage_block,
++	    pra_emmc_recover_last_level,
++	    (now - t_chunk) * 1000000ull / 1920000ull,
++	    pra_emmc_test_chunks, pra_emmc_test_ok, pra_emmc_test_fail,
++	    pra_emmc_test_suppressed ? " (+more suppressed)" : "");
++	pra_emmc_test_lines++;
++	pra_emmc_test_suppressed = 0;
++}
++
+ static void
+ pra_emmc_strategy(buf_t bp)
+ {
+@@ -2064,6 +2145,7 @@
+ 	uint32_t count = buf_count(bp);
+ 	uint64_t bytes = pra_emmc_nsectors * 512u;
+ 	uint64_t off = 0;
++	bool probed = false;
+ 	buf_setresid(bp, count);
+ 	if (!pra_emmc_ready) {
+ 		error = ENXIO;
+@@ -2095,19 +2177,49 @@
+ 		uint32_t lba = (uint32_t)(pra_emmc_first_lba + pos / 512u);
+ 		/* Whole sectors on a sector boundary go out as one CMD23+CMD18,
+ 		 * sized by the ladder: 2 sectors first, one rung per success up
+-		 * to PRA_MULTI_MAX, every gain printed. Only reached with
+-		 * emmcmulti=1 (multi defaults off after 0162/0162b). A failed
+-		 * chunk resets the ladder, runs a line recovery, and finishes
+-		 * this request on the per-sector path; two consecutive failed
+-		 * chunks latch the whole path off for the boot. The first
+-		 * failure therefore costs one small command, not the boot. */
+-		if (is_read && pra_emmc_multi_ok && skip == 0 &&
+-		    count - n >= 1024u) {
++		 * to PRA_MULTI_MAX, every gain printed. Reached with
++		 * emmcmulti=1, or - probe-only, once per request - with
++		 * emmctest=1 (0005). A failed chunk resets the ladder, runs a
++		 * line recovery, and finishes this request on the per-sector
++		 * path; two consecutive failed chunks latch the whole path off
++		 * for the boot. The first failure therefore costs one small
++		 * command, not the boot. */
++		if (is_read &&
++		    (pra_emmc_multi_ok || (pra_emmc_test_mode && !probed)) &&
++		    skip == 0 && count - n >= 1024u) {
+ 			uint32_t sectors = MIN((count - n) / 512u,
+ 			    pra_emmc_multi_ladder[pra_emmc_multi_rung]);
++			uint64_t t_chunk = mach_absolute_time();
+ 			error = pra_emmc_read_multi(lba, pra_emmc_multi_buf,
+ 			    sectors);
+-			if (!error) {
++			if (pra_emmc_test_mode && !pra_emmc_multi_ok) {
++				/* 0005 telemetry probe: recover the lines, keep
++				 * the rung state moving so the boot covers every
++				 * rung, report, then fall through to per-sector
++				 * for this sector - the probe data is discarded,
++				 * the latch state untouched. ANY probe failure
++				 * runs the escalated recovery so the per-sector
++				 * lifeline of this request survives. */
++				probed = true;
++				pra_emmc_test_chunks++;
++				if (!error) {
++					pra_emmc_test_ok++;
++					if (pra_emmc_multi_rung <
++					    PRA_MULTI_RUNGS - 1) {
++						pra_emmc_multi_rung++;
++					}
++				} else {
++					pra_emmc_test_fail++;
++					pra_emmc_recover();
++					pra_log_strat_flush(false);
++					if (pra_emmc_multi_rung != 0) {
++						pra_emmc_multi_rung = 0;
++					}
++				}
++				pra_emmc_test_report(lba, sectors, error,
++				    t_chunk);
++				error = 0;
++			} else if (!error) {
+ 				memcpy(vaddr + n, pra_emmc_multi_buf,
+ 				    (size_t)sectors * 512u);
+ 				cmds++;
+@@ -2122,36 +2234,42 @@
+ 					    pra_emmc_multi_rung]);
+ 				}
+ 				continue;
++			} else {
++				/* ANY failure counts, EBUSY included: a busy
++				 * card right after a chunk is the 0162/0162b
++				 * wedge signature (the card never stopped
++				 * streaming), not transience. Recover both
++				 * lines, count the strike, and after two
++				 * strikes leave multi for the boot -
++				 * per-sector CMD17 is the path every healthy
++				 * boot has used, so the fallback is the
++				 * known-good state, never a flood. The
++				 * failure line carries the chunk's last
++				 * status word (0003) and strat flushes the
++				 * ring tail itself (it holds the lock), so
++				 * the wedge forensics land on disk even if
++				 * the card is wedging right now and the
++				 * periodic flusher loses. */
++				pra_emmc_recover();
++				pra_emmc_multi_fail_run++;
++				printf("PRA eMMC: CMD18 %u-sector chunk failed "
++				    "(%d) status=%x; %u consecutive\n", sectors,
++				    error, pra_emmc_multi_last_status,
++				    pra_emmc_multi_fail_run);
++				pra_log_strat_flush(false);
++				if (pra_emmc_multi_fail_run >= 2) {
++					printf("PRA eMMC: CMD18 unavailable, "
++					    "falling back to 512-byte reads\n");
++					pra_emmc_multi_ok = false;
++					pra_log_strat_flush(true);
++				}
++				if (pra_emmc_multi_rung != 0) {
++					pra_emmc_multi_rung = 0;
++					printf("PRA eMMC: CMD18 ladder -> 2 "
++					    "sectors\n");
++				}
++				error = 0;
+ 			}
+-			/* ANY failure counts, EBUSY included: a busy card right
+-			 * after a chunk is the 0162/0162b wedge signature (the
+-			 * card never stopped streaming), not transience. Recover
+-			 * both lines, count the strike, and after two strikes
+-			 * leave multi for the boot - per-sector CMD17 is the
+-			 * path every healthy boot has used, so the fallback is
+-			 * the known-good state, never a flood. The failure line
+-			 * carries the chunk's last status word (0003) and strat
+-			 * flushes the ring tail itself (it holds the lock), so
+-			 * the wedge forensics land on disk even if the card is
+-			 * wedging right now and the periodic flusher loses. */
+-			pra_emmc_recover();
+-			pra_emmc_multi_fail_run++;
+-			printf("PRA eMMC: CMD18 %u-sector chunk failed (%d) "
+-			    "status=%x; %u consecutive\n", sectors, error,
+-			    pra_emmc_multi_last_status,
+-			    pra_emmc_multi_fail_run);
+-			pra_log_strat_flush(false);
+-			if (pra_emmc_multi_fail_run >= 2) {
+-				printf("PRA eMMC: CMD18 unavailable, falling "
+-				    "back to 512-byte reads\n");
+-				pra_emmc_multi_ok = false;
+-				pra_log_strat_flush(true);
+-			}
+-			if (pra_emmc_multi_rung != 0) {
+-				pra_emmc_multi_rung = 0;
+-				printf("PRA eMMC: CMD18 ladder -> 2 sectors\n");
+-			}
+-			error = 0;
+ 		}
+ 		if (is_read) {
+ 			error = pra_emmc_read_sector(lba, pra_emmc_bounce);

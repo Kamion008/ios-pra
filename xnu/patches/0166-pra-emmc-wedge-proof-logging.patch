@@ -1,0 +1,413 @@
+pra: 0166 - wedge-proof logging: strat flushes the ring itself on chunk failure
+
+DRAFT (not committed; produced by the eMMC speed-work agent, lives in
+research/driver-specs/emmc-work/). Generated against the reconstructed
+CI-built tree: pristine xnu-8796.141.3 + stack 0001..0165 with pre-skips
+0031/0041/0097/0099/0127/0129, GNU patch -p1 --fuzz=0 (index lines
+stripped). Verify with GNU `patch -p1 --fuzz=0 --dry-run`, NOT git apply
+(git 2.56 skip-detects already-applied hunks with rc=0).
+
+PROBLEM: every multi-block wedge so far destroyed its own evidence. The
+pralog flusher writes through the same strat path and shares pra_emmc_lock
+with strat, so a wedged card leaves ring N byte-identical to ring N-1
+(ring20/ring21) - the wedge forensics (which phase failed, which status
+word, did the lines ever clear) were lost three boots in a row.
+
+CHANGES:
+
+1. pra_log_panic_flush's core loop + header write refactored into
+   pra_log_flush_locked(start, blocks, total, seq), called with
+   pra_emmc_lock HELD. New pra_log_strat_flush(force) writes the newest
+   128 ring blocks (64 KiB tail) + header from strat's chunk-failure path
+   (strat already holds the lock) and again, force=true, when the 2-strike
+   latch fires. Bounded: on a healthy card ~0.2 s of writes; on a wedged
+   card the first write_raw fails EBUSY after its bounded ready-poll and
+   the attempt is one printed line. Rate-limited to one per 10 s with the
+   suppressed count carried on the next line; the latch flush bypasses the
+   limit (at most once per boot, terminal event).
+2. The periodic flusher's pra_log_write_sector switches lck_mtx_lock ->
+   lck_mtx_try_lock and returns EBUSY when strat owns the line: it skips
+   that sector this tick instead of queueing behind a strat request for
+   minutes. The existing EBUSY retry logic absorbs the new return path.
+3. Every CMD18 event prints with its forensics: the chunk-failure line
+   gains the chunk's last status word (pra_emmc_multi_last_status, set at
+   every read_multi exit; EBUSY exits carry the PRESENT_STATE CMD/DAT
+   inhibit bits instead); pra_emmc_recover() now reports whether the lines
+   actually released ("recover: CMD12+reset, CMD/DAT lines released /
+   STILL BUSY", rate-limited 1/10 s with a running recover count). Ladder
+   transitions already print (0164).
+4. pra_emmc_read_sector's busy exit now uses pra_emmc_busy_note() - the
+   0164-sized gap WORKLOG section 11 called out: the DEFAULT path was the
+   only one still printing card-busy at line rate. A healthy boot prints
+   nothing either way; a wedge boot now rate-limits like the multi path.
+5. pra_log_thread's header seq promoted to a file-scope pra_log_seq so the
+   strat flush writes headers in the same sequence space.
+
+DEFAULT BOOT: byte-identical behaviour unless the card misbehaves - every
+changed line is on a failure or busy path; the flusher try_lock only
+differs from lock when strat holds the lock, which the old code would have
+blocked on.
+
+STACKING: on top of 0164+0165. 0004/0005/0006 build on this patch.
+
+---
+ bsd/dev/pra_sdhci.c | 17 hunks
+---
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -34,6 +34,17 @@
+  * on a printed ladder (2 -> 8 -> 16 -> 32 -> 64 -> 128 sectors) so a wrong
+  * guess costs 1 KiB, never the boot.
+  *
++ * Wedge-proof logging (0003): ring20/ring21 both came back byte-identical to
++ * their predecessors because the wedged strat path starved the pralog
++ * flusher - it shares pra_emmc_lock with strat and writes through the same
++ * eMMC path, so a wedged card loses ALL log evidence. Now strat flushes the
++ * ring tail to disk itself whenever a CMD18 chunk fails and when multi
++ * latches off (strat already holds pra_emmc_lock, so the flush runs inline),
++ * the periodic flusher takes the lock with try_lock so it never blocks
++ * behind a strat request for more than one tick, and every chunk failure,
++ * ladder move and recovery reports whether the CMD/DAT lines actually
++ * cleared - the forensics the wedge boots lost.
++ *
+  * The UART is gated by EL3 and the framebuffer console wraps around, so the
+  * last lines of a hung boot are lost. Boot-arg pralog=1 keeps console output
+  * in a 4 MiB ring and flushes it every 10 s to the tail of the unused
+@@ -160,6 +171,12 @@
+ static bool pra_emmc_multi_cmd23;
+ static uint32_t pra_emmc_multi_rung;
+ static uint32_t pra_emmc_multi_fail_run;
++/* Last controller status word a CMD23+CMD18 chunk saw, kept for the strat
++ * failure line: the errno alone does not say WHICH phase timed out, and the
++ * status word does (SDHCI_ERROR_BITS high half = data-phase error, 0 with a
++ * non-EBUSY errno = command/response timeout, DAT/CMD inhibit bits set =
++ * the card is still mid-stream, the 0162 wedge signature). */
++static uint32_t pra_emmc_multi_last_status;
+ static uint8_t pra_emmc_multi_buf[PRA_MULTI_MAX * 512u] __attribute__((aligned(64)));
+ static bool pra_emmc_stats;
+ static uint64_t pra_emmc_stat_bytes, pra_emmc_stat_cmds, pra_emmc_stat_ns;
+@@ -332,7 +349,9 @@
+ 	uint64_t t_wait = pra_emmc_stats ? mach_absolute_time() : 0;
+ 
+ 	if (pra_emmc_wait_ready()) {
+-		printf("PRA eMMC: card busy, skip read lba=%u\n", lba);
++		/* busy_note, not a line-rate printf (the 0164 gap): the default
++		 * path must not become the next flood that starves the flusher. */
++		pra_emmc_busy_note("reads", lba);
+ 		return EBUSY;
+ 	}
+ 
+@@ -464,13 +483,33 @@
+  * 0162/0162b wedge signature is the card still mid-stream after the chunk
+  * (DAT held, every later command EBUSY until power cycle), so the order
+  * matters: CMD12 stops the card side first, the soft reset clears the
+- * controller side, then the ready wait confirms both lines released. */
++ * controller side, then the ready wait confirms both lines released - and
++ * the outcome is PRINTED, rate-limited like busy_note: whether the lines
++ * cleared after CMD12+reset is exactly the forensics the 0162 wedge boots
++ * never got (they lost the whole ring instead). */
++static uint64_t pra_emmc_recover_count;
++static uint64_t pra_emmc_recover_print_at;
++
+ static void
+ pra_emmc_recover(void)
+ {
++	bool released;
++
+ 	pra_emmc_stop_transfer();
+ 	pra_emmc_abort_data();
+-	(void)pra_emmc_wait_ready();
++	released = pra_emmc_wait_ready() == 0;
++	pra_emmc_multi_last_status =
++	    released ? 0 : pra_emmc_rd32(SDHCI_PRESENT_STATE) & 0x3u;
++	pra_emmc_recover_count++;
++	if (pra_emmc_recover_print_at &&
++	    mach_absolute_time() - pra_emmc_recover_print_at <
++	    10ULL * 1920000ULL) {
++		return;
++	}
++	pra_emmc_recover_print_at = mach_absolute_time();
++	printf("PRA eMMC: recover: CMD12+reset, CMD/DAT lines %s "
++	    "(recover=%llu)\n",
++	    released ? "released" : "STILL BUSY", pra_emmc_recover_count);
+ }
+ 
+ /* One CMD23+CMD18 for up to PRA_MULTI_MAX sectors. CMD23 tells the CARD how
+@@ -495,6 +534,8 @@
+ 	uint64_t t_wait = pra_emmc_stats ? mach_absolute_time() : 0;
+ 
+ 	if (pra_emmc_wait_ready()) {
++		pra_emmc_multi_last_status =
++		    pra_emmc_rd32(SDHCI_PRESENT_STATE) & 0x3u;
+ 		pra_emmc_busy_note("reads", lba);
+ 		return EBUSY;
+ 	}
+@@ -535,11 +576,13 @@
+ 		}
+ 		if (error) {
+ 			printf("PRA eMMC: CMD23 lba=%u status=%x\n", lba, status);
++			pra_emmc_multi_last_status = status;
+ 			goto out;
+ 		}
+ 		if (pra_emmc_rd32(SDHCI_RESPONSE0) & 0xfdffe008u) {
+ 			printf("PRA eMMC: CMD23 lba=%u card error r1=%x\n",
+ 			    lba, pra_emmc_rd32(SDHCI_RESPONSE0));
++			pra_emmc_multi_last_status = pra_emmc_rd32(SDHCI_RESPONSE0);
+ 			error = EIO;
+ 			goto out;
+ 		}
+@@ -561,16 +604,19 @@
+ 	}
+ 	if (error) {
+ 		printf("PRA eMMC: CMD18 lba=%u command error status=%x\n", lba, status);
++		pra_emmc_multi_last_status = status;
+ 		goto out;
+ 	}
+ 	if (!(status & NORMAL_CMD_COMPLETE)) {
+ 		printf("PRA eMMC: CMD18 lba=%u command timeout status=%x\n", lba, status);
++		pra_emmc_multi_last_status = status;
+ 		error = ETIMEDOUT;
+ 		goto out;
+ 	}
+ 	if (pra_emmc_rd32(SDHCI_RESPONSE0) & 0xfdffe008u) {
+ 		printf("PRA eMMC: CMD18 lba=%u card error r1=%x\n",
+ 		    lba, pra_emmc_rd32(SDHCI_RESPONSE0));
++		pra_emmc_multi_last_status = pra_emmc_rd32(SDHCI_RESPONSE0);
+ 		error = EIO;
+ 		goto out;
+ 	}
+@@ -595,6 +641,7 @@
+ 		if (error) {
+ 			printf("PRA eMMC: CMD18 lba=%u block %u status=%x\n",
+ 			    lba, b, status);
++			pra_emmc_multi_last_status = status;
+ 			goto out;
+ 		}
+ 		if (pra_emmc_stats && b == 0) {
+@@ -633,6 +680,7 @@
+ 	}
+ 	if (error) {
+ 		printf("PRA eMMC: CMD18 lba=%u transfer status=%x\n", lba, status);
++		pra_emmc_multi_last_status = status;
+ 		goto out;
+ 	}
+ 	if (pra_emmc_stats) {
+@@ -642,6 +690,7 @@
+ 		 * on a chunk that failed - acceptable, they are rare. */
+ 		pra_emmc_stat_rread_ops += nblocks;
+ 	}
++	pra_emmc_multi_last_status = 0;
+ 
+ out:
+ 	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
+@@ -864,7 +913,15 @@
+ 	    (uint64_t)lba - pra_log_erecovery_lba >= PRA_LOG_SECTORS) {
+ 		return EROFS;
+ 	}
+-	lck_mtx_lock(&pra_emmc_lock);
++	/* try_lock, not lock (0003): a strat request holds pra_emmc_lock for
++	 * its whole sector loop, which during a wedge or a storm is seconds
++	 * or minutes of queueing per 512-byte sector. Blocking here is how a
++	 * wedged strat starved the flusher: ring21 came back byte-identical
++	 * to ring20. Skip this sector now; the EBUSY handling in the flush
++	 * loop keeps the flush position and the next 10 s tick retries. */
++	if (!lck_mtx_try_lock(&pra_emmc_lock)) {
++		return EBUSY;
++	}
+ 	error = pra_emmc_write_raw(lba, sector);
+ 	lck_mtx_unlock(&pra_emmc_lock);
+ 	return error;
+@@ -962,10 +1019,16 @@
+ 	pra_log_print(pra_log_buf, (uint32_t)len, total, 0);
+ }
+ 
++/* The periodic flusher's header sequence number, promoted from a thread
++ * local so the strat-side flush (pra_log_strat_flush) can write a header
++ * carrying the same seq instead of resetting it to 0. Read by strat without
++ * the lock: a stale seq in a header is display noise, never data loss. */
++static uint64_t pra_log_seq;
++
+ static void
+ pra_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint64_t flushed = 0, seq = 0, last_total = 0;
++	uint64_t flushed = 0, last_total = 0;
+ 	int idle = 0, ticks = 0, write_fails = 0;
+ 	uint8_t sector[512];
+ 
+@@ -1002,7 +1065,7 @@
+ 					.version = 1,
+ 					.size = PRA_LOG_SIZE,
+ 					.total = total,
+-					.seq = ++seq,
++					.seq = ++pra_log_seq,
+ 				};
+ 				memset(sector, 0, sizeof(sector));
+ 				memcpy(sector, &h, sizeof(h));
+@@ -1097,6 +1160,100 @@
+ 	}
+ }
+ 
++/* Write `blocks` 512-byte ring blocks starting at ring block `start`, then
++ * the header sector. pra_emmc_lock must be HELD: this is the core the panic
++ * flush ran inline, refactored out so strat can call it from the CMD18
++ * chunk-failure path (strat already holds the lock) and the panic path can
++ * call it after acquiring-or-stealing the lock. Stop on the first failed
++ * sector: on a wedged card the next write_raw fails EBUSY after its bounded
++ * ready-poll (~1-2 s) and the caller reports the attempt - which is itself
++ * one line of forensics - instead of spinning 8192 times. */
++static int
++pra_log_flush_locked(uint64_t start, uint64_t blocks, uint64_t total,
++    uint32_t seq)
++{
++	uint8_t sector[512];
++	int error = 0;
++
++	if (start >= PRA_LOG_SIZE / 512u) {
++		return EINVAL;
++	}
++	if (start + blocks > PRA_LOG_SIZE / 512u) {
++		blocks = PRA_LOG_SIZE / 512u - start;
++	}
++	for (uint64_t block = start; block < start + blocks && !error;
++	    block++) {
++		memcpy(sector, pra_log_ring + (size_t)block * 512u,
++		    sizeof(sector));
++		error = pra_emmc_write_raw((uint32_t)(pra_log_erecovery_lba + 1u +
++		    block), sector);
++	}
++	if (!error) {
++		struct pra_log_header h = {
++			.magic = { 'P', 'R', 'A', 'L', 'O', 'G', '1', '\0' },
++			.version = 1,
++			.size = PRA_LOG_SIZE,
++			.total = total,
++			.seq = seq,
++		};
++		memset(sector, 0, sizeof(sector));
++		memcpy(sector, &h, sizeof(h));
++		error = pra_emmc_write_raw((uint32_t)pra_log_erecovery_lba, sector);
++	}
++	return error;
++}
++
++/* strat-side evidence flush, called with pra_emmc_lock held whenever a CMD18
++ * chunk fails and again when the 2-strike latch fires (force): a wedged
++ * strat previously starved the periodic flusher and the ring came back
++ * byte-identical to the previous boot (ring20/ring21), so the flush has to
++ * happen where the wedge is. Writes the newest 128 ring blocks (64 KiB -
++ * every chunk-failure, recover and busy-skip line lands in the tail) plus
++ * the header: bounded work on a healthy card (~0.2 s at the measured ~600
++ * KiB/s write rate) and one bounded EBUSY on a wedged one. Rate-limited to
++ * one per 10 s - a recurring failure mode must not turn the flush itself
++ * into the flood - with the suppressed count carried on the next line. The
++ * latch flush bypasses the limit: it happens at most once per boot and is
++ * the terminal event. */
++static uint64_t pra_log_strat_flush_at;
++static uint64_t pra_log_strat_flush_skipped;
++
++static void
++pra_log_strat_flush(bool force)
++{
++	uint64_t total, used, blocks, start, now;
++	int error;
++
++	/* Same guard as the panic flush: with pralog off, or before the GPT
++	 * lookup has found erecovery_kernel, the ring target is unknown and
++	 * pra_log_flush_locked would write the ring at LBA 0-ish - the
++	 * protective MBR. Never write through an unprogrammed target. */
++	if (!pra_log_enabled || !pra_log_erecovery_sectors) {
++		return;
++	}
++	total = os_atomic_load(&pra_log_total, relaxed);
++	used = (total + 511u) & ~511ull;
++	if (used > PRA_LOG_SIZE) {
++		used = PRA_LOG_SIZE;
++	}
++	blocks = used / 512u;
++	start = blocks > 128u ? blocks - 128u : 0;
++	blocks -= start;
++	now = mach_absolute_time();
++	if (!force && pra_log_strat_flush_at &&
++	    now - pra_log_strat_flush_at < 10ULL * 1920000ULL) {
++		pra_log_strat_flush_skipped++;
++		return;
++	}
++	pra_log_strat_flush_at = now;
++	error = pra_log_flush_locked(start, blocks, total,
++	    (uint32_t)pra_log_seq);
++	printf("PRA LOG: strat flush %llu blocks total=%llu err=%d "
++	    "skipped=%llu\n",
++	    blocks, total, error, pra_log_strat_flush_skipped);
++	pra_log_strat_flush_skipped = 0;
++}
++
+ /* The flusher thread dies with the boot, so a panic loses everything printed
+  * since its last 10 s tick - the pe_init.c:314 panic (0153) left no trace in
+  * the ring for exactly this reason. Called once from the panic path, after
+@@ -1107,9 +1264,8 @@
+ void
+ pra_log_panic_flush(void)
+ {
+-	uint8_t sector[512];
+-	uint64_t total, used, block;
+-	int error = 0;
++	uint64_t total, used;
++	int error;
+ 
+ 	if (!pra_log_enabled || !pra_log_erecovery_sectors) {
+ 		return;
+@@ -1153,24 +1309,8 @@
+ 	if (used > PRA_LOG_SIZE) {
+ 		used = PRA_LOG_SIZE;
+ 	}
+-	for (block = 0; block < used / 512u && !error; block++) {
+-		memcpy(sector, pra_log_ring + (size_t)block * 512u,
+-		    sizeof(sector));
+-		error = pra_emmc_write_raw((uint32_t)(pra_log_erecovery_lba + 1u +
+-		    block), sector);
+-	}
+-	if (!error) {
+-		struct pra_log_header h = {
+-			.magic = { 'P', 'R', 'A', 'L', 'O', 'G', '1', '\0' },
+-			.version = 1,
+-			.size = PRA_LOG_SIZE,
+-			.total = total,
+-			.seq = 0,
+-		};
+-		memset(sector, 0, sizeof(sector));
+-		memcpy(sector, &h, sizeof(h));
+-		error = pra_emmc_write_raw((uint32_t)pra_log_erecovery_lba, sector);
+-	}
++	/* Core loop shared with strat's chunk-failure flush (0003). */
++	error = pra_log_flush_locked(0, used / 512u, total, 0);
+ 	lck_mtx_unlock(&pra_emmc_lock);
+ 	if (error) {
+ 		printf("PRA LOG: panic flush failed %d\n", error);
+@@ -1791,16 +1931,23 @@
+ 			 * both lines, count the strike, and after two strikes
+ 			 * leave multi for the boot - per-sector CMD17 is the
+ 			 * path every healthy boot has used, so the fallback is
+-			 * the known-good state, never a flood. */
++			 * the known-good state, never a flood. The failure line
++			 * carries the chunk's last status word (0003) and strat
++			 * flushes the ring tail itself (it holds the lock), so
++			 * the wedge forensics land on disk even if the card is
++			 * wedging right now and the periodic flusher loses. */
+ 			pra_emmc_recover();
+ 			pra_emmc_multi_fail_run++;
+-			printf("PRA eMMC: CMD18 %u-sector chunk failed (%d); "
+-			    "%u consecutive\n", sectors, error,
++			printf("PRA eMMC: CMD18 %u-sector chunk failed (%d) "
++			    "status=%x; %u consecutive\n", sectors, error,
++			    pra_emmc_multi_last_status,
+ 			    pra_emmc_multi_fail_run);
++			pra_log_strat_flush(false);
+ 			if (pra_emmc_multi_fail_run >= 2) {
+ 				printf("PRA eMMC: CMD18 unavailable, falling "
+ 				    "back to 512-byte reads\n");
+ 				pra_emmc_multi_ok = false;
++				pra_log_strat_flush(true);
+ 			}
+ 			if (pra_emmc_multi_rung != 0) {
+ 				pra_emmc_multi_rung = 0;

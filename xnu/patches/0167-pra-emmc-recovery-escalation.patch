@@ -1,0 +1,357 @@
+pra: 0167 - recovery escalation: line reset, full controller reset, card idle+reinit
+
+DRAFT (not committed; produced by the eMMC speed-work agent). STACKS ON
+0003. Generated against the reconstructed CI-built tree (pristine
+xnu-8796.141.3 + 0001..0165 with pre-skips 0031/0041/0097/0099/0127/0129,
+GNU patch -p1 --fuzz=0, index lines stripped). Verify with GNU
+`patch -p1 --fuzz=0 --dry-run`, NOT git apply.
+
+PROBLEM: pra_emmc_recover() is one level - CMD12 stop + CMD|DAT soft reset
++ ready wait - and 0164's ring has never shown what happens when that is
+not enough. The 0162 wedge signature (card streaming forever, DAT held)
+survives a controller-side reset by definition; the driver had no second
+or third move, so the boot died and took the evidence with it.
+
+CHANGES - pra_emmc_recover() escalates, each level printed:
+
+(a) CMD12 stop + CMD|DAT soft reset + ready wait, the 0164 recovery.
+    Outcome printed rate-limited (1/10 s, running recover count): lines
+    "released" or "STILL BUSY". Safe: only command/data aborts, card state
+    untouched.
+
+(b) FULL software reset - SOFTWARE_RESET = 0x7 (DAT line + CMD line + ALL)
+    - then pra_emmc_ensure_clock() (the reset stops the SD clock) and a
+    100k-nop settle, then ready wait. Resets ONLY the host controller:
+    FIFOs, DMA state, clock engine. The card keeps its state machine, RCA
+    and negotiated data path, so per-sector CMD17 - the boot's lifeline -
+    works the moment the lines free; that is what makes (b) safe for the
+    command path. The pre-reset HOST_CONTROL value is read and written
+    back because this Arasan's reset behaviour is unverified (the spec
+    says config registers survive a reset-all; belt and suspenders).
+    Outcome printed.
+
+(c) idle the CARD: CMD0, bounded CMD1 SEND_OP_COND polling (20 tries, OCR
+    arg 0x40ff8080), then FULL identification: CMD2 (CID ignored), CMD3
+    (assign RCA 1), CMD7 (select), CMD13 verify state==tran, then the
+    boot's data path re-asserted (CMD6 BUS_WIDTH=8bit, CMD6 HS_TIMING=1,
+    host control 8-bit|HS) and PROVEN with one real CMD17 read of the
+    root partition's first LBA. Full identification is mandatory, not
+    optional polish: CMD17 is illegal outside stby/tran/data, so a bare
+    CMD0+CMD1 would leave the lifeline dead. Card-side resets revert the
+    volatile EXT_CSD fields (bus width, HS timing), hence the CMD6s.
+    (c) runs only after (a) AND (b) failed - per-sector reads are already
+    dead - so it cannot make a working boot worse; if it fails too, the
+    next exit is a power cycle, same as before this patch.
+
+STATED UNKNOWNs (checked, not guessed):
+- The boot's OCR argument was never recorded: LK initialised the card
+  before this driver mapped the host and the probe prints (host/caps/
+  extcsd - ring22:3-6) carry no OCR. CMD1 uses the standard
+  sector-addressed pattern 0x40ff8080 (HCS=1, both voltage windows) and
+  the response is printed verbatim. The R1 error mask is NOT applied to
+  CMD1 (OCR busy/HCS bits would trip it).
+- The boot's RCA is equally unrecorded; a fresh RCA 1 is assigned and
+  printed.
+- The command encodings for CMD0/1/2/3/7/13 mirror the closest existing
+  command of the same class (0x1A = the proven R1 no-data family,
+  0x1B = the CMD6 R1b family, 0x0000 = all-zero). None has run on this
+  hardware; every step is bounded (2e5-iteration polls) and printed, and
+  a mid-sequence failure ends (c) with its print.
+
+RECOVER MOVED: pra_emmc_recover() + helpers now live after pra_emmc_tune()
+so (c) can use pra_emmc_switch()/pra_emmc_read_sector(); the only caller
+(strat) is defined later, so no forward declarations. The 0003-era rate-
+limited outcome print of level (a) is preserved verbatim in behaviour.
+
+DEFAULT BOOT: unchanged - recover() still runs only after a failed chunk
+(2-strike latch caps it at two runs per boot) or, with 0002, after a DMA
+failure (one-strike latch). Levels (b)/(c) exist behind (a)'s failure.
+
+---
+ bsd/dev/pra_sdhci.c | 3 hunks
+---
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -45,6 +45,19 @@
+  * ladder move and recovery reports whether the CMD/DAT lines actually
+  * cleared - the forensics the wedge boots lost.
+  *
++ * Recovery escalation (0004): pra_emmc_recover() escalates when the first
++ * line recovery does not release the CMD/DAT lines. (a) CMD12 stop + CMD|DAT
++ * soft reset, the 0164 recovery; (b) full software reset (all three reset
++ * bits) + clock re-ensure + settle - resets ONLY the controller, the card
++ * keeps its state, RCA and negotiated data path, so per-sector CMD17 is
++ * untouched once the lines free; (c) idle the card itself: CMD0, bounded
++ * CMD1 OP_COND polling, then full identification (CMD2/CMD3/CMD7 - CMD17 is
++ * illegal outside stby/tran/data, so partial re-init would leave the
++ * lifeline dead), CMD13 confirmation, and re-assertion of the boot's 8-bit
++ * HS data path with the CMD6s. (c) runs only after (a) AND (b) failed, i.e.
++ * when per-sector reads are already dead, so it cannot make a live boot
++ * worse - and every level prints its outcome.
++ *
+  * The UART is gated by EL3 and the framebuffer console wraps around, so the
+  * last lines of a hung boot are lost. Boot-arg pralog=1 keeps console output
+  * in a 4 MiB ring and flushes it every 10 s to the tail of the unused
+@@ -479,38 +492,9 @@
+ 	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
+ }
+ 
+-/* Full recovery after a failed CMD18 chunk; strat holds pra_emmc_lock. The
+- * 0162/0162b wedge signature is the card still mid-stream after the chunk
+- * (DAT held, every later command EBUSY until power cycle), so the order
+- * matters: CMD12 stops the card side first, the soft reset clears the
+- * controller side, then the ready wait confirms both lines released - and
+- * the outcome is PRINTED, rate-limited like busy_note: whether the lines
+- * cleared after CMD12+reset is exactly the forensics the 0162 wedge boots
+- * never got (they lost the whole ring instead). */
+-static uint64_t pra_emmc_recover_count;
+-static uint64_t pra_emmc_recover_print_at;
+-
+-static void
+-pra_emmc_recover(void)
+-{
+-	bool released;
+-
+-	pra_emmc_stop_transfer();
+-	pra_emmc_abort_data();
+-	released = pra_emmc_wait_ready() == 0;
+-	pra_emmc_multi_last_status =
+-	    released ? 0 : pra_emmc_rd32(SDHCI_PRESENT_STATE) & 0x3u;
+-	pra_emmc_recover_count++;
+-	if (pra_emmc_recover_print_at &&
+-	    mach_absolute_time() - pra_emmc_recover_print_at <
+-	    10ULL * 1920000ULL) {
+-		return;
+-	}
+-	pra_emmc_recover_print_at = mach_absolute_time();
+-	printf("PRA eMMC: recover: CMD12+reset, CMD/DAT lines %s "
+-	    "(recover=%llu)\n",
+-	    released ? "released" : "STILL BUSY", pra_emmc_recover_count);
+-}
++/* pra_emmc_recover() is defined further down, next to the other recovery
++ * helpers it escalates through (pra_emmc_switch for the CMD6s); strat is
++ * its only caller until 0002's DMA path adds a second one. */
+ 
+ /* One CMD23+CMD18 for up to PRA_MULTI_MAX sectors. CMD23 tells the CARD how
+  * many blocks to send, so the transfer ends by itself: no stop command, no
+@@ -1747,6 +1731,220 @@
+ 	}
+ }
+ 
++/* Bounded single-command issue for the escalated recovery. Clears status,
++ * writes the argument, issues, polls command-complete ONLY (never the error
++ * bits: CMD1's OCR response is R3, has no CRC, and this Arasan may raise
++ * its response-CRC error bit for it), returns the response word,
++ * 0xffffffff on timeout. Encodings mirror the closest existing command of
++ * the same class - 0x1A = the proven CMD17/CMD23 R1 no-data family, 0x1B =
++ * the CMD6 R1b family, 0x0000 all-zero = no response, no data - none of the
++ * new ones has ever run on hardware (UNKNOWN, flagged in WORKLOG section
++ * 15), and every failure is bounded and printed. Does not bracket registers
++ * with save/restore: the next read op re-programs everything it needs, and
++ * a recovery that leaves ARGUMENT/INT_STATUS dirty costs nothing.
++ * Command-complete DOES fire for no-response commands (CMD0) per SDHCI
++ * 2.0/3.0 - it is generated after the command's end bit. */
++static uint32_t
++pra_emmc_recover_cmd(uint16_t cmd, uint32_t arg)
++{
++	uint32_t status = 0;
++
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, 0xffffffffu);
++	pra_emmc_wr32(SDHCI_ARGUMENT, arg);
++	__asm__ volatile("dsb sy" : : : "memory");
++	pra_emmc_wr16(SDHCI_COMMAND, cmd);
++	for (unsigned i = 0; i < 200000; i++) {
++		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++		if (status & NORMAL_CMD_COMPLETE) {
++			break;
++		}
++	}
++	if (!(status & NORMAL_CMD_COMPLETE)) {
++		return 0xffffffffu;
++	}
++	status = pra_emmc_rd32(SDHCI_RESPONSE0);
++	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, NORMAL_CMD_COMPLETE);
++	return status;
++}
++
++/* (c) idle the card and re-enumerate it. Only runs after (a) and (b) both
++ * failed to release the lines, i.e. per-sector CMD17 is already dead - this
++ * cannot make a working boot worse, it is the last software exit before a
++ * power cycle. CMD0 resets the card state machine to idle; CMD17 is illegal
++ * outside stby/tran/data, so identification MUST be completed (CMD1 ->
++ * CMD2 -> CMD3 -> CMD7) or the lifeline stays dead - that is why this is a
++ * full re-enumeration, not just CMD0+CMD1. Two UNKNOWNs are stated, not
++ * guessed:
++ *   - the boot's OCR argument: LK initialised the card before this driver
++ *     mapped the host, and the probe prints (host/caps/extcsd, ring22:3-6)
++ *     carry no OCR, so the standard sector-addressed pattern 0x40ff8080
++ *     (HCS=1, both voltage windows) is used and the CMD1 response is
++ *     printed verbatim for the record. The R1 error mask is NOT applied
++ *     (CMD1's OCR sets busy/HCS bits the mask would flag as card errors).
++ *   - the boot's RCA: equally unrecorded, so a fresh RCA (1) is assigned
++ *     with CMD3 and printed.
++ * Card-side resets revert the volatile EXT_CSD fields (bus width, HS
++ * timing) to defaults, so the boot's 8-bit HS data path is re-asserted
++ * with the CMD6s pra_emmc_switch already knows how to send and the host
++ * control bits, and the result is PROVEN with one real CMD17 read - the
++ * lifeline verdict. 52 MHz 8-bit HS is within both card (DEVICE_TYPE 0x57)
++ * and host (caps bit 21) capability; if the LK handoff was HS200-class
++ * this is a deliberate downgrade to a mode this driver can actually drive,
++ * printed for the record. */
++static int
++pra_emmc_recover_idle_card(void)
++{
++	uint32_t r = 0;
++	bool ready = false;
++	uint8_t sector[512];
++
++	(void)pra_emmc_recover_cmd(0x0000u, 0);        /* CMD0 GO_IDLE_STATE */
++	for (unsigned i = 0; i < 20; i++) {
++		r = pra_emmc_recover_cmd(0x011Au, 0x40ff8080u);  /* CMD1 OP_COND */
++		if (r == 0xffffffffu) {
++			break;
++		}
++		if (!(r & 0x80000000u)) {
++			ready = true;
++			break;
++		}
++	}
++	printf("PRA eMMC: recover(c): CMD0+CMD1 ocr=%x (arg 40ff8080, boot "
++	    "OCR UNKNOWN)\n", r);
++	if (!ready) {
++		return -1;
++	}
++	(void)pra_emmc_wait_ready();
++	r = pra_emmc_recover_cmd(0x021Au, 0);          /* CMD2, CID ignored */
++	if (r == 0xffffffffu) {
++		printf("PRA eMMC: recover(c): CMD2 failed\n");
++		return -1;
++	}
++	r = pra_emmc_recover_cmd(0x031Au, 0x00010000u);  /* CMD3, assign RCA 1 */
++	if (r == 0xffffffffu) {
++		printf("PRA eMMC: recover(c): CMD3 failed\n");
++		return -1;
++	}
++	(void)pra_emmc_wait_ready();
++	r = pra_emmc_recover_cmd(0x071Bu, 0x00010000u);  /* CMD7 select */
++	if (r == 0xffffffffu) {
++		printf("PRA eMMC: recover(c): CMD7 failed\n");
++		return -1;
++	}
++	r = pra_emmc_recover_cmd(0x0D1Au, 0x00010000u);  /* CMD13 status */
++	printf("PRA eMMC: recover(c): rca=1 status=%x state=%u\n", r,
++	    r == 0xffffffffu ? 0xfu : (r >> 9) & 0xfu);
++	if (r == 0xffffffffu || ((r >> 9) & 0xfu) != 4) {
++		return -1;
++	}
++	if (pra_emmc_switch((3u << 24) | (183u << 16) | (2u << 8))) {
++		printf("PRA eMMC: recover(c): BUS_WIDTH=8bit failed\n");
++		return -1;
++	}
++	if (pra_emmc_switch((3u << 24) | (185u << 16) | (1u << 8))) {
++		printf("PRA eMMC: recover(c): HS_TIMING=1 failed\n");
++		return -1;
++	}
++	{
++		uint32_t hc = pra_emmc_rd32(SDHCI_HOST_CONTROL);
++		pra_emmc_wr32(SDHCI_HOST_CONTROL,
++		    hc | HC_8BIT_WIDTH | HC_HIGH_SPEED);
++	}
++	if (pra_emmc_read_sector(
++	    pra_emmc_first_lba ? (uint32_t)pra_emmc_first_lba : 1u, sector)) {
++		printf("PRA eMMC: recover(c): lifeline CMD17 FAILED\n");
++		return -1;
++	}
++	printf("PRA eMMC: recover(c): lifeline CMD17 ok\n");
++	return 0;
++}
++
++/* Full recovery after a failed CMD18 chunk; strat holds pra_emmc_lock. The
++ * 0162/0162b wedge signature is the card still mid-stream after the chunk
++ * (DAT held, every later command EBUSY until power cycle), so the order
++ * matters: CMD12 stops the card side first, the soft reset clears the
++ * controller side, then the ready wait confirms both lines released - and
++ * the outcome is PRINTED, rate-limited like busy_note: whether the lines
++ * cleared after CMD12+reset is exactly the forensics the 0162 wedge boots
++ * never got (they lost the whole ring instead).
++ *
++ * 0004 escalation: level (a) is the 0164 recovery. If the lines are STILL
++ * busy after it, (b) full software reset (all three reset bits - DAT, CMD,
++ * ALL) + clock re-ensure + settle. Reset-for-all touches ONLY the host
++ * controller (FIFOs, DMA state, stops the SD clock): the card keeps its
++ * state machine, RCA and negotiated data path, so the per-sector CMD17
++ * lifeline works the moment the lines free - that is what makes (b) safe
++ * for the command path. The spec says config registers survive, but this
++ * Arasan's reset behaviour is unverified, so the pre-reset host control
++ * value is written back (belt and suspenders; it was also never re-armed
++ * here before). If (b) still leaves the lines busy, (c) idles and
++ * re-enumerates the CARD (above) - by then per-sector reads are dead
++ * anyway, so (c) risks nothing the boot was not already losing.
++ * pra_emmc_recover_last_level (0 none, 1..3) is telemetry for the
++ * emmctest=1 per-chunk line (0005). */
++static uint64_t pra_emmc_recover_count;
++static uint64_t pra_emmc_recover_print_at;
++static int pra_emmc_recover_last_level;
++
++static void
++pra_emmc_recover(void)
++{
++	bool released;
++	uint32_t hc;
++
++	pra_emmc_stop_transfer();
++	pra_emmc_abort_data();
++	released = pra_emmc_wait_ready() == 0;
++	pra_emmc_multi_last_status =
++	    released ? 0 : pra_emmc_rd32(SDHCI_PRESENT_STATE) & 0x3u;
++	pra_emmc_recover_count++;
++	pra_emmc_recover_last_level = 1;
++	if (pra_emmc_recover_print_at &&
++	    mach_absolute_time() - pra_emmc_recover_print_at <
++	    10ULL * 1920000ULL) {
++		/* Rate limit only the recurring (a) outcome; (b)/(c) fire at
++		 * most once per wedge and their lines are the forensics. */
++		if (released) {
++			return;
++		}
++	} else {
++		pra_emmc_recover_print_at = mach_absolute_time();
++		printf("PRA eMMC: recover(a): CMD12+reset, CMD/DAT lines %s "
++		    "(recover=%llu)\n",
++		    released ? "released" : "STILL BUSY",
++		    pra_emmc_recover_count);
++		if (released) {
++			return;
++		}
++	}
++
++	/* (b) full software reset. */
++	hc = pra_emmc_rd32(SDHCI_HOST_CONTROL);
++	pra_emmc_wr8(SDHCI_SOFTWARE_RESET, 0x7u);
++	for (unsigned i = 0; i < 200000; i++) {
++		if (!(pra_emmc_rd8(SDHCI_SOFTWARE_RESET) & 0x7u)) {
++			break;
++		}
++	}
++	pra_emmc_ensure_clock();
++	pra_emmc_wr32(SDHCI_HOST_CONTROL, hc);
++	for (unsigned i = 0; i < 100000; i++) {
++		__asm__ volatile("nop");
++	}
++	released = pra_emmc_wait_ready() == 0;
++	pra_emmc_recover_last_level = 2;
++	printf("PRA eMMC: recover(b): full reset, CMD/DAT lines %s\n",
++	    released ? "released" : "STILL BUSY");
++	if (released) {
++		return;
++	}
++
++	/* (c) idle the card and re-enumerate. */
++	pra_emmc_recover_last_level = 3;
++	printf("PRA eMMC: recover(c): card idle+reinit, (a)+(b) failed\n");
++	(void)pra_emmc_recover_idle_card();
++}
++
+ static int
+ pra_emmc_map_host(void)
+ {

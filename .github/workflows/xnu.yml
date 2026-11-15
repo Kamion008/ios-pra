@@ -167,7 +167,17 @@ jobs:
           strings -a "$kernel" | grep 'CMD23 lba=' >/dev/null
           strings -a "$kernel" | grep 'busy-skip' >/dev/null
           strings -a "$kernel" | grep 'CMD18 ladder' >/dev/null
-          echo 'PRA charger, panic flush, Setup probe and 0164 eMMC driver are linked.'
+          # 0165 guard: the churn-block marker (grep -F: patterns contain
+          # regex metacharacters).
+          strings -a "$kernel" | grep -F 'praexecskip: blocked' >/dev/null
+          # 0166-0170 guards: wedge-proof logging, recovery escalation,
+          # emmctest telemetry, boot milestones, SDMA - one marker each.
+          strings -a "$kernel" | grep -F 'PRA LOG: strat flush' >/dev/null
+          strings -a "$kernel" | grep -F 'recover(c): card idle+reinit' >/dev/null
+          strings -a "$kernel" | grep -F 'emmctest=1 probe chunks on' >/dev/null
+          strings -a "$kernel" | grep -F '[+%3llu s]' >/dev/null
+          strings -a "$kernel" | grep -F 'emmcdma=1 rejected' >/dev/null
+          echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite and 0165 churn fix are linked.'
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
         if: always()

@@ -1,0 +1,109 @@
+pra: 0169 - boot milestones: [+Ns] stamps at probe, GPT, rootdev, pralog start
+
+DRAFT (not committed; produced by the eMMC speed-work agent). STACKS ON
+0003 + 0004 + 0005. Generated against the reconstructed CI-built tree
+(pristine xnu-8796.141.3 + 0001..0165 with pre-skips
+0031/0041/0097/0099/0127/0129, GNU patch -p1 --fuzz=0, index lines
+stripped). Verify with GNU `patch -p1 --fuzz=0 --dry-run`, NOT git apply.
+
+PROBLEM: no ring has ever carried wall-clock time. The stats lines tick
+every 8 MiB but nothing says WHEN; the pre-logo phase (everything before
+the framebuffer console) is 5-11 min after a 14 GiB restage and completely
+uninstrumented (WORKLOG section 15), so the boot-time budget cannot be
+split into pre-logo vs IO vs post-logo. One tiny print per milestone turns
+every future ring into a timeline.
+
+CHANGES: pra_emmc_milestone(what) prints "[+%3llu s] <what>", dividing
+mach_absolute_time() by 1920000. Provenance of the constant: ADT
+timebase-frequency = 1920000 (docs/pra-address-overrides.md, confirmed in
+live dmesg; the same constant the busy-note rate limit divides for its
+10 s window). mach_absolute_time starts near kernel entry, so the value is
+seconds since kernel start - exactly the boot timeline. Four call sites:
+
+  1. pra_emmc_map_host, after the probe prints and boot-arg parses
+     ("eMMC host probed");
+  2. pra_emmc_find_root_partition, after the GPT geometry print
+     ("eMMC GPT found");
+  3. pra_emmc_rootdev, after the /dev/sdhcroot0 ready print
+     ("root device ready");
+  4. pra_log_start, after the PRA LOG lba print ("pralog started").
+
+Each call site runs at most once per boot (map_host returns early on
+re-probe, pra_log_start once enabled), so no rate limiting. Re-probe of
+the GPT path is the one exception and would print a second, later stamp -
+itself useful (it timestamps the re-probe).
+
+DEFAULT BOOT: four one-line prints. No behaviour change.
+
+---
+ bsd/dev/pra_sdhci.c | 6 hunks
+---
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -71,6 +71,14 @@
+  * resets on failure, so a full boot covers every rung 2..128 - the data the
+  * CMD23 wedge root-cause needs, collected on a real boot at zero boot risk.
+  *
++ * Boot milestones (0006): the probe, GPT, root-device and pralog points
++ * print "[+Ns] <milestone>" using mach_absolute_time(), which ticks at
++ * 1.92 MHz (ADT timebase-frequency = 1920000, docs/pra-address-overrides.md;
++ * the same constant the busy-note 10 s window uses) from near kernel entry.
++ * Every future ring becomes a wall-clock timeline: the stats lines gain a
++ * time axis, and the uninstrumented pre-logo phase - 5-11 min after a 14 GiB
++ * restage (WORKLOG section 15) - gets measured for the first time.
++ *
+  * The UART is gated by EL3 and the framebuffer console wraps around, so the
+  * last lines of a hung boot are lost. Boot-arg pralog=1 keeps console output
+  * in a 4 MiB ring and flushes it every 10 s to the tail of the unused
+@@ -323,6 +331,19 @@
+ 	    pra_emmc_busy_skips, what, lba);
+ }
+ 
++/* Boot milestones (0006). mach_absolute_time ticks at 1.92 MHz - ADT
++ * timebase-frequency = 1920000 (docs/pra-address-overrides.md, confirmed in
++ * live dmesg; the same constant busy_note divides for its 10 s window) -
++ * and starts near kernel entry, so ticks / 1920000 is seconds since kernel
++ * start. One line per milestone; every call site is reached once per boot
++ * (map_host returns early on re-probe, the log start returns early once
++ * enabled), so no extra rate limiting. */
++static void
++pra_emmc_milestone(const char *what)
++{
++	printf("[+%3llu s] %s\n", mach_absolute_time() / 1920000ull, what);
++}
++
+ /* The bootloader leaves the SD clock running. If it gated it at handoff,
+  * re-enable the internal clock and then the SD clock, keeping the divider
+  * and power settings it chose. */
+@@ -1360,6 +1381,7 @@
+ 	printf("PRA LOG: lba=%llu, %u sectors, idle=%d at=%d\n",
+ 	    pra_log_erecovery_lba, PRA_LOG_SECTORS, pra_log_idle_limit * 10,
+ 	    pra_log_at_limit * 10);
++	pra_emmc_milestone("pralog started");
+ 	if (kernel_thread_start(pra_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+@@ -1561,6 +1583,7 @@
+ 	printf("PRA eMMC: GPT %s first=%llu sectors=%llu %s\n",
+ 	    pra_emmc_partition_name, pra_emmc_first_lba, pra_emmc_nsectors,
+ 	    pra_emmc_writable ? "writable" : "read-only");
++	pra_emmc_milestone("eMMC GPT found");
+ 	pra_log_probe();
+ 	return 0;
+ }
+@@ -2070,6 +2093,7 @@
+ 			    "stays off, probe data discarded\n");
+ 		}
+ 	}
++	pra_emmc_milestone("eMMC host probed");
+ 	return 0;
+ }
+ 
+@@ -2420,6 +2444,7 @@
+ 		printf("PRA eMMC: /dev/sdhcroot0 ready, GPT %s %s\n",
+ 		    pra_emmc_partition_name,
+ 		    pra_emmc_writable ? "writable" : "read-only");
++		pra_emmc_milestone("root device ready");
+ 		pra_log_start();
+ 		/*
+ 		 * The SWEET process sampler (sweet_sample.c) is started from the

@@ -1,0 +1,411 @@
+From 0002-pra-emmc-dma Mon Sep 17 00:00:00 2001
+Subject: [PRA eMMC 0002 v3] SDMA for the per-sector CMD17 path behind
+ emmcdma=1 (default off), runtime-verified; caps2 print; rebased onto 0164
+
+DRAFT - not applied, not committed. v3 REBASES v2 onto the 0164 driver
+state: verified with the 0164 method (GNU patch -p1 --fuzz=0 on the
+index-stripped diff against the reconstructed CI-built tree: pristine
+xnu-8796.141.3 + stack 0001..0165 with pre-skips 0031/0041/0097/0099/0127/
+0129). The 0164 content is the intended 0163 driver (per-sector CMD17
+default, pra_emmc_multi_ok defaults false, busy_note()/recover(), the
+CMD23 block, the ladder), so v2's hunks carried over; what changed:
+
+1. VERIFICATION METHOD: v2 was verified with `git apply` on the xnu-src
+   stacked tree - exactly the method section 14 of the WORKLOG discredited
+   (git 2.56 skip-detects already-applied hunks with rc=0). v3 is verified
+   with GNU patch --fuzz=0 on the reconstructed tree, both against the
+   plain 0164+0165 state AND stacked after drafts 0003+0004+0005+0006
+   (transcripts in WORKLOG section 15.1; both orders byte-identical).
+
+2. TWO blocks moved so 0002 applies in ANY landing order relative to
+   drafts 0003-0006 (verified both ways, transcripts in WORKLOG 15.1):
+   - the map_host emmcdma parse block moved BEFORE the emmcmulti block
+     (was: after it, right before `return 0`), because 0005 (emmctest
+     parse) and 0006 (milestone print) append at the tail of map_host;
+   - the SDMA state block (dma_ok/dma_phys/externs/recover forward decl)
+     moved AFTER the stats block (was: between pra_emmc_multi_buf and
+     pra_emmc_stats), because 0003 and 0005 insert their statics in that
+     exact gap. NOTE: GNU patch 2.8.1 needs >=3 trailing context lines
+     (or EOF) to match a hunk at --fuzz=0 - hand-trimmed 1-line-context
+     hunks fail even when byte-exact (found and recorded in WORKLOG
+     15.1), so adjacency conflicts are resolved by moving insertion
+     points, never by trimming context.
+   Parse/declaration order is irrelevant - the flags are independent.
+
+3. Banner text updated (0163/commit-ecfdc55 references -> the 0164 state
+   and the reconstruction recipe).
+
+EVERYTHING ELSE IS v2's CONTENT, UNCHANGED:
+
+- SDMA applies to the CMD17 PER-SECTOR path - the default path since
+  0164 - replacing the 128 32-bit buffer-port reads with one controller
+  DMA into the 64 KiB bounce buffer plus a 512-byte memcpy. Per SDHCI
+  3.0 the SDMA System Address register is 0x00, its own register
+  (Argument is 0x08), written BEFORE the command with the transfer-mode
+  DMA-enable bit set; the old v1 "0x08 after the command" latch trick was
+  a spec misreading and is gone. Everything stays polled: transfer
+  complete from NORMAL_INT_STATUS, no interrupts.
+- Opt-in emmcdma=1, default OFF - the default boot is byte-identical to
+  the proven PIO path. At probe: the 64 KiB bounce must be physically
+  contiguous page by page (ml_vtophys 4 KiB walk), 4-byte aligned, below
+  4 GiB - otherwise ONE "emmcdma=1 rejected" line and PIO for the boot.
+  Host-control bit 3 forced to 0 = SDMA (LK handoff 0x800bf4 already
+  clear, ring19:2), old+new printed. Any DMA data-phase failure (error
+  bits or 2M-iteration timeout) prints ONE line, runs pra_emmc_recover()
+  and latches pra_emmc_dma_ok off for the boot; the caller finishes that
+  request PIO.
+- Bounce-buffer target, not the caller's page: a misfire corrupts a known
+  static buffer, and the probe-time contiguity proof over the whole 64
+  KiB carries to the future emmcdma=2 chunk mode.
+- caps2 (0x44) printed at probe (bits 0/1/2 = SDR50/SDR104/DDR50, bit 3
+  HS200) and acted on not at all; it had never been read before this
+  series.
+- Write path untouched (CMD24 stays PIO).
+
+WHAT THE STATS WILL SHOW (emmcdma=1, emmcstats=1): wait stays ~137-145 us
+(entry to TRANSFER COMPLETE - the ~137 us command overhead is still
+inside it, SDMA cannot remove that), buf collapses ~42 us -> ~1-2 us (the
+memcpy). Per-sector ceiling moves ~2.7 -> ~3.5 MB/s. That ceiling is the
+point: it proves the port drain is gone and only command overhead is
+left. The real speedup requires the CMD23 chunk path (emmcmulti=1, the
+next experiment boot, WORKLOG section 13) or the emmcdma=2 follow-up
+(flag named and rejected-with-a-print here).
+
+UNKNOWN (why default off, why one-strike latch): whether this Arasan
+honours the DMA-enable bit and the 0x00 system address at LK handoff;
+vendor register needs. A wrong guess costs ONE sector read: one print,
+one recover, PIO for the rest of the boot - the containment shape 0164
+gives the CMD23 experiment.
+
+VERIFY: GNU `patch -p1 --fuzz=0 --dry-run` against the reconstructed
+tree (WORKLOG section 15.1 transcripts). Do NOT trust `git apply --check`
+(git 2.56 skip-detects, rc=0).
+---
+ bsd/dev/pra_sdhci.c | 9 hunks
+---
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -50,6 +50,29 @@
+  * driver share one SDHCI channel, so a flush can find the card busy. That
+  * is transient, so the flusher retries on the next tick instead of stopping,
+  * and only a bounded number of complaints reach the console.
++ *
++ * SDMA is strictly opt-in via emmcdma=1 (default OFF; the default boot stays
++ * exactly the polled-PIO CMD17 path of every healthy ring). It applies to
++ * the per-sector CMD17 path only - that is the default path since 0163 -
++ * and replaces the 128 32-bit buffer-port reads with one controller DMA
++ * into the 64 KiB bounce buffer plus a 512-byte memcpy. Per SDHCI 3.0 the
++ * SDMA System Address register is 0x00, a register of its own (Argument is
++ * 0x08), written BEFORE the command with the transfer-mode DMA-enable bit
++ * set - the old "0x08 after the command" latch trick of the first DMA
++ * draft was a misreading of the spec and is gone. Everything stays polled:
++ * transfer complete is polled from NORMAL_INT_STATUS exactly like
++ * buffer-ready is in PIO, no interrupts are enabled. On any DMA error
++ * (error bits or timeout) the chunk recovers like the chunk path recovers a
++ * failed chunk (pra_emmc_recover()) and DMA latches off for the boot with
++ * one print. emmcdma=2 (SDMA for CMD23+CMD18 chunks) is a documented
++ * follow-up, deliberately NOT combined into this flag. Expectations
++ * (WORKLOG section 7): per-sector SDMA kills the ~42 us port drain (buf
++ * ~42 us -> ~1-2 us, the memcpy) but the ~137 us command overhead remains,
++ * so the per-sector ceiling moves ~2.7 -> ~3.5 MB/s; the real speedup
++ * still requires the CMD23 chunk path (emmcmulti=1), where the 137 us
++ * amortises over up to 128 sectors - and emmcdma=2 would make that chunk
++ * drain cheaper too, once CMD23 is validated on hardware.
++ *
+  */
+ #if defined(ARM64_BOARD_CONFIG_PRA)
+ #include <sys/param.h>
+@@ -75,6 +98,7 @@
+ #define PRA_SDHCI_BASE_DEFAULT 0xFF390000ULL
+ 
+ /* SDHCI register offsets (Arasan SDHCI 3.0, 32-bit buffer port). */
++#define SDHCI_SDMA_ADDR        0x00u   /* SDMA System Address (DMA only) */
+ #define SDHCI_BLOCK_SIZE       0x04u
+ #define SDHCI_BLOCK_COUNT      0x06u
+ #define SDHCI_ARGUMENT         0x08u
+@@ -93,6 +117,7 @@
+ #define SDHCI_NORMAL_INT_STATUS_EN 0x34u
+ #define SDHCI_NORMAL_INT_SIGNAL_EN 0x38u
+ #define SDHCI_CAPABILITIES     0x40u
++#define SDHCI_CAPABILITIES_2   0x44u
+ #define SDHCI_HOST_VERSION     0xFEu
+ 
+ #define NORMAL_CMD_COMPLETE    (1u << 0)
+@@ -120,6 +145,7 @@
+ #define TRANSFER_SINGLE_READ   0x12u   /* block count enable, read, single */
+ #define TRANSFER_MULTI_READ    0x36u   /* count enable, read, multi, auto CMD12 */
+ #define TRANSFER_SINGLE_WRITE  0x02u   /* block count enable, write, single */
++#define TRANSFER_DMA_ENABLE    0x01u   /* transfer mode bit 0: DMA enable (SDMA) */
+ 
+ /* Largest read issued as one CMD18, and the last rung of the chunk ladder.
+  * Per-command overhead, not the bus, is the measured limit: healthy
+@@ -176,6 +202,26 @@
+  * the conversion to nanoseconds happens once per report, not per request. */
+ static uint64_t pra_emmc_stat_wait_ticks, pra_emmc_stat_buf_ticks;
+ static uint64_t pra_emmc_stat_rread_ops;
++/* SDMA, strictly opt-in via emmcdma=1 and runtime-verified (default OFF):
++ * the caps bits say the hardware exists (ADMA2 bit 19, SDMA bit 22 of
++ * 0x44ecc881), but not one DMA transfer has ever run on this controller,
++ * so arming requires proof, never assumption. pra_emmc_dma_phys is valid
++ * only after the probe walked the whole 64 KiB bounce buffer page by page
++ * (ml_vtophys) and found it physically contiguous, 4-byte aligned and
++ * below 4 GiB (the system address register is 32 bits); anything else
++ * prints ONE warning and the boot stays PIO. One failed SDMA transfer
++ * (error bits or timeout) recovers exactly like 0163 (pra_emmc_recover())
++ * and latches DMA off for the boot. The bounce buffer doubles as the CMD17
++ * DMA target: a 512-byte read DMAs into buf[0..511] and is memcpy'd to the
++ * caller's sector, so a controller misfire corrupts a known static buffer
++ * instead of an arbitrary kernel page, and the whole-buffer contiguity
++ * proof carries over to the future emmcdma=2 chunk mode unchanged. */
++static bool pra_emmc_dma_ok;
++static uint64_t pra_emmc_dma_phys;
++extern vm_offset_t ml_vtophys(vm_offset_t vaddr);       /* machine_routines.h */
++extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length); /* caches_internal.h */
++/* read_sector runs before this definition; DMA failures there recover. */
++static void pra_emmc_recover(void);
+ static LCK_GRP_DECLARE(pra_emmc_grp, "pra_emmc");
+ static LCK_MTX_DECLARE(pra_emmc_lock, &pra_emmc_grp);
+ 
+@@ -329,6 +375,10 @@
+ 	struct pra_sdhci_saved s;
+ 	uint32_t status = 0;
+ 	int error = 0;
++	/* Snapshot: the DMA branch below latches pra_emmc_dma_ok off on its
++	 * own failure; this call then still finishes on the DMA path it
++	 * armed with (the recovery runs before any later sector starts). */
++	bool dma = pra_emmc_dma_ok;
+ 	uint64_t t_wait = pra_emmc_stats ? mach_absolute_time() : 0;
+ 
+ 	if (pra_emmc_wait_ready()) {
+@@ -344,7 +394,25 @@
+ 	pra_emmc_wr16(SDHCI_BLOCK_SIZE, 512);
+ 	pra_emmc_wr16(SDHCI_BLOCK_COUNT, 1);
+ 	pra_emmc_wr32(SDHCI_ARGUMENT, lba);
+-	pra_emmc_wr16(SDHCI_TRANSFER_MODE, TRANSFER_SINGLE_READ);
++	if (dma) {
++		/* Clean+invalidate the bounce range BEFORE the controller
++		 * writes it behind the CPU: a dirty line left behind would be
++		 * written back after the DMA and corrupt the sector, and a
++		 * stale cached line would be served to the memcpy without
++		 * ever reaching DRAM. */
++		FlushPoC_DcacheRegion((vm_offset_t)pra_emmc_multi_buf, 512);
++		/* SDMA System Address (0x00) is its own register, distinct
++		 * from the Argument (0x08): per SDHCI 3.0 it is written
++		 * BEFORE the command while DMA enable is set in the transfer
++		 * mode. A 512-byte chunk inside the page-contiguous bounce
++		 * cannot cross the 512 KiB SDMA buffer boundary, so no
++		 * boundary interrupt is expected. */
++		pra_emmc_wr32(SDHCI_SDMA_ADDR, (uint32_t)pra_emmc_dma_phys);
++		pra_emmc_wr16(SDHCI_TRANSFER_MODE,
++		    TRANSFER_SINGLE_READ | TRANSFER_DMA_ENABLE);
++	} else {
++		pra_emmc_wr16(SDHCI_TRANSFER_MODE, TRANSFER_SINGLE_READ);
++	}
+ 	__asm__ volatile("dsb sy" : : : "memory");
+ 	pra_emmc_wr16(SDHCI_COMMAND, CMD_R1_DATA_READ);
+ 
+@@ -375,39 +443,96 @@
+ 	}
+ 	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS, NORMAL_CMD_COMPLETE);
+ 
+-	error = ETIMEDOUT;
+-	for (unsigned i = 0; i < 2000000; i++) {
+-		status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
+-		if (status & SDHCI_ERROR_BITS) {
+-			printf("PRA eMMC: CMD17 lba=%u data error status=%x\n", lba, status);
+-			error = EIO;
++	if (dma) {
++		/* SDMA: the controller moves the sector into the bounce
++		 * buffer; the CPU waits for transfer complete and never
++		 * touches the buffer port (buffer-ready never fires in DMA
++		 * mode - the wait below is on TRANSFER_COMPLETE, polled from
++		 * NORMAL_INT_STATUS in the same PIO style as every other
++		 * wait in this driver). Stats note, so the numbers are read
++		 * right: wait now covers entry to TRANSFER COMPLETE - the
++		 * ~137 us command overhead the per-sector path pays anyway
++		 * is still inside it, SDMA cannot remove that - and buf
++		 * collapses from the ~42 us port drain to the 512-byte
++		 * memcpy (~1-2 us). Expected per-sector line once armed:
++		 * "wait ~140 us buf ~1 us", rate ~2.7 -> ~3.5 MB/s. */
++		error = ETIMEDOUT;
++		for (unsigned i = 0; i < 2000000; i++) {
++			status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++			if (status & SDHCI_ERROR_BITS) {
++				error = EIO;
++				break;
++			}
++			if (status & NORMAL_TRANSFER_COMPLETE) {
++				error = 0;
++				break;
++			}
++		}
++		if (error) {
++			/* One print, then DMA is off for the boot and every
++			 * later sector takes the proven PIO path below. The
++			 * recovery is exactly 0163's chunk recovery: CMD12
++			 * stop (the controller may hold DMA state after a
++			 * failed transfer), CMD|DAT soft reset, ready wait. */
++			printf("PRA eMMC: CMD17 lba=%u dma status=%x, "
++			    "SDMA off for this boot\n", lba, status);
++			pra_emmc_dma_ok = false;
++			pra_emmc_recover();
+ 			goto out;
+ 		}
+-		if (status & NORMAL_BUFFER_READ_READY) {
+-			error = 0;
+-			break;
++		/* Invalidate after the transfer: any line the CPU pulled in
++		 * speculatively while the controller was writing must go
++		 * before the memcpy. There are no dirty lines here - the
++		 * pre-DMA flush cleaned them and the CPU has not written
++		 * the bounce since - so clean+invalidate is just a safe
++		 * invalidate. */
++		FlushPoC_DcacheRegion((vm_offset_t)pra_emmc_multi_buf, 512);
++		if (pra_emmc_stats) {
++			uint64_t now = mach_absolute_time();
++			pra_emmc_stat_wait_ticks += now - t_wait;
++			t_wait = now;
++		}
++		memcpy(sector, pra_emmc_multi_buf, 512);
++		if (pra_emmc_stats) {
++			pra_emmc_stat_buf_ticks += mach_absolute_time() - t_wait;
++			pra_emmc_stat_rread_ops++;
++		}
++		error = 0;
++	} else {
++		error = ETIMEDOUT;
++		for (unsigned i = 0; i < 2000000; i++) {
++			status = pra_emmc_rd32(SDHCI_NORMAL_INT_STATUS);
++			if (status & SDHCI_ERROR_BITS) {
++				printf("PRA eMMC: CMD17 lba=%u data error status=%x\n", lba, status);
++				error = EIO;
++				goto out;
++			}
++			if (status & NORMAL_BUFFER_READ_READY) {
++				error = 0;
++				break;
++			}
++		}
++		if (error) {
++			printf("PRA eMMC: CMD17 lba=%u data timeout status=%x\n", lba, status);
++			goto out;
+ 		}
+-	}
+-	if (error) {
+-		printf("PRA eMMC: CMD17 lba=%u data timeout status=%x\n", lba, status);
+-		goto out;
+-	}
+ 
+-	if (pra_emmc_stats) {
+-		uint64_t now = mach_absolute_time();
+-		pra_emmc_stat_wait_ticks += now - t_wait;
+-		t_wait = now;
+-	}
+-	{
+-		uint32_t data[128];
+-		for (unsigned i = 0; i < 128; i++) {
+-			data[i] = pra_emmc_rd32(SDHCI_BUFFER);
++		if (pra_emmc_stats) {
++			uint64_t now = mach_absolute_time();
++			pra_emmc_stat_wait_ticks += now - t_wait;
++			t_wait = now;
++		}
++		{
++			uint32_t data[128];
++			for (unsigned i = 0; i < 128; i++) {
++				data[i] = pra_emmc_rd32(SDHCI_BUFFER);
++			}
++			memcpy(sector, data, sizeof(data));
++		}
++		if (pra_emmc_stats) {
++			pra_emmc_stat_buf_ticks += mach_absolute_time() - t_wait;
++			pra_emmc_stat_rread_ops++;
+ 		}
+-		memcpy(sector, data, sizeof(data));
+-	}
+-	if (pra_emmc_stats) {
+-		pra_emmc_stat_buf_ticks += mach_absolute_time() - t_wait;
+-		pra_emmc_stat_rread_ops++;
+ 	}
+ 	pra_emmc_wr32(SDHCI_NORMAL_INT_STATUS,
+ 	    NORMAL_TRANSFER_COMPLETE | NORMAL_BUFFER_READ_READY);
+@@ -1644,17 +1769,77 @@
+ 	uint16_t clk = pra_emmc_rd16(SDHCI_CLOCK_CONTROL);
+ 	uint32_t present = pra_emmc_rd32(SDHCI_PRESENT_STATE);
+ 	uint32_t caps = pra_emmc_rd32(SDHCI_CAPABILITIES);
++	uint32_t caps2 = pra_emmc_rd32(SDHCI_CAPABILITIES_2);
+ 	uint32_t base_mhz = (caps >> 8) & 0xffu;
+ 	uint32_t div = clk >> 8;
+ 	printf("PRA eMMC: host base=%llx version=%x clock=%x present=%x power=%x "
+-	    "caps=%x base=%u MHz div=%u\n",
++	    "caps=%x caps2=%x base=%u MHz div=%u\n",
+ 	    base, version, clk, present,
+ 	    (uint32_t)*(volatile unsigned char *)(pra_emmc_regs + SDHCI_POWER_CONTROL),
+-	    caps, base_mhz, div);
++	    caps, caps2, base_mhz, div);
++	/* caps 0x44ecc881 on every ring so far (ring18:2/ring19:2): ADMA2
++	 * (bit 19), SDMA (bit 22), HS (bit 21), 8-bit (bit 18), 3.3/1.8 V
++	 * (bits 24/26), base clock 200 MHz, 512 B max PIO block. caps2 was
++	 * never read before 0002; per SDHCI 3.0 its bits 0/1/2 are
++	 * SDR50/SDR104/DDR50 support and bit 3 HS200 - UNKNOWN which of
++	 * those this Arasan integration implements, so it is printed and
++	 * not acted on. */
+ 	if ((version & 0xffu) != 2 && (version & 0xffu) != 3) {
+ 		printf("PRA eMMC: unexpected SDHCI spec version %u\n", version & 0xffu);
+ 	}
+ 	pra_emmc_ensure_clock();
++	/* emmcdma=1 arms SDMA for the per-sector CMD17 path (default OFF -
++	 * without it every boot is byte-identical to the proven PIO path).
++	 * The 64 KiB bounce buffer must be physically contiguous page by
++	 * page, 4-byte aligned at its physical base (the SDHCI system
++	 * address minimum) and below 4 GiB (the register is 32 bits); kernel
++	 * bss is expected to satisfy all three, but a wrong guess would
++	 * program a bogus system address, so this is checked, never assumed,
++	 * and a rejection prints ONE warning and keeps the boot on PIO. Host
++	 * control bit 3 (DMA select) is forced to 0 = SDMA and both values
++	 * are printed, since the LK handoff state is only known from the
++	 * probe print (0x800bf4 has it clear, ring19:2). emmcdma=2 - SDMA
++	 * for the CMD23+CMD18 chunks, where the drain cost really matters -
++	 * is a follow-up, deliberately NOT combined into this flag: this
++	 * first flag changes exactly one loop (the 128-word port drain into
++	 * a DMA wait + memcpy) and is independently latchable off. */
++	int dma = 0;
++	if (PE_parse_boot_argn("emmcdma", &dma, sizeof(dma))) {
++		if (dma == 1) {
++			vm_offset_t bvaddr = (vm_offset_t)pra_emmc_multi_buf;
++			uint64_t phys = ml_vtophys(bvaddr);
++			bool contig = true;
++			/* Walk at 4 KiB granularity: a subdivision of every
++			 * page size this build might use (4K/16K), so the
++			 * check is valid either way. */
++			for (vm_offset_t off = 0x1000u;
++			    off < sizeof(pra_emmc_multi_buf); off += 0x1000u) {
++				if (ml_vtophys(bvaddr + off) != phys + off) {
++					contig = false;
++					break;
++				}
++			}
++			if (!contig || (phys & 3u) || (phys >> 32)) {
++				printf("PRA eMMC: emmcdma=1 rejected, bounce "
++				    "not DMA-able (contig=%d phys=%llx); PIO "
++				    "this boot\n", contig, phys);
++			} else {
++				uint8_t hc = pra_emmc_rd8(SDHCI_HOST_CONTROL);
++				pra_emmc_dma_phys = phys;
++				printf("PRA eMMC: SDMA armed per-sector, "
++				    "bounce phys=%llx host_control %x -> %x\n",
++				    phys, hc, hc & ~(uint8_t)0x8u);
++				pra_emmc_wr8(SDHCI_HOST_CONTROL,
++				    hc & ~(uint8_t)0x8u);
++				pra_emmc_dma_ok = true;
++			}
++		} else if (dma == 2) {
++			printf("PRA eMMC: emmcdma=2 (CMD23 chunk SDMA) is a "
++			    "follow-up, not implemented; PIO\n");
++		} else {
++			printf("PRA eMMC: unknown emmcdma=%d, PIO\n", dma);
++		}
++	}
+ 	/* 0162 (auto CMD12) and 0162b (manual CMD12) both proved that an
+ 	 * open-ended CMD18 wedges this controller+card until power cycle, and
+ 	 * the flood then hides all evidence by starving the log flusher. So
