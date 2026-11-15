@@ -15,13 +15,14 @@
 # !! DROPS ARGS. Every boot that skipped these args failed on the phone:     !!
 # !!                                                                        !!
 # !!   cpus=1              -> hangs (SMP boot never completes)              !!
-# !!   emmcmulti=0         -> 0001 makes CMD18 multi-block reads default;   !!
-# !!                          do NOT put emmcmulti=0 back without reading   !!
-# !!                          research/driver-specs/emmc-work/WORKLOG.md:   !!
-# !!                          the old wedge (soft reset without CMD12) is   !!
-# !!                          fixed in-driver and the ladder bounds it;      !!
-# !!                          emmcmulti=0 or emmcmulti=2 remain escape       !!
-# !!                          hatches for one-off CMDLINE experiments only   !!
+# !!   emmcmulti=1         -> 0163 made per-sector CMD17 the driver default !!
+# !!                          again: 0162 (auto CMD12) and 0162b (manual    !!
+# !!                          CMD12) BOTH wedged the card - CMD18 without    !!
+# !!                          CMD23 is an open-ended stream this Arasan      !!
+# !!                          never stops. emmcmulti=1 is the CMD23 opt-in  !!
+# !!                          experiment; keep it OUT of the default        !!
+# !!                          cmdline until it survives a boot (see         !!
+# !!                          research/driver-specs/emmc-work/WORKLOG.md)   !!
 # !!   missing pralog=1    -> no eMMC ring at all -> every boot's evidence  !!
 # !!                          is lost (this is the panic-capture path)      !!
 # !!   missing wdt=-1      -> watchdog reboots the panic off the screen     !!
@@ -43,12 +44,13 @@ mkdir -p "$OUT"
 
 python3 tools/mkadt_pra.py "$OUT/adt-pra.bin"
 
-# The proven-good cmdline (0153..0158b boots), with emmcmulti=0 dropped by
-# 0001: CMD18 reads are now the driver default with the ladder + stop fixes
-# in-driver (bsd/dev/pra_sdhci.c), so no boot arg is needed to enable them
-# and emmcmulti=0 stays an escape hatch, not a critical arg. cpus=4,
-# pralog=1 praloglba=794623 (the eMMC ring at the erecovery tail), wdt=-1
-# (panic stays on screen). Keep in sync with AGENTS.md.
+# The proven-good cmdline (0153..0158b boots), unchanged by 0163: the driver
+# default is per-sector CMD17 reads again (0162/0162b both wedged the card on
+# CMD18 - see research/driver-specs/emmc-work/WORKLOG.md), so no emmcmulti
+# arg is needed and emmcmulti=1 (CMD23 opt-in) stays a one-off experiment,
+# not a critical arg. cpus=4, pralog=1 praloglba=794623 (the eMMC ring at
+# the erecovery tail), wdt=-1 (panic stays on screen). Keep in sync with
+# AGENTS.md.
 : "${CMDLINE:=debug=0xc serial=3 cpus=4 keepsyms=1 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1 emmcstats=1 pralog=1 praloglba=794623 sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1 sweetsample=Setup praexecskip=locationd,WirelessRadioManagerd,fairplayd.H2,bluetoothd,nanotimekitcompaniond,CommCenter}"
 
 if [ "${CMDLINE}" != "debug=0xc serial=3 cpus=4 keepsyms=1 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1 emmcstats=1 pralog=1 praloglba=794623 sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1 sweetsample=Setup praexecskip=locationd,WirelessRadioManagerd,fairplayd.H2,bluetoothd,nanotimekitcompaniond,CommCenter" ]; then

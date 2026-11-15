@@ -30,11 +30,12 @@ echo "image:   $IMG ($BYTES B, $SECTORS sectors, sha256 $WANT)"
 # !! HARD GATE: the image's cmdline must carry the critical PRA boot args.  !!
 # !! Boots without these failed on the phone, exactly, every time:          !!
 # !!   cpus=4              - cpus=1 hangs the SMP boot                      !!
-# !!   emmcmulti=0 is GONE from the list as of 0001: CMD18 multi-block     !!
-# !!                         reads are the driver default now (ladder +     !!
-# !!                         explicit-stop fallback in pra_sdhci.c); the    !!
-# !!                         old "card busy" wedge is fixed in-driver.      !!
-# !!                         emmcmulti=0/2 stay one-off CMDLINE experiments. !!
+# !!   no emmcmulti needed as of 0163: the driver default is per-sector     !!
+# !!                         CMD17 again (0162 auto-CMD12 AND 0162b manual  !!
+# !!                         CMD12 both wedged the card into "card busy     !!
+# !!                         skip read" floods; CMD18 without CMD23 is an   !!
+# !!                         open-ended stream). emmcmulti=1 is the one-off  !!
+# !!                         CMD23 opt-in experiment - see emmc-work.       !!
 # !!   pralog=1 praloglba=794623 - no eMMC ring -> all boot evidence lost   !!
 # !!   wdt=-1              - watchdog reboots the panic off the screen      !!
 # !! This gate exists because agents keep "simplifying" the cmdline. To     !!
