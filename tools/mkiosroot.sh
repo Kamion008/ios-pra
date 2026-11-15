@@ -259,17 +259,25 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 # others warn if absent so name drift is visible without failing the build.
 say "removing unsatisfiable launchd jobs (donor v12 CommCenter removal)"
 ld="$work/root/System/Library/LaunchDaemons"
-commcenter_plist=$(ls "$ld" | grep -i '^com.apple.commcenter' | head -1)
-if [[ -z $commcenter_plist ]]; then
+# EVERY CommCenter variant (the first build grabbed only
+# CommCenterMobileHelper.plist and left the main CommCenter.plist - the
+# actual CoreTelephony blocker - behind).
+cc_removed=0
+for f in "$ld"/com.apple.[Cc]ommcenter*.plist; do
+	[[ -e $f ]] || continue
+	sudo rm "$f"
+	echo "  removed ${f##*/}"
+	cc_removed=1
+done
+if (( ! cc_removed )); then
 	echo "error: no CommCenter plist in LaunchDaemons - the removal list needs updating" >&2
 	exit 1
 fi
-for name in "$commcenter_plist" \
+for name in \
 	com.apple.bluetoothd.plist \
 	com.apple.fairplayd.H2.plist \
 	com.apple.nanotimekitcompaniond.plist \
-	com.apple.locationd.plist \
-	com.apple.WirelessRadioManagerd.plist; do
+	com.apple.locationd.plist; do
 	if [[ -f "$ld/$name" ]]; then
 		sudo rm "$ld/$name"
 		echo "  removed $name"
@@ -277,6 +285,8 @@ for name in "$commcenter_plist" \
 		echo "  WARNING: $name not present in LaunchDaemons"
 	fi
 done
+echo "  wireless/radio plists present: $(ls "$ld" | grep -icE 'wireless|radio'):"
+ls "$ld" | grep -iE 'wireless|radio' | sed 's/^/    /' || true
 
 say "copy finished; free space"
 df -h "$work/root"
