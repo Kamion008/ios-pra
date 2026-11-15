@@ -249,6 +249,17 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<plist version="1.0"><dict><key>FBLaunchWatchdogExceptions</key><dict><key>com.apple.purplebuddy</key><integer>65535</integer></dict></dict></plist>' |
 	sudo install -m 0644 -o 501 -g 501 /dev/stdin \
 	"$prefs/com.apple.springboard.plist"
+# v14 SetupDone bypass (the donor's last step): Setup (purplebuddy) cannot
+# render without a GPU device - ring27 measured its main thread living in
+# MIL/Metal at one pc across the whole boot. An empty com.apple.SetupDone
+# plist makes SpringBoard go straight to the lock screen, which renders on
+# the CPU (the donor's proven path: "lock screen, one CPU, CPU rendering").
+# Activation state comes from the ADT's Hactivation properties, not data_ark.
+printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	'<plist version="1.0"><dict/></plist>' |
+	sudo install -m 0644 -o 501 -g 501 /dev/stdin \
+	"$prefs/com.apple.SetupDone.plist"
 
 # Remove the launchd jobs the phone cannot satisfy (no baseband, no
 # bluetooth/NITZ hardware) instead of only blocking their binaries: with the
