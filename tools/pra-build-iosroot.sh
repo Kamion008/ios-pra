@@ -7,9 +7,10 @@
 # hfsprogs.
 #
 #   (default)  research/iosroot/ios16-root.img        trimmed, SIZE 9796M
-#              that is the whole stock userdata partition (p58, 10031104 KiB
-#              = 9.57 GiB); mkiosroot.sh drops only data no first-boot UI
-#              loads, so Setup.app, the setup panes and the staged apps stay.
+#              that is the userdata partition (p58, 14340096 KiB = 14 GiB
+#              after the GPT resize, research/gpt/geometry.env); mkiosroot.sh
+#              drops only data no first-boot UI loads, so Setup.app, the
+#              setup panes and the staged apps stay.
 #   --full     research/iosroot/ios16-root-full.img   complete payload, SIZE 12G
 #              keeps every file; needs a bigger partition than stock userdata,
 #              so it is for a future GPT resize, not for staging today.
@@ -77,8 +78,18 @@ if [[ -e $out ]]; then
     fi
 fi
 
-# p58 userdata from the stock GPT: first LBA 10715136, 10031104 KiB.
-userdata_kib=10031104
+# p58 userdata size, read from the GPT-resize geometry so it cannot drift:
+# stock was 10715136 first LBA + 10031104 KiB; after the resize (research/gpt/
+# geometry.env) it is first LBA 2097152 + 14340096 KiB.
+geometry=${geometry:-$(dirname "$0")/../research/gpt/geometry.env}
+if [[ -r $geometry ]]; then
+    # shellcheck disable=SC1090
+    source "$geometry"
+    userdata_kib=${USERDATA_KIB:?geometry.env lacks USERDATA_KIB}
+else
+    echo "warning: $geometry unreadable, assuming the post-resize 14340096 KiB" >&2
+    userdata_kib=14340096
+fi
 want_kib=$(numfmt --from=iec "$size" | awk '{print int($1/1024)}')
 if (( full )); then
     echo "full build: $size (${want_kib} KiB); this will NOT fit the ${userdata_kib} KiB userdata partition"
