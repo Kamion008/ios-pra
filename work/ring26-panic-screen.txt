@@ -1,0 +1,28 @@
+Hand transcription of the phone photo (2026-11-15 ~19:40) of the ring26-boot
+panic. The ring did NOT capture this (the panic flush failed: "PRA LOG:
+panic flush failed 16" on the same screen) - the photo is the only record.
+
+Context lines immediately before the panic (the display pipeline was live):
+  SWEET SURF: backboardd sel 27
+  exec xpcproxy
+  SWEET SURF: backboardd sel 5
+  SWEET SURF: backboardd trap 2
+  SWEET SURF: backboardd trap 3
+  SWEET FB: backboardd sel 4 in 0/0 out 1/0 -> 0x0
+  SWEET FB: backboardd sel 68 in 1/0 out 0/0 -> 0x0
+  panic(cpu 2 caller 0xffffff8007ac8c8c): Kernel data abort, at pc
+  0xffffff800749bbdc, lr 0xffffff800749bba8 (saved state: 0xffffffbbd76eed10)
+  ... (registers; the notable ones)
+  x8:  0xffffff6f6144000   far: 0xffffff6f6144100  (= x8 + 0x100)
+  pc:  0xffffff800749bbdc  esr: 0x96000210   cpsr: 0x60000204
+  handshake structure not initialized
+  PRA LOG: panic flush: lock stuck, stealing
+  PRA eMMC: card busy, skipped 1 writes (last lba=794624)
+  PRA LOG: panic flush failed 16
+
+Decoded (post-session): esr 0x96000210 = synchronous external abort (the
+PA has no responder); caller 0x7ac8c8c = _sleh_synchronous_sp1; pc
+0x749bbdc sits inside _pg_bringup (between _prague_gpu_up 0x749bab0 and
+_prague_gpu_reg 0x749c5e0) - the GPU bring-up writing the guessed
+pragpu_pa=0x31000000 carveout. Ring26 also proves the display pipeline:
+IOSurface 1080x1920 created (id 3, 8355840 B) and swaps 3-5 presented.

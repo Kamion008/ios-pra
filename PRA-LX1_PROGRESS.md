@@ -823,3 +823,59 @@ probe also ran before `ip_mq_lock(port)`, racing the union transition.
 and `pra_task_comm` reads `task_get_proc_raw` (cannot panic) instead of
 `get_bsdtask_info`. Flashed as `pra-xnu-0160-probe-fix.img` (sha256
 `f74d10b5…2bfb396`), 2026-11-14 ~18:14.
+
+## 2026-11-15/16: 0161-0172, the CI silent-skip fix, the v12/v14 root, and the current stall
+
+Patch 0161 (sampler start at root-ready, `sweetsample=Setup`) and 0162 (the
+CMD18 ladder) shipped; 0162's boot flooded `card busy, skip read` and the
+emmcmulti=2 "manual stop" build did too. Forensics on the CI kernels proved
+**CI had silently skipped patches for weeks**: build.sh skips any patch
+whose `git apply --check` fails, and 0148's context had drifted, so 0148,
+0162 and 0163 never reached a kernel (run 43711926842's log: `Skipping
+patch ... error: patch failed: bsd/dev/pra_sdhci.c:395`; the shipped object
+had the 0142-era string `CMD18 unavailable (%d)` and no stop_transfer).
+Every flood boot therefore ran 0142's unfixed CMD18 the moment the cmdline
+dropped `emmcmulti=0`. 0164 (commit `d394218`) replaced 0148+0162+0163 with
+one patch generated against the driver lineage CI actually builds, per-
+sector CMD17 default, CMD23+CMD18 behind `emmcmulti=1`, recover-and-latch,
+rate-limited busy prints; the Verify step now asserts one marker string per
+landed patch (grep -F) so a silent skip fails the build. 0165 (`44fcfe5`)
+extends praexecskip to the vnode name. Local verification traps learned:
+git 2.56 skip-detects already-applied patches with rc=0, and GNU patch
+mis-parses the fabricated `index 0000000..1111111` lines; the reliable
+oracle is GNU `patch -p1 --fuzz=0` on index-stripped diffs against
+pristine xnu-8796.141.3 (macOS 13.5 tag), later superseded by the touch
+agent's recipe: stage scripts + `git apply` of the whole stack, zero skips.
+
+The eMMC suite 0166-0170 (`787b226`): wedge-proof ring flushes on chunk
+failure, escalating recovery, `emmctest=1` telemetry, `[+Ns]` boot
+milestones, SDMA behind `emmcdma=1`. 0171 (`73cbaa6`) landed the
+consolidated Mali-T830 GPU bring-up behind `sweetfb_gpu=1` (+ADT nodes);
+0172 (`787a5a1`) the CYTT21403 touch probe behind `pratouch=1`.
+
+Root recipe (tools/mkiosroot.sh, commits `7495772`/`33b1ebc`/`19534aa`/
+`ebdbf0e`): removes ALL four CommCenter plist variants (the first two
+builds missed the capital-C main plist), bluetoothd, fairplayd.H2,
+nanotimekitcompaniond, locationd plists (launchd kept spawning them from
+somewhere else even without plists - see below), and creates
+com.apple.SetupDone.plist (the donor v14 bypass; Setup itself cannot
+render - its main thread sits in MIL/Metal without a GPU device).
+
+Boot evidence: ring26 - the display pipeline ran (IOSurface 1080x1920
+created, swaps 3-5) and then panicked in `_pg_bringup` on the guessed
+`pragpu_pa=0x31000000` (synchronous external abort; the carveout candidate
+is not usable - likely clock-gated; see work/ring26-panic-screen.txt).
+ring27 (no pragpu_pa): swaps 3-7, SpringBoard surface work, but Setup
+stuck in MIL. ring28 (SetupDone root): same stall without Setup. ring29
+(0172 kernel, `sweetsample=SpringBoard,backboardd,Setup`): SpringBoard AND
+backboardd threads sampled 17/19 at one libsystem_kernel stub (byte-decoded
+via subcache .19: the stub before the saved RET is trap -13 =
+`task_dyld_process_info_notify_get`, syscall_sw.h:89) for ~3 h, zero
+further presents, IO quiet, no card errors. The fLock/vsync-notify deadlock
+theory was refuted (notify is async: `sendAsyncResult64WithOptions` with
+`kIOUserNotifyOptionCanDrop`); the mach_vm_deallocate/VM-map-lock reading
+was refuted (off-by-one stub decode). The touch probe answered I2C
+(COMP_VERSION=3132302a, COMP_TYPE=44570140); the HID descriptor read NACKs
+(follow-up needed). The GPU probe requires the real `pragpu_pa` carveout;
+0x31000000 panics. Current state, evidence and the next steps:
+`HANDOFF_2026-11-16.md` (the single source of truth for the stall).

@@ -1,0 +1,87 @@
+diff --git a/xnu/osfmk/vm/vm_user.c b/xnu/osfmk/vm/vm_user.c
+index f7603d9..8d27583 100644
+--- a/xnu/osfmk/vm/vm_user.c
++++ b/xnu/osfmk/vm/vm_user.c
+@@ -417,12 +417,35 @@ vm_allocate_external(
+  *	deallocates the specified range of addresses in the
+  *	specified address map.
+  */
++#if defined(ARM64_BOARD_CONFIG_PRA)
++/*
++ * 0173: ring29 measured every thread of SpringBoard and backboardd parked
++ * in mach_vm_deallocate (trap -12) for the whole boot while the eMMC went
++ * quiet - the VM map lock is held by something that never finishes. These
++ * probes record each in-flight deallocate (thread, range, start time); the
++ * pralog flusher prints the ones older than 10 s, naming the stuck callers.
++ */
++struct pra_vm_probe {
++	uint64_t seq;           /* bumped at entry, zeroed at exit */
++	uint64_t thread;        /* current_thread() */
++	uint64_t start, end;
++	uint64_t t_start;       /* mach_absolute_time */
++};
++struct pra_vm_probe pra_vm_probe_dealloc[16];
++#endif
++
+ kern_return_t
+ mach_vm_deallocate(
+ 	vm_map_t                map,
+ 	mach_vm_offset_t        start,
+ 	mach_vm_size_t  size)
+ {
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	thread_t pra_th = current_thread();
++	struct pra_vm_probe *pra_p = NULL;
++	int pra_i;
++#endif
++
+ 	if ((map == VM_MAP_NULL) || (start + size < start)) {
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+@@ -431,13 +454,45 @@ mach_vm_deallocate(
+ 		return KERN_SUCCESS;
+ 	}
+ 
+-	return vm_map_remove_guard(map,
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	for (pra_i = 0; pra_i < 16; pra_i++) {
++		if (pra_vm_probe_dealloc[pra_i].seq != 0 &&
++		    pra_vm_probe_dealloc[pra_i].thread == (uint64_t)pra_th) {
++			pra_p = &pra_vm_probe_dealloc[pra_i];
++			break;
++		}
++	}
++	if (pra_p == NULL) {
++		for (pra_i = 0; pra_i < 16; pra_i++) {
++			if (pra_vm_probe_dealloc[pra_i].seq == 0) {
++				pra_p = &pra_vm_probe_dealloc[pra_i];
++				break;
++			}
++		}
++	}
++	if (pra_p != NULL) {
++		pra_p->seq++;
++		pra_p->thread = (uint64_t)pra_th;
++		pra_p->start = start;
++		pra_p->end = start + size;
++		pra_p->t_start = mach_absolute_time();
++	}
++#endif
++
++	kern_return_t pra_r = vm_map_remove_guard(map,
+ 	           vm_map_trunc_page(start,
+ 	           VM_MAP_PAGE_MASK(map)),
+ 	           vm_map_round_page(start + size,
+ 	           VM_MAP_PAGE_MASK(map)),
+ 	           VM_MAP_REMOVE_NO_FLAGS,
+ 	           KMEM_GUARD_NONE).kmr_return;
++
++#if defined(ARM64_BOARD_CONFIG_PRA)
++	if (pra_p != NULL) {
++		pra_p->seq = 0;
++	}
++#endif
++	return pra_r;
+ }
+ 
+ /*
