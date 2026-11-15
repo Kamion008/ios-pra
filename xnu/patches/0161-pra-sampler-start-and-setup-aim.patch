@@ -1,0 +1,96 @@
+pra: start the process sampler on the eMMC path, aim it at Setup
+
+The hello screen never presents because Setup (com.apple.purplebuddy)
+hangs at scene creation and the launch watchdog kills it (0x8badf00d,
+20 s process-launch on the 0151 boots, 300 s scene-create since). Its
+second thread parks in xpc_connection_send_message_with_reply_sync()
+waiting for a reply that never comes; the 0153 probe was built to name
+the peer, but in the 0160 boot its 128-entry table filled before the
+smoking gun and the sampled overflow was dominated by a
+kernel_task -> Setup id=0x0 flood that is not a real RPC.
+
+- pra_sdhci now starts the SWEET process sampler where the root device
+  becomes ready. The sampler's start was hooked into sweet_ufs, which
+  never attaches on this eMMC phone, so sweetsample has been dead here
+  since 0054 (0 "SMP" lines in ring17 despite the default boot-arg).
+- pra_msg_probe: table 128 -> 512 triples, and messages with msgh_id 0
+  are skipped entirely so the flood cannot fill the table again.
+- sweet_sample: 90 samples every 120 s (was 40) - PRA boots run for
+  hours and Setup is relaunched after each watchdog kill, so the
+  sampler must outlive the first 300 s hang.
+
+Boot with sweetsample=Setup: the sampler prints Setup's full user
+pc/lr/sp plus fp backtraces ("SMP Setup[pid] slide ...") every 2
+minutes through the hang, and the offline symbolication (research/ipsw-x
+cache + .symbols, slide printed per sample) names the peer and the
+message Setup is stuck on.
+diff --git a/bsd/dev/pra_sdhci.c b/bsd/dev/pra_sdhci.c
+--- a/bsd/dev/pra_sdhci.c
++++ b/bsd/dev/pra_sdhci.c
+@@ -48,6 +48,7 @@
+ #include <machine/atomic.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void sweet_sample_start(void); /* bsd/dev/sweet_sample.c */
+ 
+ #define PRA_SDHCI_BASE_DEFAULT 0xFF390000ULL
+ 
+@@ -1768,6 +1769,15 @@ pra_emmc_rootdev(dev_t *dev)
+ 		    pra_emmc_partition_name,
+ 		    pra_emmc_writable ? "writable" : "read-only");
+ 		pra_log_start();
++		/*
++		 * The SWEET process sampler (sweet_sample.c) is started from the
++		 * sweet_ufs probe, which never attaches on this eMMC phone - the
++		 * sweetsample boot-arg has been dead here since 0054. Start it
++		 * where the root device becomes ready: sweetsample=Setup is what
++		 * catches the com.apple.purplebuddy scene-create hang (the hello
++		 * screen blocker, 0x8badf00d kills since the 0151 boots).
++		 */
++		sweet_sample_start();
+ 	}
+ 	*dev = pra_emmc_bdev;
+ 	return 0;
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -72,7 +72,10 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 		return;
+ 	}
+ 	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+-	for (int i = 0; i < 40; i++) {
++	/* 90 samples x 120 s: PRA boots run for hours and Setup is relaunched
++	 * after each 0x8badf00d kill, so the sampler must outlive the first
++	 * hang (300 s scene-create watchdog) and catch the later ones. */
++	for (int i = 0; i < 90; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+ 		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -2874,7 +2874,7 @@ ipc_kmsg_option_check(
+  * sending holds a reference to the destination port, and a port that
+  * is in a space keeps that space (and its task) alive.
+  */
+-#define PRA_MSG_KEYS 128
++#define PRA_MSG_KEYS 512
+ 
+ struct pra_msg_key {
+ 	task_t          sender;
+@@ -2942,6 +2942,15 @@ pra_msg_probe(ipc_kmsg_t kmsg, ipc_port_t port)
+ 	if (strcmp(sname, "Setup") != 0 && strcmp(rname, "Setup") != 0) {
+ 		return;
+ 	}
++	/*
++	 * The 0160 boot's table filled after 128 distinct triples, and the
++	 * sampled overflow showed the dominant remaining traffic was
++	 * kernel_task -> Setup id=0x0, thousands of times - not a real RPC,
++	 * and it drowned every useful line. Skip the id=0 flood entirely.
++	 */
++	if (hdr->msgh_id == 0) {
++		return;
++	}
+ 
+ 	for (i = 0; i < PRA_MSG_KEYS; i++) {
+ 		if (pra_msg_keys[i].hits == 0) {

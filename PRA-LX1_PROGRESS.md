@@ -19,7 +19,7 @@ failure. Deliberate experiments bypass the flash gate with
 THE CMDLINE (one line, copy-paste verbatim):
 
 ```
-debug=0xc serial=3 cpus=4 keepsyms=1 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1 emmcstats=1 emmcmulti=0 pralog=1 praloglba=794623 sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1
+debug=0xc serial=3 cpus=4 keepsyms=1 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1 emmcstats=1 emmcmulti=0 pralog=1 praloglba=794623 sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1 sweetsample=Setup
 ```
 
 What breaks without each critical arg — all observed on the PRA-LX1:
@@ -35,7 +35,7 @@ What breaks without each critical arg — all observed on the PRA-LX1:
 - **`emmcwrite=1 rootrw=1`** — ring flushes and writable root depend on them.
 - **`emmcstats=1`** — the `PRA eMMC:` IO stats that expose controller stalls.
 - **`wdt_test=no_user_checkin`** — companion to `wdt=-1`.
-- **`sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1`** —
+- **`sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1 sweetsample=Setup`** —
   framebuffer console keep-alive (the on-screen capture path).
 - **`unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1`** —
   boot progress args from the working boots; do not prune.
