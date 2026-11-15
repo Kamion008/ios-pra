@@ -229,6 +229,19 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
 	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
 
+# Skip first-boot data migration: the donor (S8) found datamigrator churns
+# forever on a fresh root until this plist exists, and UIKit's initial-device
+# context (which Setup's launch waits on) reads the same first-boot state.
+# Without it ring19 showed com.apple.datamigrator re-execing 16 times and
+# Setup's BoardServices scene connection never activating.
+prefs="$work/root/private/var/mobile/Library/Preferences"
+sudo install -d -o 501 -g 501 -m 0755 "$prefs"
+printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	'<plist version="1.0"><dict><key>LastSystemVersion</key><string>20H392</string></dict></plist>' |
+	sudo install -m 0644 -o 501 -g 501 /dev/stdin \
+	"$prefs/com.apple.migration.plist"
+
 say "copy finished; free space"
 df -h "$work/root"
 avail=$(df -B1 --output=avail "$work/root" | tail -1)

@@ -78,6 +78,34 @@ def build():
     set_prop(chosen, 'dram-size', mkadt.u64(0x40000000))
     set_prop(chosen, 'firmware-version', mkadt.cstr('pra-hi6250-entry'))
     set_prop(chosen, 'system-firmware-version', mkadt.cstr('pra-hi6250-entry'))
+    # The donor (S8) proved this block is what lets Setup's scene go
+    # foreground; every prop is copied from their working GUI milestone.
+    #
+    # display-scale: MobileGestalt's screen class. Without it the scale is 0
+    # and SpringBoard's FBSDisplayMode is "infxinf@0x" (invalid) - ring18/19
+    # showed Setup's scene created but never made visible (WatchdogVisibility:
+    # Background) and no framebuffer swap after its UI was built. 1080x1920
+    # @3x = 360x640 points, iPhone-SE-class; our A5 fbcon already matches the
+    # panel's 1080 width.
+    set_prop(chosen, 'display-scale', mkadt.u32(3))
+    # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
+    # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
+    # files), so DataMigration never records LastSystemVersion and migrates
+    # on every boot. Synthetic ECID (not the phone's, 'PRA' + 1); chip-id of
+    # the A11 that the iPhone X userland expects.
+    set_prop(chosen, 'unique-chip-id', mkadt.u64(0x5052410000000001))
+    set_prop(chosen, 'chip-id', mkadt.u32(0x8015))
+    # libimg4 (cryptexd) aborts "failed to get crypto algorithm" without it;
+    # real A11+ device trees say sha2-384.
+    set_prop(chosen, 'crypto-hash-method', mkadt.cstr('sha2-384'))
+    # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
+    # MobileGestalt reads these from /chosen, and mobileactivationd's
+    # DeviceType then takes its native "Hactivation" branch (state Activated
+    # without an activation record; no SEP, no baseband here).
+    set_prop(chosen, 'certificate-production-status', mkadt.u32(0))
+    set_prop(chosen, 'effective-production-status-ap', mkadt.u32(0))
+    set_prop(chosen, 'certificate-security-mode', mkadt.u32(1))
+    set_prop(chosen, 'effective-security-mode-sep', mkadt.u32(1))
     cpus = child(root, 'cpus')
     cpu0 = child(cpus, 'cpu0')
     set_prop(cpu0, 'compatible', mkadt.cstr('arm,cortex-a53') +
