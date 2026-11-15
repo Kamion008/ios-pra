@@ -241,6 +241,14 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<plist version="1.0"><dict><key>LastSystemVersion</key><string>20H392</string></dict></plist>' |
 	sudo install -m 0644 -o 501 -g 501 /dev/stdin \
 	"$prefs/com.apple.migration.plist"
+# FrontBoard's scene-create watchdog would kill Setup (com.apple.purplebuddy)
+# while it grinds through class realization on our slow eMMC. 65535 additive
+# seconds = ~18 h; the donor used the same FBLaunchWatchdogExceptions key.
+printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	'<plist version="1.0"><dict><key>FBLaunchWatchdogExceptions</key><dict><key>com.apple.purplebuddy</key><integer>65535</integer></dict></dict></plist>' |
+	sudo install -m 0644 -o 501 -g 501 /dev/stdin \
+	"$prefs/com.apple.springboard.plist"
 
 say "copy finished; free space"
 df -h "$work/root"
