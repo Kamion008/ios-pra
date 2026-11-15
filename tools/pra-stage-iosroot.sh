@@ -17,7 +17,7 @@ yes=${2:-}
 [[ -f $img ]] || { echo "no such image: $img" >&2; exit 1; }
 
 # p58 userdata from the stock GPT: first LBA 10715136, 10031104 KiB.
-userdata_kib=10031104
+userdata_kib=14340096   # after the GPT resize (geometry.env USERDATA_KIB)
 userdata_bytes=$((userdata_kib * 1024))
 img_bytes=$(stat -c %s "$img")
 (( img_bytes <= userdata_bytes )) || {
