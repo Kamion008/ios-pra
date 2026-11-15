@@ -30,8 +30,11 @@ echo "image:   $IMG ($BYTES B, $SECTORS sectors, sha256 $WANT)"
 # !! HARD GATE: the image's cmdline must carry the critical PRA boot args.  !!
 # !! Boots without these failed on the phone, exactly, every time:          !!
 # !!   cpus=4              - cpus=1 hangs the SMP boot                      !!
-# !!   emmcmulti=0         - multi-block reads hit "card busy, skip read"   !!
-# !!                         -> root mount error (hi6250 Arasan controller) !!
+# !!   emmcmulti=0 is GONE from the list as of 0001: CMD18 multi-block     !!
+# !!                         reads are the driver default now (ladder +     !!
+# !!                         explicit-stop fallback in pra_sdhci.c); the    !!
+# !!                         old "card busy" wedge is fixed in-driver.      !!
+# !!                         emmcmulti=0/2 stay one-off CMDLINE experiments. !!
 # !!   pralog=1 praloglba=794623 - no eMMC ring -> all boot evidence lost   !!
 # !!   wdt=-1              - watchdog reboots the panic off the screen      !!
 # !! This gate exists because agents keep "simplifying" the cmdline. To     !!
@@ -48,18 +51,18 @@ i = dec.find(b"debug=0xc")
 cmd = dec[i:dec.find(b"\x00", i)] if i >= 0 else b""
 missing = [a.decode() for a in (
 	b"cpus=4", b"rd=sdhcroot0", b"emmcroot=userdata", b"emmcprobe=1",
-	b"emmcwrite=1", b"rootrw=1", b"emmcmulti=0", b"emmcstats=1",
+	b"emmcwrite=1", b"rootrw=1", b"emmcstats=1",
 	b"pralog=1", b"praloglba=794623", b"wdt=-1", b"wdt_test=no_user_checkin",
 ) if a not in cmd]
 print("cmdline in image (%d B): %s" % (len(cmd), cmd.decode(errors="replace")))
 if missing:
 	print("REFUSING TO FLASH: cmdline is MISSING critical args:", " ".join(missing))
-	print("  cpus=1 hangs; missing emmcmulti=0 -> card busy -> mount error;")
-	print("  missing pralog=1 -> no eMMC ring; missing wdt=-1 -> panic rebooted.")
+	print("  cpus=1 hangs; missing pralog=1 -> no eMMC ring;")
+	print("  missing wdt=-1 -> panic rebooted.")
 	print("  Re-package with tools/pra_package.sh (correct args are its default),")
 	print("  or set PRA_ALLOW_ANY_CMDLINE=1 to flash this experiment anyway.")
 	sys.exit(1)
-print("cmdline OK: all 12 critical args present")
+print("cmdline OK: all 11 critical args present")
 EOF
 then
 	if [ "${PRA_ALLOW_ANY_CMDLINE:-0}" != "1" ]; then

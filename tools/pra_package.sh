@@ -15,9 +15,13 @@
 # !! DROPS ARGS. Every boot that skipped these args failed on the phone:     !!
 # !!                                                                        !!
 # !!   cpus=1              -> hangs (SMP boot never completes)              !!
-# !!   missing emmcmulti=0 -> "PRA eMMC: card busy, skip read" -> mount     !!
-# !!                          error (multi-block reads are broken on the    !!
-# !!                          hi6250 Arasan controller under load)          !!
+# !!   emmcmulti=0         -> 0001 makes CMD18 multi-block reads default;   !!
+# !!                          do NOT put emmcmulti=0 back without reading   !!
+# !!                          research/driver-specs/emmc-work/WORKLOG.md:   !!
+# !!                          the old wedge (soft reset without CMD12) is   !!
+# !!                          fixed in-driver and the ladder bounds it;      !!
+# !!                          emmcmulti=0 or emmcmulti=2 remain escape       !!
+# !!                          hatches for one-off CMDLINE experiments only   !!
 # !!   missing pralog=1    -> no eMMC ring at all -> every boot's evidence  !!
 # !!                          is lost (this is the panic-capture path)      !!
 # !!   missing wdt=-1      -> watchdog reboots the panic off the screen     !!
@@ -39,12 +43,15 @@ mkdir -p "$OUT"
 
 python3 tools/mkadt_pra.py "$OUT/adt-pra.bin"
 
-# The proven-good cmdline (0153..0158b boots). cpus=4, emmcmulti=0 (the
-# card-busy fix), pralog=1 praloglba=794623 (the eMMC ring at the erecovery
-# tail), wdt=-1 (panic stays on screen). Keep in sync with AGENTS.md.
-: "${CMDLINE:=debug=0xc serial=3 cpus=4 keepsyms=1 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1 emmcstats=1 emmcmulti=0 pralog=1 praloglba=794623 sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1 sweetsample=Setup praexecskip=locationd,WirelessRadioManagerd,fairplayd.H2,bluetoothd,nanotimekitcompaniond,CommCenter}"
+# The proven-good cmdline (0153..0158b boots), with emmcmulti=0 dropped by
+# 0001: CMD18 reads are now the driver default with the ladder + stop fixes
+# in-driver (bsd/dev/pra_sdhci.c), so no boot arg is needed to enable them
+# and emmcmulti=0 stays an escape hatch, not a critical arg. cpus=4,
+# pralog=1 praloglba=794623 (the eMMC ring at the erecovery tail), wdt=-1
+# (panic stays on screen). Keep in sync with AGENTS.md.
+: "${CMDLINE:=debug=0xc serial=3 cpus=4 keepsyms=1 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1 emmcstats=1 pralog=1 praloglba=794623 sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1 sweetsample=Setup praexecskip=locationd,WirelessRadioManagerd,fairplayd.H2,bluetoothd,nanotimekitcompaniond,CommCenter}"
 
-if [ "${CMDLINE}" != "debug=0xc serial=3 cpus=4 keepsyms=1 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1 emmcstats=1 emmcmulti=0 pralog=1 praloglba=794623 sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1 sweetsample=Setup praexecskip=locationd,WirelessRadioManagerd,fairplayd.H2,bluetoothd,nanotimekitcompaniond,CommCenter" ]; then
+if [ "${CMDLINE}" != "debug=0xc serial=3 cpus=4 keepsyms=1 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1 emmcstats=1 pralog=1 praloglba=794623 sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1 sweetsample=Setup praexecskip=locationd,WirelessRadioManagerd,fairplayd.H2,bluetoothd,nanotimekitcompaniond,CommCenter" ]; then
 	echo "=============================================================" >&2
 	echo "WARNING: non-default CMDLINE override - every dropped arg has" >&2
 	echo "  a known phone failure mode (see the block in this script)." >&2
@@ -79,15 +86,15 @@ i = dec.find(b"debug=0xc")
 cmd = dec[i:dec.find(b"\x00", i)] if i >= 0 else b""
 missing = [a.decode() for a in (
     b"cpus=4", b"rd=sdhcroot0", b"emmcroot=userdata", b"emmcprobe=1",
-    b"emmcwrite=1", b"rootrw=1", b"emmcmulti=0", b"emmcstats=1",
+    b"emmcwrite=1", b"rootrw=1", b"emmcstats=1",
     b"pralog=1", b"praloglba=794623", b"wdt=-1", b"wdt_test=no_user_checkin",
 ) if a not in cmd]
 print("cmdline in image (%d B): %s" % (len(cmd), cmd.decode(errors="replace")))
 if missing:
     print("FATAL: packaged cmdline is MISSING critical args:", " ".join(missing))
-    print("       the phone WILL fail (cpus=1 hang / card busy / no ring / watchdog)")
+    print("       the phone WILL fail (cpus=1 hang / no ring / watchdog)")
     sys.exit(1)
-print("cmdline OK: all 12 critical args present")
+print("cmdline OK: all 11 critical args present")
 EOF
 
 echo
