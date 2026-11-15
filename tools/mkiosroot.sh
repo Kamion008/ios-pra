@@ -261,13 +261,17 @@ say "removing unsatisfiable launchd jobs (donor v12 CommCenter removal)"
 ld="$work/root/System/Library/LaunchDaemons"
 # EVERY CommCenter variant (the first build grabbed only
 # CommCenterMobileHelper.plist and left the main CommCenter.plist - the
-# actual CoreTelephony blocker - behind).
+# actual CoreTelephony blocker - behind; the second try's glob missed it
+# because the name has capital letters mid-name: "CommCenter").
 cc_removed=0
-for f in "$ld"/com.apple.[Cc]ommcenter*.plist; do
+for f in "$ld"/*.plist; do
 	[[ -e $f ]] || continue
-	sudo rm "$f"
-	echo "  removed ${f##*/}"
-	cc_removed=1
+	base=${f##*/}
+	if [[ ${base,,} == com.apple.commcenter*.plist ]]; then
+		sudo rm "$f"
+		echo "  removed $base"
+		cc_removed=1
+	fi
 done
 if (( ! cc_removed )); then
 	echo "error: no CommCenter plist in LaunchDaemons - the removal list needs updating" >&2
