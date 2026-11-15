@@ -73,12 +73,15 @@ fi
 
 adb -s "$S" get-state >/dev/null 2>&1 || { echo "no adb device $S" >&2; exit 1; }
 
-# Do not boot XNU off a flat battery: the boot is an hour of full CPU.
+# Do not boot XNU off a flat battery: the boot is an hour of full CPU. 25%
+# is enough because the flashing phone is always USB-connected, and USB
+# charges it (the BQ25892 keeps the bootloader's autonomous charging
+# through the XNU boot; a plugged-in phone stays flat or gains %).
 CAP=$(adb -s "$S" shell 'cat /sys/class/power_supply/Battery/capacity' 2>/dev/null | tr -d '\r')
 case "$CAP" in
 ''|*[!0-9]*) echo "warning: battery capacity unreadable, assuming the user decided" ;;
-*) if [ "$CAP" -lt 40 ]; then
-	echo "battery at ${CAP}% (< 40%), not flashing" >&2
+*) if [ "$CAP" -lt 25 ]; then
+	echo "battery at ${CAP}% (< 25%), not flashing" >&2
 	exit 1
 fi ;;
 esac
