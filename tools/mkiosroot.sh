@@ -244,11 +244,39 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 # FrontBoard's scene-create watchdog would kill Setup (com.apple.purplebuddy)
 # while it grinds through class realization on our slow eMMC. 65535 additive
 # seconds = ~18 h; the donor used the same FBLaunchWatchdogExceptions key.
-printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+	printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	'<plist version="1.0"><dict><key>FBLaunchWatchdogExceptions</key><dict><key>com.apple.purplebuddy</key><integer>65535</integer></dict></dict></plist>' |
 	sudo install -m 0644 -o 501 -g 501 /dev/stdin \
 	"$prefs/com.apple.springboard.plist"
+
+# Remove the launchd jobs the phone cannot satisfy (no baseband, no
+# bluetooth/NITZ hardware) instead of only blocking their binaries: with the
+# plist present, launchd still OFFERS the Mach service and CoreTelephony waits
+# forever on the EPERM'd CommCenter (praexecskip), stalling Setup's
+# scene-create. This is exactly the donor's v12 "CommCenter removal" - the
+# milestone that reached their Hello. CommCenter must exist (hard check); the
+# others warn if absent so name drift is visible without failing the build.
+say "removing unsatisfiable launchd jobs (donor v12 CommCenter removal)"
+ld="$work/root/System/Library/LaunchDaemons"
+commcenter_plist=$(ls "$ld" | grep -i '^com.apple.commcenter' | head -1)
+if [[ -z $commcenter_plist ]]; then
+	echo "error: no CommCenter plist in LaunchDaemons - the removal list needs updating" >&2
+	exit 1
+fi
+for name in "$commcenter_plist" \
+	com.apple.bluetoothd.plist \
+	com.apple.fairplayd.H2.plist \
+	com.apple.nanotimekitcompaniond.plist \
+	com.apple.locationd.plist \
+	com.apple.WirelessRadioManagerd.plist; do
+	if [[ -f "$ld/$name" ]]; then
+		sudo rm "$ld/$name"
+		echo "  removed $name"
+	else
+		echo "  WARNING: $name not present in LaunchDaemons"
+	fi
+done
 
 say "copy finished; free space"
 df -h "$work/root"
