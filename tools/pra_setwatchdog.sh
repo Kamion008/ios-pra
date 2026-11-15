@@ -21,7 +21,7 @@ add=${2:-280}
 [[ -f $img ]] || { echo "no such image: $img" >&2; exit 1; }
 
 adb=${ADB:-adb}
-serial=${SERIAL:-57U7N17912003349}
+serial=${SERIAL:?export SERIAL/PRA_SERIAL (serials stay out of git)}
 adb -s "$serial" shell true >/dev/null 2>&1 || {
     echo "no adb device $serial (boot TWRP first)" >&2
     exit 1

@@ -26,7 +26,7 @@ import subprocess
 import sys
 
 SECTOR = 512
-DEFAULT_SERIAL = "57U7N17912003349"
+DEFAULT_SERIAL = None  # serials stay out of git; pass --serial
 PART_LBA = 10715136
 PART_SECTORS = 20062208
 JOURNALED = 1 << 13
@@ -96,6 +96,8 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="clear even if the journal holds transactions")
     args = ap.parse_args()
+    if not args.serial:
+        ap.error("no serial: pass --serial or export PRA_SERIAL (serials stay out of git)")
     if not (args.report or args.off or args.restore):
         ap.error("one of --report/--off/--restore is required")
 

@@ -12,7 +12,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 IMG=${1:?usage: pra_flash_skip.sh IMAGE}
-S=57U7N17912003349
+S=${PRA_SERIAL:?export PRA_SERIAL (serials stay out of git)}
 SEEK_MIB=368
 PART_SECTORS=49152
 

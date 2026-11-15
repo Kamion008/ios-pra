@@ -28,7 +28,7 @@ import subprocess
 import sys
 
 SECTOR = 512
-DEFAULT_SERIAL = "57U7N17912003349"
+DEFAULT_SERIAL = None  # serials stay out of git; pass --serial
 BLOCK = 4096
 DEFAULT_LBA = 30003504          # p58 block 2411046, verified against the catalog
 DEFAULT_FORK = 459
@@ -95,6 +95,8 @@ def main():
     ap.add_argument("--restore", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    if not args.serial:
+        ap.error("no serial: pass --serial or export PRA_SERIAL (serials stay out of git)")
     if not (args.list or args.add or args.restore):
         ap.error("one of --list/--add/--restore is required")
 

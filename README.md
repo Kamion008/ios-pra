@@ -1,103 +1,77 @@
-# iOS on the Samsung Galaxy S8
+# iOS on the Huawei PRA-LX1
 
-**iOS 16.7 on the Samsung Galaxy S8 (SM-G950F, Exynos 8895, `dreamlte`).**
+**XNU (iOS 16 generation) and the unmodified iPhone X iOS 16.7.16 userland, on
+the Huawei PRA-LX1 (hi6250 / Kirin 655, 1080×1920).**
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Galaxy S8. On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard. The phone reaches the **iOS lock screen**.
+This repo ports Apple's open-source XNU kernel (xnu-8796, the iOS 16
+generation) to the Kirin 655 and boots the **unmodified iPhone X iOS 16.7.16
+(20H392) userland** on top of it: launchd, the system daemons, backboardd,
+SpringBoard and Setup. Donor tree: [ios-galaxy-s8](https://github.com/Kamion008/ios-galaxy-s8)
+(Samsung S8 / SWEET, which reached the iOS lock screen).
 
-> ⚠️ Experimental bring-up, not a usable phone OS. It is very slow and much is missing (see [Known bugs](#known-bugs)). Installing it **erases the USERDATA partition** (all Android data). Exynos **SM-G950F** only.
+> ⚠️ Experimental bring-up, not a usable phone OS. Installing it **erases the
+> userdata partition** (all Android data). Only PRA-LX1 (hi6250). Kernel and
+> logs only write to the `erecovery_kernel` partition (p27); bootloaders,
+> recovery, modem, persist and EFS are never touched.
 
-## What works
+## Status (2026-11-15)
 
 | Area | State |
 | --- | --- |
-| Boot | Stock Samsung S-Boot → our loader in the BOOT partition → XNU. Recovery (TWRP), EFS and the bootloaders are not touched |
-| CPU | 4 Cortex-A53 cores (MPIDR 0x100–0x103), started through the PMU + PSCI. 4 KiB pages, GIC-400, 26 MHz timer |
-| Memory | 512 MiB of the upper bank at `0x880000000` |
-| Storage | Own Exynos UFS driver. The iOS root is HFS+ in USERDATA (`sda24`), read/write |
-| iOS userland | iPhone X 16.7.16 root filesystem and shared cache; launchd, daemons, backboardd, SpringBoard |
-| Display | S-Boot framebuffer, 1440×2960 (DECON in command mode). CoreAnimation renders on the CPU |
-| GUI | Apple logo, iOS lock screen (confirmed on the device) |
-| Buttons | Power, volume up/down, Bixby (ALIVE GPIOs) → HID events (seen in the log) |
-| Clock | Date and time from the S2MPS17 RTC, read by the loader |
-| Touch | S6SY761 on `hsi2c_23`: the loader powers its rails (S2MPS17 LDO34/35 over SPEEDY), a polled kernel driver feeds HID touch events; taps and swipes reach SpringBoard |
-| Logs | No need to film the screen: loader and kernel log in ramoops (pmsg) plus a 4 MiB ring at the end of USERDATA, read from TWRP |
+| Boot | Stock Huawei bootloader → LK failsafe loads p27 → our boot image (ADT + payload + cmdline) → XNU |
+| CPU | 4× Cortex-A53 (ARMv8.0, no LSE, no PAN), GIC-400, armv8 timer |
+| Storage | Own Arasan SDHCI eMMC driver (polled PIO). HFS+ iOS root in `userdata`, read/write; GPT-probed |
+| Logs | 4 MiB console ring at the tail of `erecovery_kernel`, flushed every 10 s and on panic (lock steal after a 5 s wait); pulled from TWRP |
+| iOS userland | launchd → 100+ daemons exec; backboardd renders the Apple logo + progress bar and hands the display to the render server; SpringBoard alive for hours |
+| GUI | Apple logo, progress bar, fade — **the Hello screen is the current blocker** |
+| Crashes | Panic backtraces go to screen AND the eMMC ring (`PRA BT:` frames); every kernel panic since 0156 was root-caused and fixed |
 
-## Known bugs
+**Current blocker:** Setup (`com.apple.purplebuddy`) hangs at scene creation
+waiting for a synchronous XPC reply that never arrives; the launch watchdog
+kills it (0x8badf00d). The in-kernel process sampler (`sweetsample=Setup`) now
+dumps its threads every 2 minutes to name the missing peer. Detail:
+[PRA-LX1-noted.md](PRA-LX1-noted.md) and [PRA-LX1_PROGRESS.md](PRA-LX1_PROGRESS.md).
 
-- **Very slow and laggy.** All rendering is on the CPU, there is no GPU. About 15 minutes to the lock screen on one core.
-- The iPhone X 1125×2436 mode hangs on its first frame; the native 1440×2960 mode is used (`sweetfb_native=1`).
-- The Mongoose (big) cluster does not start yet: its L2/cluster power must be enabled.
-- No battery / charging readout (no fuel gauge driver).
-- No Wi-Fi, Bluetooth, cellular, audio, cameras, sensors, GPS or SEP / Face ID.
-- **No GPU.** The Mali-G71 cannot run iOS's Metal / AGX drivers, so hardware graphics is not realistic.
-- Security is off: permissive AMFI/sandbox, stub AppleKeyStore. Do not put anything personal on it.
+## The boot command line
 
-## Roadmap
+The kernel's behavior is dictated by the boot command line. Every critical
+argument has a reproduced failure mode when dropped (`cpus=1` hangs, missing
+`emmcmulti=0` gives card-busy mount errors, missing `pralog` loses all boot
+evidence, missing `wdt=-1` reboots the panic off the screen). The proven
+string is the **default** of `tools/pra_package.sh`, which refuses to package
+— and `tools/pra_flash_skip.sh` refuses to flash — an image missing it. Do not
+weaken those gates; see the banner inside the script.
 
-- [x] S6SY761 touch driver in XNU
-- [x] Fix the 4-core stalls (physical timer)
-- [ ] Bring up the Mongoose cluster (4 more cores), raise the A53 clock (now ~1050 of 1690 MHz)
-- [ ] Faster display path: zero-copy scanout through the DPU input DMA (probe in progress), 1125x2436 presentation (being tested)
-- [ ] 1125×2436 mode without the hang
-- [x] RTC (date/time)
-- [ ] Battery stub or driver (MAX77865 fuel gauge)
-- [ ] More RAM (512 MiB of 4 GiB today)
-- [ ] Vibration motor, backlight brightness
-- [ ] Wi-Fi (BCM4361): a large job
+## Build
 
-Help is welcome: issues and pull requests.
+GitHub Actions (`.github/workflows/xnu.yml`) builds on push touching
+`xnu/patches/**` (macOS runner, Xcode 15.x is required — Xcode 16's `iig`
+emits `IORPC.kernelContent`, which xnu-8796 lacks). The kernel artifact
+(`kernel.development.pra`) is packaged and flashed from a Linux host:
 
-## Installation
-
-Step-by-step guide: **[docs/s8-install.md](docs/s8-install.md)**.
-
-In short:
-1. An unlocked SM-G950F with TWRP and a full partition backup.
-2. The XNU kernel is built on GitHub Actions (workflow `xnu`, `MACHINE_CONFIG=A5XELTE`).
-3. The iOS root image is built from the iPhone X 16.7.16 IPSW, which you download yourself, and is written to USERDATA.
-4. `tools/dreamlte/make-boot.sh` builds the BOOT image (loader + XNU + Apple Device Tree), which is written to `sda7` from TWRP.
-
-## How it boots
-
-```
-S-Boot (stock Samsung bootloader, EL1, MMU off)
-  -> BOOT partition: shim/dreamlte (our loader instead of a Linux Image)
-     -> unmasks the DECON trigger, logs to ramoops, wakes UFS
-     -> copies XNU + ADT from the ramdisk to 0x880000000, builds boot_args
-        -> XNU (xnu-8796, A5XELTE config + patch 0124-dreamlte-s8)
-           -> UFS driver -> HFS+ root in USERDATA
-              -> dyld + shared cache -> launchd -> backboardd + SpringBoard
+```sh
+tools/pra_package.sh /tmp/gh-art/kernel.development.pra   # cmdline is the default
+PRA_SERIAL=<serial> tools/pra_flash_skip.sh shim/pra/outxnu/pra-xnu.img   # p27 + sha256 readback + reboot
+PRA_SERIAL=<serial> sh tools/pra_readlog.sh               # pull the console ring from TWRP
 ```
 
-## Layout
+Device serials stay out of git: every tool takes `PRA_SERIAL` from the
+environment. The repo contains only patches, docs and host tools — the XNU
+source tree, device dumps and boot photos are gitignored.
 
-| Path | What it is |
-| --- | --- |
-| `shim/dreamlte/` | Loader for S-Boot: `loader.c`, UFS / SMP / touch probes |
-| `xnu/patches/` | XNU patches; the S8-specific one is `0124-dreamlte-s8.patch` |
-| `tools/dreamlte/apply-dreamlte.py` | Generator of patch 0124 |
-| `tools/mkadt_dreamlte.py` | Apple Device Tree for the S8 |
-| `tools/dreamlte/make-boot.sh` | Kernel → BOOT image |
-| `tools/mkiosroot.sh`, `tools/dreamlte/finish-iosroot.sh` | iOS root image build |
-| `tools/dreamlte/flash-chunks.ps1` | Writes an image to USERDATA in verified chunks |
-| `tools/dreamlte/pull-sweetlog.ps1` | Pulls the boot logs from TWRP |
-| `DREAMLTE_PROGRESS.md` | Port log: hardware facts, every boot |
+## Repo layout
 
-## Authors
+- `xnu/patches/` — the patch stack CI applies to xnu-8796 (0xx: donors,
+  1xx: PRA bring-up; `0161` is current)
+- `shim/pra/` — the loader (boot image assembly, ADT generator, payload)
+- `tools/` — packaging, flashing, log pulling, root-image surgery
+- `PRA-LX1_PROGRESS.md` / `PRA-LX1-noted.md` — the run diary: every boot, its
+  evidence and the next step
+- `codemagic.yaml` + `tools/codemagic-port.md` — backup pipeline (manual only)
 
-- [@Floppikrob](https://github.com/Floppikrob): Galaxy S8 port
-- [@MakrSas](https://github.com/MakrSas): contributor, mainline Linux on the S8 ([LinuxS8](https://github.com/MakrSas/LinuxS8))
+## Safety
 
-## Credits
-
-- [orhunnx/ios-a5xelte](https://github.com/orhunnx/ios-a5xelte): the Galaxy A5 2016 port (4 KiB pages, Exynos, S-Boot) this project is based on
-- [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet): the original iOS 16 port to the Redmi Note 10 Pro (its README: [docs/upstream-README.md](docs/upstream-README.md))
-- [MakrSas/LinuxS8](https://github.com/MakrSas/LinuxS8): mainline Linux on the Galaxy S8, the reference for touch, buttons and UFS
-- Mainline Linux (Exynos 8895, HSI2C and S6SY761 drivers), [uniLoader](https://github.com/ivoszbg/uniLoader)
-- Apple's open-source releases (xnu, IOHIDFamily, hfs), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), [apfs-fuse](https://github.com/sgan81/apfs-fuse)
-
-iOS belongs to Apple and is not distributed here: download the IPSW yourself.
-
-## License
-
-The XNU patches are derived from XNU and fall under the [APSL 2.0](https://opensource.apple.com/apsl/). Code written after Linux drivers (for example `shim/dreamlte/touch_probe.c`) is GPL-2.0, see the SPDX headers. The upstream projects ios-sweet and ios-a5xelte did not state an overall license, so the remaining files have no separate license yet.
+The flasher writes **only** p27 (`erecovery_kernel`), verifies the sha256
+readback before rebooting, and refuses a battery below 40% (the boot is an
+hour of full CPU). Bootlogs persist on disk, so a hung boot is always
+recoverable by power-cycling into TWRP.
