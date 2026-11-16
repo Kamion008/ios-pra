@@ -199,7 +199,7 @@ jobs:
           # (th/st/wait_event/waitq/continuation) plus a kernel fp backtrace
           # (kbt, only when the blocked stack was kept) to name the wait;
           # wq - offsetof(ipc_port, ip_waitq) names the port offline.
-          strings -a "$kernel" | grep -F 'cont=0x%llx kbt' >/dev/null
+          strings -a "$kernel" | grep -F 'wq=0x%llx cont=0x%llx' >/dev/null
           # 0175 guard: the sampler records the block caller's fp/lr in
           # thread_block_reason (machine.ss's fp chain cannot cross the
           # context switch - ring32 walks ended at _thread_invoke) and walks
