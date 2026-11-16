@@ -1,0 +1,72 @@
+pra: 0175 - sampler records and walks the block caller's frame
+
+ring32: launchd t1 (sync) and SpringBoard t0 (pager fault on a shared-cache
+page) sit UNINTERRUPTIBLY on the SAME wait event (we=0xfffffff6390dce08) -
+one wedged FS object blocks both. The 0173 kbt walk cannot cross the context
+switch: machine.ss's fp chain ends at _thread_invoke, so the pre-block
+caller chain (thread_block_reason -> msleep -> the wedged VFS/journal site)
+was unreachable.
+
+This patch: thread_block_reason records the caller's fp/lr into two new
+thread fields (pra_block_fp/lr) before the switch; the sampler prints the
+caller lr as blr= on every SMP line and, for stack-kept blocks, walks the
+kernel fp chain from pra_block_fp (which crosses into the real pre-block
+callers: msleep -> VFS -> the wedged site). Continuation blocks still print
+cont only (their stack is freed; walking it would read the next thread's
+stack).
+
+Marker asserted in CI (Verify): 'blr=0x%llx kbt'.
+--- a/osfmk/kern/thread.h
++++ b/osfmk/kern/thread.h
+@@ -919,6 +919,12 @@
+ #endif /* CONFIG_IOSCHED */
+ 	struct knote            *ith_knote;         /* knote fired for rcv */
+ 
++	/* 0175: block-caller frame recorded in thread_block_reason so the
++	 * sampler can walk the pre-switch caller chain (the machine saved-
++	 * state fp chain does not survive the context switch: ring32 walks
++	 * ended at _thread_invoke). */
++	uint64_t                pra_block_fp;
++	uint64_t                pra_block_lr;
+ };
+ 
+ #define ith_state           saved.receive.state
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -3824,6 +3824,10 @@
+ 
+ 	self->continuation = continuation;
+ 	self->parameter = parameter;
++	/* 0175: record the block caller's frame for the sampler (the machine
++	 * saved-state fp chain does not survive the context switch). */
++	self->pra_block_fp = (uint64_t)__builtin_frame_address(0);
++	self->pra_block_lr = (uint64_t)__builtin_return_address(0);
+ 
+ 	if (self->state & ~(TH_RUN | TH_IDLE)) {
+ 		KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE,
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1062,15 +1062,20 @@
+ 		uint64_t kfp = 0, klr = 0;
+ 
+ 		n += snprintf(line + n, sizeof(line) - n,
+-		    " th=0x%llx st=0x%x we=0x%llx wq=0x%llx cont=0x%llx kbt",
++		    " th=0x%llx st=0x%x we=0x%llx wq=0x%llx cont=0x%llx blr=0x%llx kbt",
+ 		    (uint64_t)thread, (unsigned int)thread->state,
+ 		    (uint64_t)thread->wait_event, (uint64_t)thread->waitq.wq_q,
+-		    (uint64_t)thread->continuation);
++		    (uint64_t)thread->continuation,
++		    thread->pra_block_lr);
+ 		if (n >= (int)sizeof(line)) {
+ 			n = (int)sizeof(line) - 1;
+ 			line[n] = '\0';
+ 		}
+-		if (ksb != 0) {
++		if (ksb != 0 && thread->pra_block_fp != 0) {
++			/* 0175: the block caller's frame - the real pre-switch chain. */
++			kfp = thread->pra_block_fp;
++			klr = thread->pra_block_lr;
++		} else if (ksb != 0) {
+ 			arm_kernel_saved_state_t *kg =
+ 			    &thread_get_kernel_state(thread)->machine.ss;
+ 			kfp = kg->fp;

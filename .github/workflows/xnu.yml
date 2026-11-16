@@ -200,6 +200,12 @@ jobs:
           # (kbt, only when the blocked stack was kept) to name the wait;
           # wq - offsetof(ipc_port, ip_waitq) names the port offline.
           strings -a "$kernel" | grep -F 'cont=0x%llx kbt' >/dev/null
+          # 0175 guard: the sampler records the block caller's fp/lr in
+          # thread_block_reason (machine.ss's fp chain cannot cross the
+          # context switch - ring32 walks ended at _thread_invoke) and walks
+          # the pre-switch chain for stack-kept blocks, naming the wedged
+          # VFS/journal site that UNINT-blocks launchd sync() and SpringBoard.
+          strings -a "$kernel" | grep -F 'blr=0x%llx kbt' >/dev/null
           echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite, 0165 churn fix, 0171 GPU, 0172 touch probe and 0173 sampler kernel state are linked.'
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
