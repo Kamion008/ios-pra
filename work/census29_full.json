@@ -1,0 +1,588 @@
+{
+ "slides": {
+  "backboardd": "0x2e834000",
+  "SpringBoard": "0x2e834000",
+  "Setup": "0x9764000"
+ },
+ "rows": [
+  {
+   "proc": "backboardd",
+   "pc": "0x1f0e45030",
+   "unslide": "0x1c2611030",
+   "count": 141,
+   "slide": "0x2e834000",
+   "kind": "stub-mach (pc=RET: saved pc = SVC+4)",
+   "movn_vm": "0x1c2611028",
+   "movn_imm": 46,
+   "x16": -47,
+   "trap": -47,
+   "trap_name": "mach_msg2_trap",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0x928005d0",
+    "0xd4001001",
+    "0xd65f03c0",
+    "0x928005f0"
+   ]
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x1f0e45030",
+   "unslide": "0x1c2611030",
+   "count": 107,
+   "slide": "0x2e834000",
+   "kind": "stub-mach (pc=RET: saved pc = SVC+4)",
+   "movn_vm": "0x1c2611028",
+   "movn_imm": 46,
+   "x16": -47,
+   "trap": -47,
+   "trap_name": "mach_msg2_trap",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0x928005d0",
+    "0xd4001001",
+    "0xd65f03c0",
+    "0x928005f0"
+   ]
+  },
+  {
+   "proc": "backboardd",
+   "pc": "0x1f0e454f0",
+   "unslide": "0x1c26114f0",
+   "count": 40,
+   "slide": "0x2e834000",
+   "kind": "stub-bsd (pc=B.cond: saved pc = SVC+4)",
+   "movn_vm": "0x1c26114e8",
+   "movn_imm": 368,
+   "x16": 368,
+   "trap": 368,
+   "trap_name": "workq_kernreturn",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0xd2802e10",
+    "0xd4001001",
+    "0x540000e3",
+    "0xa9bf7bfd"
+   ]
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1f0e45030",
+   "unslide": "0x1e76e1030",
+   "count": 32,
+   "slide": "0x9764000",
+   "kind": "not-stub",
+   "movn_vm": null,
+   "movn_imm": null,
+   "x16": null,
+   "trap": null,
+   "trap_name": null,
+   "image": "/usr/lib/libtidy.A.dylib",
+   "img_addr": "0x1e76d1000",
+   "seg": "[0x1e76d1000,0x1e7701ff4)",
+   "words": [
+    "0xf9401ea8",
+    "0xb4000448",
+    "0xb9411a89",
+    "0x35ffbd09"
+   ]
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1dc979030",
+   "unslide": "0x1d3215030",
+   "count": 30,
+   "slide": "0x9764000",
+   "kind": "not-stub",
+   "movn_vm": null,
+   "movn_imm": null,
+   "x16": null,
+   "trap": null,
+   "trap_name": null,
+   "image": "/System/Library/PrivateFrameworks/MIL.framework/MIL",
+   "img_addr": "0x1d3202000",
+   "seg": "[0x1d3202000,0x1d34a2000)",
+   "words": [
+    "0x949b5bc3",
+    "0x3cd783a0",
+    "0x3c8583e0",
+    "0xf85883a8"
+   ]
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x1f0e454f0",
+   "unslide": "0x1c26114f0",
+   "count": 26,
+   "slide": "0x2e834000",
+   "kind": "stub-bsd (pc=B.cond: saved pc = SVC+4)",
+   "movn_vm": "0x1c26114e8",
+   "movn_imm": 368,
+   "x16": 368,
+   "trap": 368,
+   "trap_name": "workq_kernreturn",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0xd2802e10",
+    "0xd4001001",
+    "0x540000e3",
+    "0xa9bf7bfd"
+   ]
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1cbd75030",
+   "unslide": "0x1c2611030",
+   "count": 20,
+   "slide": "0x9764000",
+   "kind": "stub-mach (pc=RET: saved pc = SVC+4)",
+   "movn_vm": "0x1c2611028",
+   "movn_imm": 46,
+   "x16": -47,
+   "trap": -47,
+   "trap_name": "mach_msg2_trap",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0x928005d0",
+    "0xd4001001",
+    "0xd65f03c0",
+    "0x928005f0"
+   ]
+  },
+  {
+   "proc": "backboardd",
+   "pc": "0x1f0e45ad0",
+   "unslide": "0x1c2611ad0",
+   "count": 17,
+   "slide": "0x2e834000",
+   "kind": "stub-bsd (pc=B.cond: saved pc = SVC+4)",
+   "movn_vm": "0x1c2611ac8",
+   "movn_imm": 515,
+   "x16": 515,
+   "trap": 515,
+   "trap_name": "sys_ulock_wait",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0xd2804070",
+    "0xd4001001",
+    "0x540000e3",
+    "0xa9bf7bfd"
+   ]
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1f0e45ad0",
+   "unslide": "0x1e76e1ad0",
+   "count": 16,
+   "slide": "0x9764000",
+   "kind": "not-stub",
+   "movn_vm": null,
+   "movn_imm": null,
+   "x16": null,
+   "trap": null,
+   "trap_name": null,
+   "image": "/usr/lib/libtidy.A.dylib",
+   "img_addr": "0x1e76d1000",
+   "seg": "[0x1e76d1000,0x1e7701ff4)",
+   "words": [
+    "0xaa1503e0",
+    "0x94003f1d",
+    "0x7100081f",
+    "0x54000183"
+   ]
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1f0e454f0",
+   "unslide": "0x1e76e14f0",
+   "count": 16,
+   "slide": "0x9764000",
+   "kind": "not-stub",
+   "movn_vm": null,
+   "movn_imm": null,
+   "x16": null,
+   "trap": null,
+   "trap_name": null,
+   "image": "/usr/lib/libtidy.A.dylib",
+   "img_addr": "0x1e76d1000",
+   "seg": "[0x1e76d1000,0x1e7701ff4)",
+   "words": [
+    "0xaa0003f5",
+    "0x3100041f",
+    "0x54000520",
+    "0x7100eebf"
+   ]
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x1f0e45538",
+   "unslide": "0x1c2611538",
+   "count": 16,
+   "slide": "0x2e834000",
+   "kind": "stub-bsd (pc=B.cond: saved pc = SVC+4)",
+   "movn_vm": "0x1c2611530",
+   "movn_imm": 375,
+   "x16": 375,
+   "trap": 375,
+   "trap_name": "kevent_id",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0xd2802ef0",
+    "0xd4001001",
+    "0x540000e3",
+    "0xa9bf7bfd"
+   ]
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1dc979ad0",
+   "unslide": "0x1d3215ad0",
+   "count": 15,
+   "slide": "0x9764000",
+   "kind": "not-stub",
+   "movn_vm": null,
+   "movn_imm": null,
+   "x16": null,
+   "trap": null,
+   "trap_name": null,
+   "image": "/System/Library/PrivateFrameworks/MIL.framework/MIL",
+   "img_addr": "0x1d3202000",
+   "seg": "[0x1d3202000,0x1d34a2000)",
+   "words": [
+    "0xc80bfd0a",
+    "0x35ffffab",
+    "0xb50000e9",
+    "0xf94002e8"
+   ]
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1dc9794f0",
+   "unslide": "0x1d32154f0",
+   "count": 15,
+   "slide": "0x9764000",
+   "kind": "not-stub",
+   "movn_vm": null,
+   "movn_imm": null,
+   "x16": null,
+   "trap": null,
+   "trap_name": null,
+   "image": "/System/Library/PrivateFrameworks/MIL.framework/MIL",
+   "img_addr": "0x1d3202000",
+   "seg": "[0x1d3202000,0x1d34a2000)",
+   "words": [
+    "0x91018260",
+    "0xf9403661",
+    "0x97ffff7c",
+    "0x91014260"
+   ]
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x0",
+   "unslide": "0x-2e834000",
+   "count": 11,
+   "slide": "0x2e834000",
+   "kind": "unmapped",
+   "movn_vm": null,
+   "movn_imm": null,
+   "x16": null,
+   "trap": null,
+   "trap_name": null,
+   "image": null,
+   "img_addr": null,
+   "seg": null,
+   "words": null
+  },
+  {
+   "proc": "backboardd",
+   "pc": "0x0",
+   "unslide": "0x-2e834000",
+   "count": 11,
+   "slide": "0x2e834000",
+   "kind": "unmapped",
+   "movn_vm": null,
+   "movn_imm": null,
+   "x16": null,
+   "trap": null,
+   "trap_name": null,
+   "image": null,
+   "img_addr": null,
+   "seg": null,
+   "words": null
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1cbd75ad0",
+   "unslide": "0x1c2611ad0",
+   "count": 10,
+   "slide": "0x9764000",
+   "kind": "stub-bsd (pc=B.cond: saved pc = SVC+4)",
+   "movn_vm": "0x1c2611ac8",
+   "movn_imm": 515,
+   "x16": 515,
+   "trap": 515,
+   "trap_name": "sys_ulock_wait",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0xd2804070",
+    "0xd4001001",
+    "0x540000e3",
+    "0xa9bf7bfd"
+   ]
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1cbd754f0",
+   "unslide": "0x1c26114f0",
+   "count": 10,
+   "slide": "0x9764000",
+   "kind": "stub-bsd (pc=B.cond: saved pc = SVC+4)",
+   "movn_vm": "0x1c26114e8",
+   "movn_imm": 368,
+   "x16": 368,
+   "trap": 368,
+   "trap_name": "workq_kernreturn",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0xd2802e10",
+    "0xd4001001",
+    "0x540000e3",
+    "0xa9bf7bfd"
+   ]
+  },
+  {
+   "proc": "backboardd",
+   "pc": "0x1ae8fb180",
+   "unslide": "0x1800c7180",
+   "count": 1,
+   "slide": "0x2e834000",
+   "kind": "not-stub",
+   "movn_vm": null,
+   "movn_imm": null,
+   "x16": null,
+   "trap": null,
+   "trap_name": null,
+   "image": "/usr/lib/libobjc.A.dylib",
+   "img_addr": "0x1800b8000",
+   "seg": "[0x1800b8000,0x1800f2d80)",
+   "words": [
+    "0xf8408d09",
+    "0x8b080128",
+    "0x39401108",
+    "0x37180068"
+   ]
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x1d2e47d08",
+   "unslide": "0x1a4613d08",
+   "count": 1,
+   "slide": "0x2e834000",
+   "kind": "not-stub",
+   "movn_vm": null,
+   "movn_imm": null,
+   "x16": null,
+   "trap": null,
+   "trap_name": null,
+   "image": null,
+   "img_addr": "0x1a4610000",
+   "seg": "[0x1a4610000,0x1a468c8dc)",
+   "words": [
+    "0x52800001",
+    "0x97fff68e",
+    "0xb9400688",
+    "0x71001d1f"
+   ]
+  },
+  {
+   "proc": "backboardd",
+   "pc": "0x1f0e4657c",
+   "unslide": "0x1c261257c",
+   "count": 1,
+   "slide": "0x2e834000",
+   "kind": "stub-bsd (pc=B.cond: saved pc = SVC+4)",
+   "movn_vm": "0x1c2612574",
+   "movn_imm": 344,
+   "x16": 344,
+   "trap": 344,
+   "trap_name": "getdirentries64",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0xd2802b10",
+    "0xd4001001",
+    "0x540000e3",
+    "0xa9bf7bfd"
+   ]
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x1f0e46728",
+   "unslide": "0x1c2612728",
+   "count": 1,
+   "slide": "0x2e834000",
+   "kind": "stub-bsd (pc=B.cond: saved pc = SVC+4)",
+   "movn_vm": "0x1c2612720",
+   "movn_imm": 5,
+   "x16": 5,
+   "trap": 5,
+   "trap_name": "open",
+   "image": "/usr/lib/system/libsystem_kernel.dylib",
+   "img_addr": "0x1c2610000",
+   "seg": "[0x1c2610000,0x1c2645ff8)",
+   "words": [
+    "0xd28000b0",
+    "0xd4001001",
+    "0x540000e3",
+    "0xa9bf7bfd"
+   ]
+  }
+ ],
+ "threads": {
+  "Setup/t0": {
+   "0x1f0e45ad0": 16,
+   "0x1dc979ad0": 15,
+   "0x1cbd75ad0": 10
+  },
+  "Setup/t1": {
+   "0x1f0e45030": 16,
+   "0x1dc979030": 15,
+   "0x1cbd754f0": 10
+  },
+  "Setup/t2": {
+   "0x1f0e45030": 16,
+   "0x1dc979030": 15,
+   "0x1cbd75030": 10
+  },
+  "Setup/t3": {
+   "0x1f0e454f0": 16,
+   "0x1dc9794f0": 15,
+   "0x1cbd75030": 10
+  },
+  "SpringBoard/t0": {
+   "0x1d2e47d08": 1,
+   "0x1f0e45030": 17,
+   "0x1f0e46728": 1
+  },
+  "SpringBoard/t1": {
+   "0x1f0e454f0": 1
+  },
+  "SpringBoard/t3": {
+   "0x1f0e45030": 17
+  },
+  "SpringBoard/t4": {
+   "0x1f0e45030": 8
+  },
+  "SpringBoard/t5": {
+   "0x1f0e45030": 9
+  },
+  "SpringBoard/t6": {
+   "0x1f0e45030": 8
+  },
+  "SpringBoard/t8": {
+   "0x1f0e45030": 9
+  },
+  "SpringBoard/t9": {
+   "0x1f0e45030": 7
+  },
+  "SpringBoard/t10": {
+   "0x1f0e454f0": 1
+  },
+  "SpringBoard/t11": {
+   "0x1f0e454f0": 1
+  },
+  "SpringBoard/t12": {
+   "0x1f0e454f0": 1,
+   "0x1f0e45538": 9
+  },
+  "SpringBoard/t13": {
+   "0x1f0e454f0": 1,
+   "0x1f0e45538": 7
+  },
+  "SpringBoard/t14": {
+   "0x0": 1,
+   "0x1f0e45030": 9
+  },
+  "SpringBoard/t15": {
+   "0x1f0e45030": 16
+  },
+  "SpringBoard/t16": {
+   "0x1f0e45030": 7,
+   "0x1f0e454f0": 9
+  },
+  "SpringBoard/t17": {
+   "0x1f0e454f0": 12
+  },
+  "SpringBoard/t18": {
+   "0x0": 10
+  },
+  "backboardd/t0": {
+   "0x1ae8fb180": 1,
+   "0x1f0e4657c": 1,
+   "0x1f0e45030": 17
+  },
+  "backboardd/t1": {
+   "0x1f0e454f0": 1,
+   "0x1f0e45030": 17
+  },
+  "backboardd/t2": {
+   "0x1f0e45030": 18
+  },
+  "backboardd/t3": {
+   "0x1f0e45030": 17
+  },
+  "backboardd/t4": {
+   "0x1f0e45030": 17
+  },
+  "backboardd/t5": {
+   "0x1f0e45030": 17
+  },
+  "backboardd/t6": {
+   "0x1f0e45030": 17
+  },
+  "backboardd/t7": {
+   "0x1f0e45030": 17
+  },
+  "backboardd/t8": {
+   "0x1f0e454f0": 1,
+   "0x1f0e45ad0": 16
+  },
+  "backboardd/t9": {
+   "0x1f0e45ad0": 1,
+   "0x1f0e45030": 3,
+   "0x1f0e454f0": 13
+  },
+  "backboardd/t10": {
+   "0x1f0e45030": 1,
+   "0x1f0e454f0": 16
+  },
+  "backboardd/t11": {
+   "0x1f0e454f0": 7,
+   "0x0": 6
+  },
+  "backboardd/t12": {
+   "0x1f0e454f0": 2,
+   "0x0": 5
+  }
+ }
+}

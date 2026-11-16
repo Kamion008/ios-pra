@@ -1,0 +1,185 @@
+{
+ "n_samples": 44,
+ "n_threads_parsed": 537,
+ "slides": {
+  "backboardd": {
+   "slide": "0x2e834000",
+   "mh": "0x100164000",
+   "pid": 56
+  },
+  "SpringBoard": {
+   "slide": "0x2e834000",
+   "mh": "0x10045c000",
+   "pid": 26
+  },
+  "Setup": {
+   "slide": "0x9764000",
+   "mh": "0x100630000",
+   "pid": 476
+  }
+ },
+ "pc_census": [
+  {
+   "proc": "backboardd",
+   "pc": "0x1f0e45030",
+   "count": 141,
+   "unslide": "0x1c2611030"
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x1f0e45030",
+   "count": 107,
+   "unslide": "0x1c2611030"
+  },
+  {
+   "proc": "backboardd",
+   "pc": "0x1f0e454f0",
+   "count": 40,
+   "unslide": "0x1c26114f0"
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1f0e45030",
+   "count": 32,
+   "unslide": "0x1e76e1030"
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1dc979030",
+   "count": 30,
+   "unslide": "0x1d3215030"
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x1f0e454f0",
+   "count": 26,
+   "unslide": "0x1c26114f0"
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1cbd75030",
+   "count": 20,
+   "unslide": "0x1c2611030"
+  },
+  {
+   "proc": "backboardd",
+   "pc": "0x1f0e45ad0",
+   "count": 17,
+   "unslide": "0x1c2611ad0"
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1f0e45ad0",
+   "count": 16,
+   "unslide": "0x1e76e1ad0"
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1f0e454f0",
+   "count": 16,
+   "unslide": "0x1e76e14f0"
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x1f0e45538",
+   "count": 16,
+   "unslide": "0x1c2611538"
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1dc979ad0",
+   "count": 15,
+   "unslide": "0x1d3215ad0"
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1dc9794f0",
+   "count": 15,
+   "unslide": "0x1d32154f0"
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x0",
+   "count": 11,
+   "unslide": "-0x2e834000"
+  },
+  {
+   "proc": "backboardd",
+   "pc": "0x0",
+   "count": 11,
+   "unslide": "-0x2e834000"
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1cbd75ad0",
+   "count": 10,
+   "unslide": "0x1c2611ad0"
+  },
+  {
+   "proc": "Setup",
+   "pc": "0x1cbd754f0",
+   "count": 10,
+   "unslide": "0x1c26114f0"
+  },
+  {
+   "proc": "backboardd",
+   "pc": "0x1ae8fb180",
+   "count": 1,
+   "unslide": "0x1800c7180"
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x1d2e47d08",
+   "count": 1,
+   "unslide": "0x1a4613d08"
+  },
+  {
+   "proc": "backboardd",
+   "pc": "0x1f0e4657c",
+   "count": 1,
+   "unslide": "0x1c261257c"
+  },
+  {
+   "proc": "SpringBoard",
+   "pc": "0x1f0e46728",
+   "count": 1,
+   "unslide": "0x1c2612728"
+  }
+ ],
+ "thread_census": {
+  "Setup t0": 41,
+  "Setup t1": 41,
+  "Setup t2": 41,
+  "Setup t3": 41,
+  "backboardd t0": 19,
+  "SpringBoard t0": 19,
+  "backboardd t1": 18,
+  "backboardd t2": 18,
+  "backboardd t3": 17,
+  "backboardd t4": 17,
+  "backboardd t5": 17,
+  "backboardd t6": 17,
+  "backboardd t7": 17,
+  "backboardd t8": 17,
+  "backboardd t9": 17,
+  "backboardd t10": 17,
+  "SpringBoard t3": 17,
+  "SpringBoard t15": 16,
+  "SpringBoard t16": 16,
+  "backboardd t11": 13,
+  "SpringBoard t17": 12,
+  "SpringBoard t12": 10,
+  "SpringBoard t14": 10,
+  "SpringBoard t18": 10,
+  "SpringBoard t5": 9,
+  "SpringBoard t8": 9,
+  "SpringBoard t4": 8,
+  "SpringBoard t6": 8,
+  "SpringBoard t13": 8,
+  "backboardd t12": 7,
+  "SpringBoard t9": 7,
+  "SpringBoard t1": 1,
+  "SpringBoard t10": 1,
+  "SpringBoard t11": 1
+ }
+}
