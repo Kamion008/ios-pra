@@ -42,3 +42,12 @@ SpringBoard on the phone, CPU-only.
   launchd.plist (donor script removes only CommCenter).
 - 0175 is on master with CI green; the assert fix commit (0173 marker) is
   also on master.
+
+## Second sighting (2026-11-16, later)
+
+Another boot of the same image reached the lock screen, clock showing 8:59
+(vs 4:08 on the milestone boot) — the clock render CHANGES between boots:
+kernel timebase -> timer -> SpringBoard re-render confirmed working. That
+is 2 of the last 3 boots reaching the lock screen; ring34's black-screen
+boot remains the one wedged on _pra_emmc_lock (stochastic). 0176 (the
+pra_emmc_lock discipline fix) should make it every boot.
