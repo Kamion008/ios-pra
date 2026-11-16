@@ -43,11 +43,16 @@ SpringBoard on the phone, CPU-only.
 - 0175 is on master with CI green; the assert fix commit (0173 marker) is
   also on master.
 
-## Second sighting (2026-11-16, later)
+## Second sighting (2026-11-16, later) — CORRECTED
 
-Another boot of the same image reached the lock screen, clock showing 8:59
-(vs 4:08 on the milestone boot) — the clock render CHANGES between boots:
-kernel timebase -> timer -> SpringBoard re-render confirmed working. That
-is 2 of the last 3 boots reaching the lock screen; ring34's black-screen
-boot remains the one wedged on _pra_emmc_lock (stochastic). 0176 (the
-pra_emmc_lock discipline fix) should make it every boot.
+Another boot of the same image reached the lock screen — that is 2 of the
+last 3 boots. CORRECTION (the first version of this note was wrong): the
+"8:59" was the user's stopwatch timing of the boot, NOT the clock. The
+lock screen's clock is FROZEN at 4:08 across boots AND across re-renders
+(swaps went to 15 in ring34's boot while the clock stayed 4:08):
+mach_absolute_time advances (timers, sampler cadence work) but the WALL
+CLOCK does not — the timebase->gettimeofday conversion is broken or zero.
+Next-session item, elevated: fix the kernel wall clock (check the ADT
+timebase 1.92 MHz vs the real CNTFRQ, the clock.c scale, and the boot
+epoch seed). The ring34's black-screen boot remains the one wedged on
+_pra_emmc_lock (stochastic).
