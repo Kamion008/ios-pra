@@ -192,7 +192,15 @@ jobs:
           strings -a "$kernel" | grep -F 'PRA touch:' >/dev/null
           strings -a "$kernel" | grep -F 'PRA touch: HID desc' >/dev/null
           strings -a "$kernel" | grep -F 'pratouch' >/dev/null
-          echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite, 0165 churn fix, 0171 GPU and 0172 touch probe are linked.'
+          # 0173 sampler guard: the ring29 census (work/census29.md) showed
+          # the stall is mach_msg2_trap (-47) + idle GCD workers, and 0 of 537
+          # samples sat at mach_vm_deallocate (-12) - so the old vm_user probe
+          # is dropped and the sampler now prints kernel-side per-thread state
+          # (th/st/wait_event/waitq/continuation) plus a kernel fp backtrace
+          # (kbt, only when the blocked stack was kept) to name the wait;
+          # wq - offsetof(ipc_port, ip_waitq) names the port offline.
+          strings -a "$kernel" | grep -F 'cont=0x%llx kbt' >/dev/null
+          echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite, 0165 churn fix, 0171 GPU, 0172 touch probe and 0173 sampler kernel state are linked.'
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
         if: always()

@@ -1,0 +1,95 @@
+pra: 0173 - sampler prints kernel-side wait state per thread
+
+The ring29 census (work/census29.md, 537 thread records, 21 distinct PCs)
+refuted "majority trap -13": zero samples sit at
+task_dyld_process_info_notify_get; the parked threads are mach_msg2_trap
+(-47, 268), workq_kernreturn (368, 76), sys_ulock_wait (515, 27) and
+kevent_id (375, 16), and 22 samples have pc=0. The mach_vm_deallocate probe
+planned as 0173 hunk (a) measures a trap that never appears - dropped.
+
+What the sampler could not answer is WHY the kernel parks these threads.
+The user-only backtrace ends at the syscall stub. This patch extends every
+per-thread "SMP" line with:
+  th=0x..    the thread pointer
+  st=0x..    thread->state (TH_WAIT etc., osfmk/kern/thread.h)
+  we=0x..    thread->wait_event (event64_t value; 0 = NO_EVENT64 = a port
+             receive in mach_msg2; the handoff's "string" reading is wrong)
+  wq=0x..    thread->waitq.wq_q - for a port receive this is the port's
+             embedded ip_waitq, so the owning port is
+             wq - offsetof(struct ipc_port, ip_waitq) (ipc_port.h:318),
+             resolved offline against the CI kernel + headers
+  kbt 0x..   kernel fp chain from the per-thread kernel saved state
+             (thread_get_kernel_state()->machine.ss, the same source
+             machine_trace_thread64 uses for blocked threads,
+             osfmk/kdp/ml/arm/kdp_machdep.c:364), bounded to the thread's
+             own kernel_stack, 8-byte aligned, strictly downward.
+Line buffer 220 -> 640 with explicit truncation clamps (the old loop's
+fixed 20-char margin does not cover the new ~70-char append).
+
+Marker asserted in CI (Verify): 'cont=0x%llx kbt'.
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1023,7 +1023,7 @@
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+-		char line[400];
++		char line[640];
+ 		int n;
+ 		uint64_t fp;
+ 
+@@ -1043,6 +1043,54 @@
+ 				break;
+ 			}
+ 			fp = frame[0];
++		}
++		/*
++		 * 0173: kernel-side context of the same thread. state/wait_event/waitq
++		 * say HOW it is parked (wait_event is an event64_t value, 0 =
++		 * NO_EVENT64 for a mach_msg2 port receive; waitq names the wait queue -
++		 * for a port receive it is the port's embedded ip_waitq, so the owning
++		 * port is wq - offsetof(ipc_port, ip_waitq), computed offline).
++		 * cont names the continuation a stackless block resumes (mach_msg2
++		 * receive blocks at ipc_mqueue_receive_continue with the stack freed,
++		 * kernel_stack == 0). The kernel fp chain is only readable when the
++		 * stack was kept (kernel_stack != 0): read the per-thread kernel saved
++		 * state (thread_get_kernel_state()->machine.ss, the same source
++		 * machine_trace_thread64 uses for blocked threads) and walk fp bounded
++		 * to this thread's own kernel stack, 8-aligned, downward.
++		 */
++		vm_offset_t ksb = (vm_offset_t)thread->kernel_stack;
++		uint64_t kfp = 0, klr = 0;
++
++		n += snprintf(line + n, sizeof(line) - n,
++		    " th=0x%llx st=0x%x we=0x%llx wq=0x%llx cont=0x%llx kbt",
++		    (uint64_t)thread, (unsigned int)thread->state,
++		    (uint64_t)thread->wait_event, (uint64_t)thread->waitq.wq_q,
++		    (uint64_t)thread->continuation);
++		if (n >= (int)sizeof(line)) {
++			n = (int)sizeof(line) - 1;
++			line[n] = '\0';
++		}
++		if (ksb != 0) {
++			arm_kernel_saved_state_t *kg =
++			    &thread_get_kernel_state(thread)->machine.ss;
++			kfp = kg->fp;
++			klr = kg->lr;
++		}
++		if (klr != 0) {
++			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", klr);
++		}
++		for (int i = 0; i < 10 && kfp != 0 && (kfp & 7) == 0 &&
++		    kfp > (uint64_t)ksb && kfp < (uint64_t)(ksb + kernel_stack_size) &&
++		    kfp + sizeof(uint64_t[2]) <= (uint64_t)(ksb + kernel_stack_size) &&
++		    n < (int)sizeof(line) - 24; i++) {
++			uint64_t frame[2];
++
++			memcpy(frame, (const void *)kfp, sizeof(frame));
++			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++			if (frame[0] <= kfp) {
++				break;
++			}
++			kfp = frame[0];
+ 		}
+ 		printf("%s\n", line);
+ 	}
