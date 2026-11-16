@@ -102,5 +102,24 @@ else
 fi
 
 MKROOT_TRIM=$((1 - full)) tools/mkiosroot.sh "$os" "$sysos" "$appos" "$out" "$size"
+
+# Donor finish steps (ios-galaxy-s8 tools/dreamlte/finish-iosroot.sh): the
+# root tweaks that turned mkiosroot output into the donor's v8-v14 images
+# that reached the home screen. Without them: launchd keeps spawning the
+# churner jobs forever (the job database is System/Library/xpc/launchd.plist,
+# NOT the LaunchDaemons files mkiosroot removes), /private/var/containers is
+# missing, the purplebuddy Setup bypass never engages (Setup runs its
+# wizard), SpringBoard has no BKNoWatchdogs, mediaserverd crash-loops.
+# Idempotent; this script runs as root, so mount - tweak - umount here.
+mnt=$(mktemp -d)
+fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
+mount -t hfsplus -o loop,force "$out" "$mnt"
+python3 "$(dirname "$0")/sweet-root-tweaks.py" "$mnt"
+sync
+umount "$mnt"
+rmdir "$mnt"
+fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
+fsck.hfsplus -f -n "$out"
+
 ls -l "$out"
 echo "stage with: tools/pra-stage-iosroot.sh $out"
