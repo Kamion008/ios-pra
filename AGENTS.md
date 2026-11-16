@@ -1,63 +1,59 @@
-# Working on the A5XELTE fork
+# AGENTS.md — ios-pra (PRA-LX1 iOS port)
 
-## ⚠️⚠️⚠️ THE PRA BOOT COMMAND LINE — DO NOT SKIP, SHORTEN, OR "SIMPLIFY" ⚠️⚠️⚠️
+## Project
+Goal: boot the iPhone X iOS 16.7.16 userland on a Huawei PRA-LX1 (Kirin 655 /
+hi6250) via the Android boot image → EL1 loader (`shim/pra`) → a ported XNU
+(xnu-8796.141.3). Donor tree: `ios-galaxy-s8` (SWEET/A5XELTE).
+READ FIRST: the latest `HANDOFF_*.md` (currently `HANDOFF_2026-11-16.md`) — the
+single source of truth for status, verified facts, refuted theories and the
+do-not-do list. This file holds stable mechanics only.
 
-Every PRA kernel flash MUST use this EXACT cmdline. It is the string of every boot
-that reached the daemons (0153 → 0156 → 0158b; transcript line 1343). It is now the
-DEFAULT in `tools/pra_package.sh` (no CMDLINE env needed), and both
-`tools/pra_package.sh` and `tools/pra_flash_skip.sh` REFUSE an image that is missing
-the 12 critical args — because every dropped arg below has a REPRODUCED phone
-failure. Deliberate experiments bypass the flash gate with
-`PRA_ALLOW_ANY_CMDLINE=1`, nothing else.
+## Repo layout
+- `PRA-LX1_PROGRESS.md` — PRA-specific evidence log (hardware facts, boot history).
+- `HANDOFF_2026-11-16.md` — active handoff; add newer dated ones after it.
+- `NOTES.md`, `A5XELTE_PROGRESS.md`, `docs/` — donor history; inherited claims
+  there (fastboot boot, BOOT p10, 12-arg gate, sweetsample=Setup) are STALE.
+- `xnu/patches/` — the numbered patch stack (`NNNN-*.patch` + stager `.sh`).
+- `tools/` — `pra_ci.sh` (dispatch macOS CI), `pra_package.sh`, `pra_flash_skip.sh`,
+  `pra_readlog.sh` (ring pull), `mkiosroot.sh` (root staging), `mkadt_pra.py` (ADT).
+- `shim/pra/` — EL1 loader + `build-xnu.sh`; `work/` — per-session notes/rings/scripts.
+- `research/`, `live/`, `out/`, `xnu-src/`, `backup/` — gitignored artifacts.
 
-THE CMDLINE (one line, copy-paste verbatim):
+## Build / package / flash / log
+- Build: CI only (no local macOS toolchain): `RUNNER=macos-15 tools/pra_ci.sh Kamion008/ios-pra`;
+  fetch a kernel with `gh run download <run-id> -R Kamion008/ios-pra -n xnu-kernel`.
+- Package: `bash tools/pra_package.sh <kernel.development.pra>` → `out/pra-xnu.img`.
+- Flash: `PRA_SERIAL="$PRA_SERIAL" bash tools/pra_flash_skip.sh out/<img>.img`
+  — writes ONLY p27 (erecovery_kernel) via adb dd, then verifies a readback sha.
+- Ring log: `tools/pra_readlog.sh` (or `adb exec-out dd if=/dev/block/mmcblk0
+  bs=512 skip=794623 count=8193`, then `strings -a`). ALWAYS `cmp` against the
+  previous ring first (wraps leave stale content); /tmp is volatile — copy into `work/`.
 
-```
-debug=0xc serial=3 cpus=4 keepsyms=1 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1 rootrw=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1 emmcstats=1 pralog=1 praloglba=794623 sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1 sweetsample=Setup praexecskip=locationd,WirelessRadioManagerd,fairplayd.H2,bluetoothd,nanotimekitcompaniond,CommCenter
-```
+## The boot cmdline
+The canonical cmdline is the DEFAULT inside `tools/pra_package.sh` — do not copy
+it into docs (it drifts; AGENTS.md went stale that way before). Both
+`pra_package.sh` and `pra_flash_skip.sh` hard-refuse any image missing the 11
+critical args: cpus=4 rd=sdhcroot0 emmcroot=userdata emmcprobe=1 emmcwrite=1
+rootrw=1 emmcstats=1 pralog=1 praloglba=794623 wdt=-1 wdt_test=no_user_checkin.
+Experiments append args via the CMDLINE env WITHOUT pruning defaults; only
+`PRA_ALLOW_ANY_CMDLINE=1` bypasses the gate (deliberate one-offs).
 
-What breaks without each critical arg — all observed on the PRA-LX1:
-- **`cpus=4`** — `cpus=1` (the OLD package default!) hangs the SMP boot.
-- **`emmcmulti=0`** — multi-block reads hit `PRA eMMC: card busy, skip read` →
-  root mount error (2026-11-14, first 0159 boot — the incident that mandated this
-  block). Driver comment: "emmcmulti=0 forces the per-sector path without a rebuild".
-- **`pralog=1 praloglba=794623`** — without them there is NO eMMC ring: every boot's
-  evidence, including the panic backtrace capture, is lost. `praloglba` points the
-  ring at the erecovery_kernel tail so the next power-on still boots.
-- **`wdt=-1`** — the watchdog reboots the panic off the screen before a photo.
-- **`rd=sdhcroot0 emmcroot=userdata emmcprobe=1`** — no root device otherwise.
-- **`emmcwrite=1 rootrw=1`** — ring flushes and writable root depend on them.
-- **`emmcstats=1`** — the `PRA eMMC:` IO stats that expose controller stalls.
-- **`wdt_test=no_user_checkin`** — companion to `wdt=-1`.
-- **`sweetfb_noconsole=1 a5fb_noconsole=1 a5fb_keep_on=1 sweetfb_hz=1 sweetsample=Setup praexecskip=locationd,WirelessRadioManagerd,fairplayd.H2,bluetoothd,nanotimekitcompaniond,CommCenter`** —
-  framebuffer console keep-alive (the on-screen capture path).
-- **`unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 ignition_level=1`** —
-  boot progress args from the working boots; do not prune.
+## Patch hygiene
+CI runs the three stage `.sh` scripts, then applies every patch in order; a
+patch whose `git apply` fails is skipped SILENTLY, so `.github/workflows/xnu.yml`
+asserts one marker string per landed patch (`grep -F`). Every new patch adds a
+marker assert and is verified with the 0164 method: stage scripts + `git apply`
+of the whole stack (zero skips), then GNU `patch -p1 --fuzz=0 --dry-run` on
+index-stripped diffs. Local `git apply --check` proves nothing (git 2.56
+skip-detects already-applied patches with rc=0). Never trust a green CI without
+checking the asserts.
 
-The old trap: `pra_package.sh` used to default to `cpus=1 … -noprogress`, and
-hand-written CMDLINE overrides kept losing args (the 2026-11-13 handoff command
-block itself had a lossy short version — the 2026-11-14 boot failed on the phone
-because of it). The default is now the proven string and both scripts gate on it.
-Do not weaken the gates.
-
-
-- For Samsung SM-A510F work, read `A5XELTE_PROGRESS.md` and `docs/a5xelte-migration-map.md` first. Record new device evidence in the former and commit completed changes. Keep private VM addresses, passwords, device dumps and downloaded Apple binaries out of git.
-- Preserve recovery p11, EFS p3 and the existing Linux BOOT checkpoint. Current XNU trials may write only the explicitly authorized BOOT p10; the donor's Xiaomi `fastboot` and USERDATA instructions are not A5XELTE instructions.
-- Keep build success, recovered kernel markers, physical screen reports and iOS runtime behavior as separate claims. `NOTES.md` below is SWEET donor history; do not edit it to imply Samsung behavior.
-
-## Original SWEET contributor instructions (donor reference)
-
-- Read `NOTES.md` before starting; it contains the project goal, hardware facts,
-  current blocker, local artifact locations and the next concrete action.
-- The user switches agents frequently. Update the active handoff in `NOTES.md`
-  after each milestone and before stopping. Record commits, CI run IDs, exact
-  build/boot results and unfinished work. Distinguish observations from guesses.
-- Commit completed changes. Use `gh` for GitHub Actions kernel builds and logs.
-  Local single-file cross-compiles are useful before spending a CI run.
-- Device bring-up uses temporary `fastboot boot` images. Preserve the Android
-  installation and partition backups. The user approved (2026-10-15) using
-  internal UFS for iOS and said Android may be deleted: the iOS root goes
-  into the existing `userdata` partition (no GPT changes). Keep bootloaders,
-  recovery, modem, persist and the backups intact, and confirm each
-  destructive step with the user before running it.
-- Keep device dumps, serial numbers and downloaded Apple artifacts out of git.
+## Safety (the handoff do-not-do list is authoritative)
+- Flash only p27 via `pra_flash_skip.sh` — never p30/p32, bootloaders, recovery,
+  modem, persist, EFS, BOOT. Battery ≥25%; force-flash only on explicit approval.
+- Never boot without `pralog=1 praloglba=794623` (a blind boot loses evidence).
+- Serials via PRA_SERIAL env only — never in git. No Apple binaries, device
+  dumps or personal data in git.
+- Get explicit user approval (exact command shown first) before any flash, restage or destructive eMMC write.
+- Keep build success, on-screen reports and runtime behavior as separate claims;
+  label evidence VERIFIED (file:line/command) vs INFERRED vs UNKNOWN.
