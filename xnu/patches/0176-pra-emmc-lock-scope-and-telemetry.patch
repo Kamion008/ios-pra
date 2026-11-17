@@ -171,7 +171,7 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
  		uint64_t pos = off + n;
  		uint32_t skip = pos & 511u;
  		uint32_t take = MIN(count - n, 512u - skip);
-@@ -2442,6 +2512,13 @@
+@@ -2442,6 +2512,10 @@
  					    pra_emmc_multi_ladder[
  					    pra_emmc_multi_rung]);
  				}
@@ -179,13 +179,10 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
 +				 * loop, so it must release the mutex the per-iteration
 +				 * structure acquires at the top. */
 +				lck_mtx_unlock(&pra_emmc_lock);
-+				continue;
-+					    pra_emmc_multi_rung]);
-+				}
  				continue;
  			} else {
  				/* ANY failure counts, EBUSY included: a busy
-@@ -2497,13 +2574,28 @@
+@@ -2497,13 +2571,28 @@
  				cmds++;
  			}
  		}

@@ -300,7 +300,7 @@ log.append(m)
 # right there (CI bisect: run 44165122932 failed; runtime self-deadlock).
 # Anchor extended with the rung block: the base has THREE 4-tab continues
 # (:1660, :1666, :2445).
-sd, m = insert_before(sd, [
+sd, m = replace_block(sd, [
     "\t\t\t\t\t    pra_emmc_multi_rung]);",
     "\t\t\t\t}",
     "\t\t\t\tcontinue;",
