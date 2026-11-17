@@ -206,6 +206,13 @@ jobs:
           # the pre-switch chain for stack-kept blocks, naming the wedged
           # VFS/journal site that UNINT-blocks launchd sync() and SpringBoard.
           strings -a "$kernel" | grep -F 'blr=0x%llx kbt' >/dev/null
+          # 0176 guard: wedge discriminator, EBUSY attribution and the
+          # calendar clock in the sampler header. NOTE: workflow changes are
+          # direct commits - a yml hunk inside a patch cannot apply in the
+          # CI's dxb apply tree and would silently skip the whole patch.
+          strings -a "$kernel" | grep -F 'PRA LOG: lock state data=' >/dev/null
+          strings -a "$kernel" | grep -F '(lock=%llu card=%llu)' >/dev/null
+          strings -a "$kernel" | grep -F 'cal=%llu.%06llu' >/dev/null
           echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite, 0165 churn fix, 0171 GPU, 0172 touch probe and 0173 sampler kernel state are linked.'
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)

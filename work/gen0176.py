@@ -20,7 +20,11 @@ OUT = f"{P}/0176-pra-emmc-lock-scope-and-telemetry.patch"
 
 SD = f"{BASE}/bsd/dev/pra_sdhci.c"
 EX = f"{BASE}/osfmk/kern/exception.c"
-YML = f"{REPO}/.github/workflows/xnu.yml"
+# NOTE: .github/workflows/xnu.yml is NOT patchable - CI applies patches in
+# the dxb build tree which has no .github; a yml hunk makes the whole patch
+# skip silently there (run 44141348138 built the old asserts and stayed
+# green). Workflow assert changes are DIRECT COMMITS to the repo's yml,
+# made in the same commit as the patch.
 
 def read(path):
     return open(path, encoding="utf-8").read().splitlines()
@@ -317,27 +321,17 @@ else:
     log.append("[11] clock.h already included - skipped")
 
 # ---------------- xnu.yml ----------------
-yml = read(YML)
-
-# [12] marker asserts in the same commit (the format rule)
-yml, m = insert_after(yml, [
-    "          strings -a \"$kernel\" | grep -F 'blr=0x%llx kbt' >/dev/null",
-], [
-    "          # 0176 guard: wedge discriminator, EBUSY attribution and the",
-    "          # calendar clock in the sampler header.",
-    "          strings -a \"$kernel\" | grep -F 'PRA LOG: lock state data=' >/dev/null",
-    "          strings -a \"$kernel\" | grep -F '(lock=%llu card=%llu)' >/dev/null",
-    "          strings -a \"$kernel\" | grep -F 'cal=%llu.%06llu' >/dev/null",
-], "[12] CI asserts")
-log.append(m)
+yml = read(f"{REPO}/.github/workflows/xnu.yml")
+assert not any("0176" in l for l in yml), "yml asserts already present - move them out of the patch scope"
+# [12] marker asserts: these go into the REPO's yml via the orchestrator's
+# direct edit (same commit as the patch), NOT via this patch - see the
+# header note above.
 
 # ---------------- emit the patch ----------------
 d1 = difflib.unified_diff(read(SD), sd, fromfile="a/bsd/dev/pra_sdhci.c",
                           tofile="b/bsd/dev/pra_sdhci.c", n=3, lineterm="")
 d2 = difflib.unified_diff(read(EX), ex, fromfile="a/osfmk/kern/exception.c",
                           tofile="b/osfmk/kern/exception.c", n=3, lineterm="")
-d3 = difflib.unified_diff(read(YML), yml, fromfile="a/.github/workflows/xnu.yml",
-                          tofile="b/.github/workflows/xnu.yml", n=3, lineterm="")
 
 header = """pra: 0176 - per-sector eMMC locking + wedge discriminator telemetry
 
@@ -380,8 +374,7 @@ for l in log:
 # ---------------- verify three ways ----------------
 scratch = tempfile.mkdtemp(prefix="v0176")
 for path, content in (("bsd/dev/pra_sdhci.c", "\n".join(read(SD)) + "\n"),
-                      ("osfmk/kern/exception.c", "\n".join(read(EX)) + "\n"),
-                      (".github/workflows/xnu.yml", "\n".join(read(YML)) + "\n")):
+                      ("osfmk/kern/exception.c", "\n".join(read(EX)) + "\n")):
     fp = os.path.join(scratch, path)
     os.makedirs(os.path.dirname(fp), exist_ok=True)
     open(fp, "w").write(content)
@@ -406,8 +399,7 @@ r = subprocess.run(["git", "-C", scratch, "apply", "-v", OUT],
 print(f"[verify] git apply rc={r.returncode}")
 assert r.returncode == 0 and "Skipped" not in (r.stdout + r.stderr)
 for path, expect in (("bsd/dev/pra_sdhci.c", sd),
-                     ("osfmk/kern/exception.c", ex),
-                     (".github/workflows/xnu.yml", yml)):
+                     ("osfmk/kern/exception.c", ex)):
     got = open(os.path.join(scratch, path)).read()
     assert got == "\n".join(expect) + "\n", f"{path} mismatch"
     print(f"[verify] {path}: applied == expected")
