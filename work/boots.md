@@ -25,3 +25,15 @@ boots 1-2 are UNPREDICTED. Baseline started 15:58:14.
 | 4 | 29512a04dba33d8a5281 | **y** (user: "WORKED") | shorter than #1-#3 (user: "probably booted in less time") | — | — (healthy) | **4:07** — the label VARIES with boot duration (4:08 in #1-#3, 4:07 here): epoch+uptime at render time, advancing; NEVER-REDRAWN now leads H2 (frozen-gettimeofday refuted by 4:07≠4:08 across boots; no advance within boot #1) — 0176 sampler header line confirms in-ring per protocol | ring38 sha 9316b9ce — **IDENTICAL to ring35 AGAIN (seq stuck at 9): P5 now 3 of 4 healthy boots wrote ZERO bytes** | predicted |
 | 5 | 29512a04dba33d8a5281 | **y** (user: "AGAIN, 4:07 in lock screen") | ~8m class | — | — (healthy) | **4:07** (2nd consecutive) | ring39 sha bb29d0ef — **DIFFERS: boot #5 WROTE (header seq=2, total=133,205)** — starvation spectrum across healthy boots: 0 / 0 / 0 / 2 / 9 successful flushes of ~90 ticks; parks resolve (th= 0x9→0x1→0x9 timeline) | predicted |
 | 6 | 29512a04dba33d8a5281 | **y** (user: "last boot was 4:08") | ~8m class | — | — (healthy) | **4:08** (render-time variance within the class) | ring40 pending (phone in XNU at last check — pull on TWRP return) | predicted |
+
+SERIES DECISION (2026-11-17, user: "run the new kernel"): the baseline series
+STOPS at boot #6 — 6/6 healthy (+ the pre-series milestone boot = 7 of the
+last 8). The ~1/3 wedge rate is not reproduced; the mechanism is audited
+(work/audit-pra-emmc-lock-2026-11-17.md). The 0176 series (telemetry + fix)
+starts next: same frozen-build rules, kernel 0176, rows below.
+
+## 0176 series (kernel 0176 + same tweaked root — FROZEN build)
+
+| # | kernel sha | reached | boot time | wedge telemetry | clock | ring | pred |
+|---|---|---|---|---|---|---|---|
+| 1 | pending CI artifact sha | fired pending flash | — | — | — | — | predicted (predictions T1-T3) |
