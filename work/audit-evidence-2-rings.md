@@ -70,3 +70,42 @@ EBUSY can come from TWO sources the line does not distinguish:
 :1088 = lock busy; :1090 = card-side errors also surface from write_raw.
 So a starvation window ("after 64 ticks") can be lock-EBUSY, card-EBUSY, or
 both; the ring alone cannot tell them apart.
+
+## APPEND (2026-11-17 evening — measured after the packet was first built)
+
+### ring34's full write-failure offset table (strings -a -t d, 29 lines)
+  10,270 / 12,940 / 20,246 / 30,256 / 31,686 / 32,445 / 33,820 / 34,675
+  (the "after 1..8 ticks" early burst — all INSIDE fresh < 284,020),
+ 175,611 (the single "after 64 ticks" line),
+ 195,731 / 196,221 / 197,566 / 207,252 / 207,742 (after 1-5),
+ 209,606 / 210,772 / 211,589 / 212,430 / 213,144 / 213,463 / 217,495 (1-7),
+ 228,312 / 238,973 / 239,556 / 251,344 (1), 282,337 / 283,150 / 283,897 /
+ 284,387 (1, 1, 1, 2) — the last four straddle total=284,020.
+The 64-tick window (175,611) sits AFTER the park lines (36,149 / 136,813 /
+168,476) with ZERO failure lines between 34,675 and 175,611.
+
+### ring38 (boot #4, healthy, clock 4:07)
+sha256 first-16 = 9316b9ce5ffd7289 — BYTE-IDENTICAL to ring35 (cmp empty);
+header total/seq = 209,077 / 9 (boot #4 wrote NOTHING).
+
+### ring39 (boot #5, healthy, clock 4:07)
+sha256 first-16 = bb29d0ef3994b45e — DIFFERS from ring35. Header:
+total=133,205 (0x20855), seq=2 (only TWO fully-successful flush ticks).
+"write failed" lines: 43; early ones at 13,077-30,343 INSIDE fresh; offsets
+283,486 / 285,088 / 295,934 are BEYOND total (stale boot-#1-era fragments).
+"strat flush" lines: 0.
+Mutex parks INSIDE fresh: 52,502 (launchd t3), 87,912 (launchd t0),
+130,509 (launchd t3) — all we=0xfffffff00844dc08.
+PER-THREAD TIMELINE (the park-persistence probe): launchd t3,
+th=0xfffffff54bb5dc00, appears exactly 3 times: st=0x9 @52,502, st=0x1
+@88,571, st=0x9 @130,509 — the park RESOLVED (the thread got in, ran, and
+re-parked on a later sync cycle). st=0x1 = TH_WAIT without TH_UNINT.
+
+### Interpretive impact of ring39
+Healthy boots now form a starvation SPECTRUM: successful flush ticks out of
+~90 active ticks = 0 (boots #2/#3/#4), 2 (boot #5), 9 (boot #1); and the
+wedged boot = 67 (its parks/EBUSY pattern differs — see the offset table
+above). Parks on the mutex occur in EVERY measured healthy boot and RESOLVE
+(the th= timeline). The wedged boot's TERMINAL park state was never flushed
+(self-erasing evidence: content stops at the last successful flush).
+

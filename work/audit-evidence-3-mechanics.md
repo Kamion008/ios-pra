@@ -47,9 +47,27 @@ There is NO strat flush on the per-sector CMD17 path.
 - Pre-series: 2 of 3 boots reached the lock screen; 1 wedged (ring34's boot).
 - 2026-11-17 baseline series, frozen 0175 image (kernel sha
   29512a04dba33d8a5281, VERIFIED pre-flight readback):
-  boot #1 15:58:14 -> lock screen 8m30s (ring35 pulled 16:29 from TWRP);
-  boot #2 16:30:31 -> lock screen (user: "same as boot 1, no changes");
-  boot #3 17:03:34 -> lock screen (user: "same as boot 2");
-  boot #4 17:27:55 -> outcome pending at packet time.
-- The lock-screen clock reads 4:08 in every observed boot (two readings at
-  different uptimes in boot #1, both 4:08).
+  boot #1 15:58:14 -> lock screen 8m30s, clock 4:08 (ring35 pulled 16:29);
+  boot #2 16:30:31 -> lock screen, clock 4:08 (user: "same as boot 1");
+  boot #3 17:03:34 -> lock screen, clock 4:08 (user: "same as boot 2");
+  boot #4 17:27:55 -> lock screen, clock 4:07 (user: "WORKED ... probably
+      booted in less time"; ring38 pulled ~17:45 from TWRP);
+  boot #5 17:45:27 -> lock screen, clock 4:07 (user: "AGAIN, 4:07 in lock
+      screen"; ring39 pulled ~18:02 from TWRP);
+  boot #6 18:02:24 -> in flight at packet-update time.
+- Clock pattern: 4:08 x3 (boots #1-3, ~8m30s class) then 4:07 x2 (boots
+  #4-5, shorter class per user report). Within boot #1 the label showed
+  4:08 at two DIFFERENT uptimes (~10 and ~15 min) — no in-boot advance.
+- User corroboration (2026-11-17, chat): the "PRA LOG: write failed 16
+  after N ticks" signature "already happened on most boot[s] but it was
+  temporary" — i.e. flusher starvation windows are a known, usually
+  transient phenomenon; corroborated independently by ring35's short-burst
+  failures and by pra_sdhci.c:1084's ring21/ring20 precedent comment.
+- Symbol check (nm on the 0175 CI kernel artifact, run 43958048368):
+  `fffffff00844dc00 b _pra_emmc_lock` — the park event address
+  we=0xfffffff00844dc08 = _pra_emmc_lock + 0x8 EXACTLY. The parked threads
+  are parked on the driver's mutex state word (script-verified).
+- ctid_get_thread_unsafe: declared `extern thread_t
+  ctid_get_thread_unsafe(ctid_t ctid);` at osfmk/kern/thread.h:1643 —
+  callable from bsd/dev (the driver already uses kern externs, e.g.
+  kernel_thread_start at pra_sdhci.c:305).

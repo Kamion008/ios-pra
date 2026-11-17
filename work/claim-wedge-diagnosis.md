@@ -1,82 +1,115 @@
-# CLAIM: the _pra_emmc_lock wedge + the stale-ring mechanism (post-blind-pass)
+# CLAIM v2: the _pra_emmc_lock wedge + the stale-ring mechanism
 
-author: GLM-5.3-Flash (ZCode session 2026-11-17; commits 189fd5a/9d71e91 +
-this claim's commit; evidence = work/audit-evidence-1/2/3, CI run 44119547672
-buildtree, rings 34-38)
+author: GLM-5.3-Flash (ZCode session 2026-11-17; commits 189fd5a..; evidence
+= work/audit-evidence-1/2/3/4, CI run 44119547672 buildtree, rings 34-39)
+Revised after claim review round 1 (work/pkt-175415/report.md): C1 softened
+(EBUSY conflation), packet-stale items refreshed (boots #4-#6, ring38/39),
+hold-time numbers bounded honestly, telemetry moved inside the locked
+region, strat-flush contract fixed, the 1.92-vs-19.2 MHz limiter question
+recorded as open.
 
-## C1 — strat's whole-request hold starves the flusher (VERIFIED mechanism)
+## C1 — strat's whole-request hold is the contention unit (mechanism
+## VERIFIED in source; the ring attribution of EBUSY windows to the lock is
+## INFERRED and waits on 0176 telemetry)
 
 strat holds pra_emmc_lock from lck_mtx_lock (pra_sdhci.c:2381) to
-lck_mtx_unlock (:2506) — the ENTIRE per-sector request loop, including
-bounded 2,000,000-iteration register polls per sector. Consequences measured
-in the rings: the wedged boot's flusher hit one 64-tick (640 s at the 10 s
-tick, pra_sdhci.c:1201) EBUSY window ("write failed 16 after 64 ticks", byte
-offset 175,611 in ring34) and boot #1 (healthy) succeeded only 9 times in
-~90 active ticks with 53 complaint lines. The user corroborates the
-write-failed signature as pre-existing and "temporary on most boots" —
-transient windows resolve with a success (which is also the only way the
-lines reach disk), so a boot-long storm leaves byte-identical stale rings
-and no trace (boots #2/#3/#4: cmp vs ring35 empty, seq frozen at 9).
-FALSIFIER: 0176 telemetry showing sub-10 s strat holds during starvation.
+lck_mtx_unlock (:2506) — the ENTIRE per-sector request loop (source excerpt,
+evidence-1). Every bounded poll is <=2,000,000 register reads, an UPPER
+bound whose wall time is UNKNOWN (order 0.1-0.5 s INFERRED from the bound;
+the "~1-2 s" figure in the source comment describes the LOG write path,
+evidence-1:1333-1334, not strat). Ring attribution limit: "write failed 16"
+covers BOTH lock-EBUSY (:1088) and card-side errors (:1090) — the ring
+cannot separate them (evidence-2 conflation section). What the rings DO
+establish: a starvation spectrum across healthy boots (successful flush
+ticks out of ~90 active: 0, 0, 0, 2, 9 — evidence-2 append) with one
+window in the wedged boot spanning >=640 s (64 failing ticks at the 10 s
+cadence; >=, not =, because the counter only resets on success,
+evidence-1:1252-1254), and the offset table (evidence-2 append) placing
+that window AFTER the recorded parks. FALSIFIER: 0176 telemetry showing
+sub-10-s-equivalent strat holds during starvation windows.
 
-## C2 — the wedge parks are NOT explained by a continuous holder
+## C2 — parks resolve in healthy boots; the wedge's terminal state is
+## unflushed, so lost-wakeup vs stuck-holder is INSUFFICIENT from rings
 
-ring34: parks at bytes 36,149 (backboardd t0), 136,813 (SpringBoard t10),
-168,476 (launchd t2) — ALL before the 64-tick window (175,611), with ZERO
-write-failure lines between bytes 34,675 and 175,611: the flusher acquired
-the lock repeatedly WHILE three threads sat parked on the mutex. ring35
-(healthy boot) parks at 36,227/37,642/51,697/131,479 inside its fresh
-region. Structurally possible WITHOUT corruption: lck_mtx_try_lock does a
-raw CAS of the 32-bit lck_mtx.data word against 0, deliberately ignoring
-queues (osfmk/kern/lock_mtx.c:1126-1133), and parked waiters hang off the
-TURNSTILE (lck_mtx_tsid -> turnstile -> waitq_wakeup64_one in
-lck_mtx_unlock_wakeup, lock_mtx.c:616-641) — so data==0 does not imply "no
-waiters". Two live mechanisms remain, separated ONLY by the 0176 state
-telemetry: (a) turnstile-enqueued waiters that no unlock ever wakes (lost
-wakeup: tsid set, data==0, parks persist); (b) parks that are short and
-merely caught by the sampler (they resolve; the terminal wedge state was
-never flushed — self-erasing evidence ends at ring34's total=284,020).
-FALSIFIER for (a): 0176 prints tsid==0 at moments when parks persist.
+Parks on the mutex occur in every measured boot and RESOLVE: ring39's
+launchd t3 timeline is st=0x9 @52,502 -> st=0x1 @88,571 -> st=0x9 @130,509
+(evidence-2 append) — park, run, re-park: the strat-hold queueing rhythm.
+Structurally, parks can coexist with successful try_locks because try_lock
+CASes the 32-bit data word against 0 while waiters hang off the TURNSTILE
+(lck_mtx.c:1126-1133 and :616-641, evidence-4) — data==0 does not mean "no
+waiters". The wedged boot's TERMINAL park state was never flushed (content
+stops at the last successful flush, total=284,020; self-erasing evidence).
+Therefore: whether the terminal wedge is (a) a stuck/never-completing
+holder, (b) turnstile waiters never woken, or (c) both in sequence, CANNOT
+be decided from rings — INSUFFICIENT. The 0176 instrument decides it:
+print data + tsid + the decoded owner thread from INSIDE the locked
+region. FALSIFIERS: telemetry showing tsid==0 while parks persist
+(b refuted), or owner==0 + data==0 with parks persisting (neither a nor b
+— something else).
 
-## C3 — the panic-path steal is not involved (VERIFIED)
+## C3 — the panic-path steal is not involved (SURVIVES review round 1)
 
 pra_log_panic_flush's opaque[1] zeroing (:1461) has exactly one caller:
-osfmk/kern/debug.c:1464-1467, the panic hook. No panic occurred in any
-measured boot. The flusher's 67 successful ticks in the wedged boot also
-coexist with balanced driver lock sites (no returns/gotos inside the locked
-region) and zero interrupt-context acquires (polled PIO, lock-free
-_cnputc path).
+osfmk/kern/debug.c:1464-1467, the panic hook (evidence-3/4). Caveat kept
+honest: "no panic occurred" is INFERRED — a FAILED panic flush leaves the
+same stale header the success path writes; nothing in the rings shows a
+panic signature for these boots.
 
 ## C4 — the patch stack never touched the lock machinery (VERIFIED)
 
-grep over xnu/patches/*.patch: every lck_mtx mention is in driver/console
-files; no patch touches osfmk/kern/locks* / machine locks. 0124's
-machine_routines.c hunk = CNTP/CNTV physical-timer selection only (no
-wfe/sev/idle changes). The lock implementation is stock xnu-8796.141.3
-(osfmk/kern/lock_mtx.c, MCS/turnstile design).
+grep over xnu/patches/*.patch: every lck_mtx mention is driver/console
+files; no patch touches osfmk/kern/locks* / machine locks (evidence-3).
+0124's machine_routines.c hunk is CNTP/CNTV timer-register selection only
+(evidence-4 carries the hunk excerpt). The lock implementation is stock
+xnu-8796.141.3. The park event address is script-verified as the driver's
+own mutex: nm gives `fffffff00844dc00 b _pra_emmc_lock` = we − 0x8
+(evidence-3/4).
 
-## C5 — the fix set for 0176
+## C5 — the 0176 change set (one branch of a declared fork, plus the
+## instrument that settles the fork)
 
 1. per-sector lock scoping in strat's request loop (move :2381/:2506 inside
-   the loop, keeping the shared pra_emmc_bounce / pra_emmc_multi_buf
-   read+copy inside each critical section): bounds every hold to one
-   sector/chunk — the flusher and parked waiters interleave; a slow-card
-   request degrades to slow progress instead of a system-wide wedge.
-2. H1 telemetry, rate-limited: at the flusher's repeated try_lock failures,
-   print the mutex state word AND tsid AND the decoded owner thread
-   (ctid_get_thread_unsafe on data, as lck_mtx.c's own
-   LCK_MTX_OWNER_FOR_TRACE does); at strat unlock, a >10 s hold line
-   (lba/count/duration); disambiguate flusher EBUSY (lock-busy vs card-busy
-   return codes). Interpretation per handoff section 4 H1.
-3. strat flushes the ring tail at unlock, rate-limited to 10 s (the limiter
-   already exists at :1408) — guarantees disk coverage when the thread
-   flusher starves, and carries the flusher counters in the header.
+   the loop; the shared pra_emmc_bounce / pra_emmc_multi_buf read+copy
+   stays inside each critical section). Effect: every hold is bounded to
+   one sector/chunk — the flusher and parked waiters interleave, and a
+   slow/stuck-card request degrades to slow progress instead of a
+   system-wide wedge (the terminal-wedge shape becomes structurally
+   impossible from this driver). Under fork-(b) (pure lost wakeup) this
+   alone does not restore wakeups — it is NOT claimed as the wedge fix; it
+   removes the strat-hold confounder so the telemetry measures the wake
+   path cleanly, and it caps the damage of fork-(a).
+2. telemetry INSIDE the locked region (a stuck holder self-reports before
+   any unlock exists to flush): rate-limited hold-time line with lba/count,
+   the mutex state word + tsid + the decoded owner thread
+   (ctid_get_thread_unsafe — extern at osfmk/kern/thread.h:1643, evidence-4),
+   and DISTINCT return codes for lock-busy vs card-busy in
+   pra_log_write_sector (kills the evidence-2 conflation). Limiters are
+   TICK/COUNT-based, not mach_absolute_time deltas, because the timebase
+   scale is an OPEN question: the existing :1408 constant 10ULL*1920000ULL
+   means 10 s only at 1.92 MHz and 1 s at 19.2 MHz (review round 1, valid
+   arithmetic objection — unverified either way; the 0176 clock line
+   measures the real scale).
+3. strat flushes the ring tail INSIDE the locked region immediately before
+   :2506 (honors the documented "called with pra_emmc_lock held" contract —
+   review round 1's FAULT objection accepted), rate-limited by request
+   COUNT. This gives disk coverage in the parks/free-lock regime; in a
+   stuck-holder regime the item-2 in-locked telemetry self-reports.
 4. clock_get_calendar_microtime next to mach_absolute_time in the sampler
-   header (H2 discriminator; never-redrawn currently leads after boot #4's
-   4:07-vs-4:08).
+   header (H2 discriminator; never-redrawn leads after boots #4-#5's 4:07
+   and boot #6's 4:08).
 
-## What would falsify this whole claim
+## Rebuttal on the record (review round 1, rejected objection)
+
+The hypothesized nested double-acquire (strat -> pra_log_strat_flush ->
+pra_log_write_sector -> try_lock while strat holds the lock) cannot occur:
+pra_log_write_sector's only callers are pra_sdhci.c:1222 and :1237, both in
+pra_log_thread; pra_log_strat_flush calls pra_log_flush_locked, which calls
+pra_emmc_write_raw directly (:1353/:1366) — evidence-4 carries the caller
+analysis.
+
+## What would falsify this claim set
 
 0176 telemetry during a wedge showing tsid==0 + data==0 while parks persist
-(a wake path that never enqueued), or strat holds < 10 s throughout with the
-flusher succeeding every tick — either would move the diagnosis off C1/C2.
+(no queue was ever formed), or sub-10-s-equivalent strat holds during
+starvation windows with the flusher failing on card-side errors only —
+either moves the diagnosis off C1/C5.
