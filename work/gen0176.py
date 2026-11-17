@@ -380,11 +380,10 @@ for l in log:
 
 # ---------------- verify three ways ----------------
 scratch = tempfile.mkdtemp(prefix="v0176")
-verify_pairs = [("bsd/dev/pra_sdhci.c", sd)]
+verify_pairs = [("bsd/dev/pra_sdhci.c", read(SD), sd)]
 if not NO_CLOCK:
-    verify_pairs.append(("osfmk/kern/exception.c", ex))
-for path, content in [(p, "\n".join(c) + "\n") for (p, c) in
-                      [(p, c) for (p, c) in verify_pairs]]:
+    verify_pairs.append(("osfmk/kern/exception.c", read(EX), ex))
+for path, base, content in verify_pairs:
     fp = os.path.join(scratch, path)
     os.makedirs(os.path.dirname(fp), exist_ok=True)
     open(fp, "w").write(content)
@@ -408,7 +407,7 @@ r = subprocess.run(["git", "-C", scratch, "apply", "-v", OUT],
                    capture_output=True, text=True)
 print(f"[verify] git apply rc={r.returncode}")
 assert r.returncode == 0 and "Skipped" not in (r.stdout + r.stderr)
-for path, expect in verify_pairs:
+for path, base, expect in verify_pairs:
     got = open(os.path.join(scratch, path)).read()
     assert got == "\n".join(expect) + "\n", f"{path} mismatch"
     print(f"[verify] {path}: applied == expected")
