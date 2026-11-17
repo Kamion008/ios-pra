@@ -110,6 +110,33 @@ analysis.
 ## What would falsify this claim set
 
 0176 telemetry during a wedge showing tsid==0 + data==0 while parks persist
-(no queue was ever formed), or sub-10-s-equivalent strat holds during
-starvation windows with the flusher failing on card-side errors only —
-either moves the diagnosis off C1/C5.
+(the queue dissolved without waking anyone — deeper than fork-(b)), or
+sub-10-s-equivalent strat holds during starvation windows with the flusher
+failing on card-side errors only — either moves the diagnosis off C1/C5.
+
+## ADDENDUM — claim review round 2 (work/pkt-182616): 1 refuted / 10 weak /
+## 5 survive; revisions adopted
+
+- C1c REFUTED: the 64-tick window is a MID-BOOT TRANSIENT (counter resets
+  at 195,731-217,495 prove successful flushes after it) — it is NOT a
+  terminal-wedge signature. C1 no longer leans on it.
+- C1d: poll bounds stated per-loop-class (init 4,000,000; commands 2,000,000);
+  the "~1-2 s" figure belongs to the LOG path's comment; wall time per
+  failed poll stays UNKNOWN/INFERRED.
+- C2a: st=0x1 is TH_WAIT (not run) — the timeline proves the thread LEFT
+  the mutex wait and reached a different wait event, nothing more.
+- C2c falsifier wording: (b) = tsid!=0 with no wake; "tsid==0 while parks
+  persist" = the queue dissolved without waking anyone = deeper than (b).
+- C3: "no panic occurred" is INFERRED (a FAILED panic flush leaves the
+  prior header; a successful one would write a new one). The grep listing
+  for pra_log_panic_flush is in evidence-3/4.
+- C4: the 17-patch list is the FULL grep output (none after 0166 mentions
+  lck_mtx); the pre-series boots ran the same flashed 0175 image (handoff
+  sec 1/8), so the nm address applies to ring34's boot too.
+- C5 constraints adopted (see work/audit-pra-emmc-lock-2026-11-17.md):
+  per-iteration lock/unlock (the :2500-2502 error break must not exit
+  holding the lock), COUNT/TICK-based limiters (the :1408 timebase
+  constant is unverified), strat tail-flush writes NO header (the
+  header/total invariant stays intact), console+RAM-ring are the
+  guaranteed telemetry channels under the lock.
+
