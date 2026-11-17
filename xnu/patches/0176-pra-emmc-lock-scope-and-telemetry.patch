@@ -125,13 +125,17 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
  	if (!error) {
  		struct pra_log_header h = {
  			.magic = { 'P', 'R', 'A', 'L', 'O', 'G', '1', '\0' },
-@@ -1380,6 +1432,13 @@
+@@ -1380,6 +1432,17 @@
   * into the flood - with the suppressed count carried on the next line. The
   * latch flush bypasses the limit: it happens at most once per boot and is
   * the terminal event. */
 +static uint64_t pra_emmc_lock_busy_mark;
 +/* 0176: flusher EBUSY attribution (the audit's conflation killer) and
-+ * the request counter for the count-limited tail flush. */
++ * the request counter for the count-limited tail flush. The owner
++ * decoder gets a local explicit extern - pra_sdhci.c does not include
++ * kern/thread.h (thread_t arrives via the :305 extern pattern), so an
++ * implicit declaration would be fatal under -Werror (CI run 44165122932). */
++extern thread_t ctid_get_thread_unsafe(uint32_t ctid);
 +static uint64_t pra_log_lock_busy;
 +static uint64_t pra_log_card_busy;
 +static uint64_t pra_emmc_req_count;
@@ -139,7 +143,7 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
  static uint64_t pra_log_strat_flush_at;
  static uint64_t pra_log_strat_flush_skipped;
  
-@@ -1411,8 +1470,8 @@
+@@ -1411,8 +1474,8 @@
  		return;
  	}
  	pra_log_strat_flush_at = now;
@@ -150,7 +154,7 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
  	printf("PRA LOG: strat flush %llu blocks total=%llu err=%d "
  	    "skipped=%llu\n",
  	    blocks, total, error, pra_log_strat_flush_skipped);
-@@ -2378,8 +2437,12 @@
+@@ -2378,8 +2441,12 @@
  	bool is_read = (buf_flags(bp) & B_READ) != 0;
  	uint32_t cmds = 0;
  	uint64_t t0 = pra_emmc_stats ? mach_absolute_time() : 0;
@@ -164,7 +168,21 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
  		uint64_t pos = off + n;
  		uint32_t skip = pos & 511u;
  		uint32_t take = MIN(count - n, 512u - skip);
-@@ -2497,13 +2560,28 @@
+@@ -2442,6 +2509,13 @@
+ 					    pra_emmc_multi_ladder[
+ 					    pra_emmc_multi_rung]);
+ 				}
++				/* 0176: this chunk path skips the per-sector tail of the
++				 * loop, so it must release the mutex the per-iteration
++				 * structure acquires at the top. */
++				lck_mtx_unlock(&pra_emmc_lock);
++				continue;
++					    pra_emmc_multi_rung]);
++				}
+ 				continue;
+ 			} else {
+ 				/* ANY failure counts, EBUSY included: a busy
+@@ -2497,13 +2571,28 @@
  				cmds++;
  			}
  		}
@@ -194,3 +212,32 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
  	buf_unmap(bp);
  	pra_emmc_note_io(count - buf_resid(bp), cmds, t0, is_read);
  done:
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -76,6 +76,7 @@
+ #include <ipc/ipc_pset.h>
+ #include <ipc/ipc_machdep.h>
+ 
++#include <kern/clock.h>
+ #include <kern/ipc_tt.h>
+ #include <kern/task.h>
+ #include <kern/thread.h>
+@@ -1018,7 +1019,17 @@
+ 		slide = sr->sr_slide;
+ 		vm_shared_region_deallocate(sr);
+ 	}
+-	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
++	/* 0176: the wall clock next to the per-process header - the H2
++ * never-redrawn-vs-frozen discriminator (boots #4/#5 rendered 4:07 vs
++ * boots #1-#3/#6 at 4:08; no in-boot advance). Also measures the real
++ * timebase scale against the calendar. clock_sec_t/clock_usec_t are
++ * the prototype's own types (clock.h:51-57 - usec is 32-bit). */
++	clock_sec_t cal_s = 0;
++	clock_usec_t cal_us = 0;
++	clock_get_calendar_microtime(&cal_s, &cal_us);
++	printf("SMP %s[%d] slide 0x%llx mh 0x%llx cal=%llu.%06llu\n",
++	    name, pid, slide, task->mach_header_vm_address,
++	    (uint64_t)cal_s, (uint64_t)cal_us);
+ 
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {

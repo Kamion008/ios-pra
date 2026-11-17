@@ -67,7 +67,11 @@ log.append(f"lock_mtx.h fields verified ({len(lmh)} lines)")
 sd, m = insert_before(sd,
     ["static uint64_t pra_log_strat_flush_at;"],
     ["/* 0176: flusher EBUSY attribution (the audit's conflation killer) and",
-     " * the request counter for the count-limited tail flush. */",
+     " * the request counter for the count-limited tail flush. The owner",
+     " * decoder gets a local explicit extern - pra_sdhci.c does not include",
+     " * kern/thread.h (thread_t arrives via the :305 extern pattern), so an",
+     " * implicit declaration would be fatal under -Werror (CI run 44165122932). */",
+     "extern thread_t ctid_get_thread_unsafe(uint32_t ctid);",
      "static uint64_t pra_log_lock_busy;",
      "static uint64_t pra_log_card_busy;",
      "static uint64_t pra_emmc_req_count;",
@@ -269,6 +273,26 @@ sd, m = replace_block(sd, [
 ], "[8] unlock per iteration (swap 2)")
 log.append(m)
 
+# [8b] the successful-chunk path ends in `continue`, which in the per-
+# iteration structure would skip the bottom unlock - release the mutex
+# right there (CI bisect: run 44165122932 failed; runtime self-deadlock).
+# Anchor extended with the rung block: the base has THREE 4-tab continues
+# (:1660, :1666, :2445).
+sd, m = insert_before(sd, [
+    "\t\t\t\t\t    pra_emmc_multi_rung]);",
+    "\t\t\t\t}",
+    "\t\t\t\tcontinue;",
+], [
+    "\t\t\t\t\t    pra_emmc_multi_rung]);",
+    "\t\t\t\t}",
+    "\t\t\t\t/* 0176: this chunk path skips the per-sector tail of the",
+    "\t\t\t\t * loop, so it must release the mutex the per-iteration",
+    "\t\t\t\t * structure acquires at the top. */",
+    "\t\t\t\tlck_mtx_unlock(&pra_emmc_lock);",
+    "\t\t\t\tcontinue;",
+], "[8b] unlock before the chunk continue")
+log.append(m)
+
 # [9] the large-request line, once per request, after the loop
 sd, m = insert_before(sd, ["\tbuf_unmap(bp);"], [
     "\tif (pra_log_lock_busy > pra_emmc_lock_busy_mark && count >= 64u * 512u) {",
@@ -386,7 +410,7 @@ if not NO_CLOCK:
 for path, base, content in verify_pairs:
     fp = os.path.join(scratch, path)
     os.makedirs(os.path.dirname(fp), exist_ok=True)
-    open(fp, "w").write(content)
+    open(fp, "w").write("\n".join(base) + "\n")
 subprocess.run(["git", "init", "-q", scratch], check=True)
 subprocess.run(["git", "-C", scratch, "config", "user.email", "v@v"], check=True)
 subprocess.run(["git", "-C", scratch, "config", "user.name", "v"], check=True)
