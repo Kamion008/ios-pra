@@ -85,47 +85,7 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
  				}
  			} else {
  				write_fails = 0;
-@@ -1333,9 +1364,13 @@
-  * sector: on a wedged card the next write_raw fails EBUSY after its bounded
-  * ready-poll (~1-2 s) and the caller reports the attempt - which is itself
-  * one line of forensics - instead of spinning 8192 times. */
-+/* 0176: the block-copy loop WITHOUT the header write. The header's
-+ * total must keep meaning "the periodic flusher fully flushed 0..total"
-+ * - the ring accounting (and every pull comparison) relies on it - so
-+ * partial flushes (strat's tail) must not touch it. The panic path
-+ * keeps the full rewrite + header via pra_log_flush_locked. */
- static int
--pra_log_flush_locked(uint64_t start, uint64_t blocks, uint64_t total,
--    uint32_t seq)
-+pra_log_flush_tail_locked(uint64_t start, uint64_t blocks)
- {
- 	uint8_t sector[512];
- 	int error = 0;
-@@ -1353,6 +1388,23 @@
- 		error = pra_emmc_write_raw((uint32_t)(pra_log_erecovery_lba + 1u +
- 		    block), sector);
- 	}
-+	return error;
-+}
-+
-+static int
-+pra_log_flush_locked(uint64_t start, uint64_t blocks, uint64_t total,
-+    uint32_t seq)
-+{
-+	uint8_t sector[512];
-+	int error = 0;
-+
-+	if (start >= PRA_LOG_SIZE / 512u) {
-+		return EINVAL;
-+	}
-+	if (start + blocks > PRA_LOG_SIZE / 512u) {
-+		blocks = PRA_LOG_SIZE / 512u - start;
-+	}
-+	error = pra_log_flush_tail_locked(start, blocks);
- 	if (!error) {
- 		struct pra_log_header h = {
- 			.magic = { 'P', 'R', 'A', 'L', 'O', 'G', '1', '\0' },
-@@ -1380,6 +1432,17 @@
+@@ -1380,6 +1411,17 @@
   * into the flood - with the suppressed count carried on the next line. The
   * latch flush bypasses the limit: it happens at most once per boot and is
   * the terminal event. */
@@ -143,62 +103,10 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
  static uint64_t pra_log_strat_flush_at;
  static uint64_t pra_log_strat_flush_skipped;
  
-@@ -1411,8 +1474,8 @@
- 		return;
- 	}
- 	pra_log_strat_flush_at = now;
--	error = pra_log_flush_locked(start, blocks, total,
--	    (uint32_t)pra_log_seq);
-+	/* 0176: tail-only, header-less - see pra_log_flush_tail_locked. */
-+	error = pra_log_flush_tail_locked(start, blocks);
- 	printf("PRA LOG: strat flush %llu blocks total=%llu err=%d "
- 	    "skipped=%llu\n",
- 	    blocks, total, error, pra_log_strat_flush_skipped);
-@@ -2378,8 +2441,12 @@
- 	bool is_read = (buf_flags(bp) & B_READ) != 0;
- 	uint32_t cmds = 0;
- 	uint64_t t0 = pra_emmc_stats ? mach_absolute_time() : 0;
--	lck_mtx_lock(&pra_emmc_lock);
-+	/* 0176: the lock is per sector/chunk now. A whole-request hold on a
-+	 * slow card parked every strat caller on this mutex for minutes -
-+	 * hours (the wedge) while the periodic flusher starved (rings 34-39).
-+	 * The error break below stays OUTSIDE the locked section. */
- 	for (uint32_t n = 0; n < count;) {
-+		lck_mtx_lock(&pra_emmc_lock);
- 		uint64_t pos = off + n;
- 		uint32_t skip = pos & 511u;
- 		uint32_t take = MIN(count - n, 512u - skip);
-@@ -2442,6 +2509,13 @@
- 					    pra_emmc_multi_ladder[
- 					    pra_emmc_multi_rung]);
- 				}
-+				/* 0176: this chunk path skips the per-sector tail of the
-+				 * loop, so it must release the mutex the per-iteration
-+				 * structure acquires at the top. */
-+				lck_mtx_unlock(&pra_emmc_lock);
-+				continue;
-+					    pra_emmc_multi_rung]);
-+				}
- 				continue;
- 			} else {
- 				/* ANY failure counts, EBUSY included: a busy
-@@ -2497,13 +2571,28 @@
- 				cmds++;
- 			}
- 		}
-+		if (++pra_emmc_req_count % 128u == 0u) {
-+			/* 0176: tail flush from inside the locked section (the
-+			 * documented strat_flush contract), count-limited, header-less. */
-+			pra_log_strat_flush(true);
-+		}
-+		lck_mtx_unlock(&pra_emmc_lock);
- 		if (error) {
- 			break;
- 		}
- 		n += take;
+@@ -2504,6 +2546,16 @@
  		buf_setresid(bp, count - n);
  	}
--	lck_mtx_unlock(&pra_emmc_lock);
+ 	lck_mtx_unlock(&pra_emmc_lock);
 +	if (pra_log_lock_busy > pra_emmc_lock_busy_mark && count >= 64u * 512u) {
 +		/* 0176: name the big requests while the flusher is starving -
 +		 * the contention-unit evidence (audit C1). */

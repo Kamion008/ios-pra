@@ -44,6 +44,20 @@ def insert_before(lines, anchor, new, tag):
     i = anchor_unique(lines, anchor, tag)
     return lines[:i] + new + lines[i:], f"{tag}: inserted before line {i+1}"
 
+# CI-bisect support: NO_LOCKSWAP=1 withholds the tail-flush refactor ([5*],
+# [6]) and the per-iteration lock swap ([7], [8], [8b]) - the telemetry
+# groups ([2], [3], [4*], [9*]) and the clock stay in.
+NO_LOCKSWAP = os.environ.get("NO_LOCKSWAP") == "1"
+_real_rb, _real_ib = replace_block, insert_before
+def replace_block(lines, anchor, new, tag):  # noqa: F811
+    if NO_LOCKSWAP and tag.startswith(("[5", "[6", "[7", "[8")):
+        return lines, f"{tag}: SKIPPED (NO_LOCKSWAP bisect)"
+    return _real_rb(lines, anchor, new, tag)
+def insert_before(lines, anchor, new, tag):  # noqa: F811
+    if NO_LOCKSWAP and tag.startswith(("[5", "[6", "[7", "[8")):
+        return lines, f"{tag}: SKIPPED (NO_LOCKSWAP bisect)"
+    return _real_ib(lines, anchor, new, tag)
+
 def insert_after(lines, anchor, new, tag):
     i = anchor_unique(lines, anchor, tag)
     return lines[:i+1] + new + lines[i+1:], f"{tag}: inserted after line {i+1}"
