@@ -291,34 +291,40 @@ sd, m = insert_before(sd, [
 log.append(m)
 
 # ---------------- exception.c ----------------
-ex = read(EX)
-
-# [10] the calendar clock in the sampler header (H2 discriminator)
-ex, m = replace_block(ex, [
-    "\tprintf(\"SMP %s[%d] slide 0x%llx mh 0x%llx\\n\", name, pid, slide, task->mach_header_vm_address);",
-], [
-    "\t/* 0176: the wall clock next to the per-process header - the H2",
-    " * never-redrawn-vs-frozen discriminator (boots #4/#5 rendered 4:07 vs",
-    " * boots #1-#3/#6 at 4:08; no in-boot advance). Also measures the real",
-    " * timebase scale against the calendar. clock_sec_t/clock_usec_t are",
-    " * the prototype's own types (clock.h:51-57 - usec is 32-bit). */",
-    "\tclock_sec_t cal_s = 0;",
-    "\tclock_usec_t cal_us = 0;",
-    "\tclock_get_calendar_microtime(&cal_s, &cal_us);",
-    "\tprintf(\"SMP %s[%d] slide 0x%llx mh 0x%llx cal=%llu.%06llu\\n\",",
-    "\t    name, pid, slide, task->mach_header_vm_address,",
-    "\t    (uint64_t)cal_s, (uint64_t)cal_us);",
-], "[10] sampler clock")
-log.append(m)
-
-# [11] clock.h include (idempotent: skip if already present)
-if not any("kern/clock.h" in l for l in ex):
-    inc2 = next(i for i, l in enumerate(ex) if l.startswith("#include <kern/"))
-    ex, m = insert_before(ex, [ex[inc2]],
-                          ["#include <kern/clock.h>"], "[11] clock include")
-    log.append(m)
+NO_CLOCK = os.environ.get("NO_CLOCK") == "1"
+if NO_CLOCK:
+    log.append("NO_CLOCK=1: exception.c hunks withheld (CI bisect)")
+    ex = None
 else:
-    log.append("[11] clock.h already included - skipped")
+    ex = read(EX)
+
+if not NO_CLOCK:
+    # [10] the calendar clock in the sampler header (H2 discriminator)
+    ex, m = replace_block(ex, [
+        "\tprintf(\"SMP %s[%d] slide 0x%llx mh 0x%llx\\n\", name, pid, slide, task->mach_header_vm_address);",
+    ], [
+        "\t/* 0176: the wall clock next to the per-process header - the H2",
+        " * never-redrawn-vs-frozen discriminator (boots #4/#5 rendered 4:07 vs",
+        " * boots #1-#3/#6 at 4:08; no in-boot advance). Also measures the real",
+        " * timebase scale against the calendar. clock_sec_t/clock_usec_t are",
+        " * the prototype's own types (clock.h:51-57 - usec is 32-bit). */",
+        "\tclock_sec_t cal_s = 0;",
+        "\tclock_usec_t cal_us = 0;",
+        "\tclock_get_calendar_microtime(&cal_s, &cal_us);",
+        "\tprintf(\"SMP %s[%d] slide 0x%llx mh 0x%llx cal=%llu.%06llu\\n\",",
+        "\t    name, pid, slide, task->mach_header_vm_address,",
+        "\t    (uint64_t)cal_s, (uint64_t)cal_us);",
+    ], "[10] sampler clock")
+    log.append(m)
+
+    # [11] clock.h include (idempotent: skip if already present)
+    if not any("kern/clock.h" in l for l in ex):
+        inc2 = next(i for i, l in enumerate(ex) if l.startswith("#include <kern/"))
+        ex, m = insert_before(ex, [ex[inc2]],
+                              ["#include <kern/clock.h>"], "[11] clock include")
+        log.append(m)
+    else:
+        log.append("[11] clock.h already included - skipped")
 
 # ---------------- xnu.yml ----------------
 # [12] marker asserts: these go into the REPO's yml via the orchestrator's
@@ -328,8 +334,11 @@ else:
 # ---------------- emit the patch ----------------
 d1 = difflib.unified_diff(read(SD), sd, fromfile="a/bsd/dev/pra_sdhci.c",
                           tofile="b/bsd/dev/pra_sdhci.c", n=3, lineterm="")
-d2 = difflib.unified_diff(read(EX), ex, fromfile="a/osfmk/kern/exception.c",
-                          tofile="b/osfmk/kern/exception.c", n=3, lineterm="")
+if NO_CLOCK:
+    d2 = ()
+else:
+    d2 = difflib.unified_diff(read(EX), ex, fromfile="a/osfmk/kern/exception.c",
+                              tofile="b/osfmk/kern/exception.c", n=3, lineterm="")
 
 header = """pra: 0176 - per-sector eMMC locking + wedge discriminator telemetry
 
@@ -371,8 +380,11 @@ for l in log:
 
 # ---------------- verify three ways ----------------
 scratch = tempfile.mkdtemp(prefix="v0176")
-for path, content in (("bsd/dev/pra_sdhci.c", "\n".join(read(SD)) + "\n"),
-                      ("osfmk/kern/exception.c", "\n".join(read(EX)) + "\n")):
+verify_pairs = [("bsd/dev/pra_sdhci.c", sd)]
+if not NO_CLOCK:
+    verify_pairs.append(("osfmk/kern/exception.c", ex))
+for path, content in [(p, "\n".join(c) + "\n") for (p, c) in
+                      [(p, c) for (p, c) in verify_pairs]]:
     fp = os.path.join(scratch, path)
     os.makedirs(os.path.dirname(fp), exist_ok=True)
     open(fp, "w").write(content)
@@ -396,8 +408,7 @@ r = subprocess.run(["git", "-C", scratch, "apply", "-v", OUT],
                    capture_output=True, text=True)
 print(f"[verify] git apply rc={r.returncode}")
 assert r.returncode == 0 and "Skipped" not in (r.stdout + r.stderr)
-for path, expect in (("bsd/dev/pra_sdhci.c", sd),
-                     ("osfmk/kern/exception.c", ex)):
+for path, expect in verify_pairs:
     got = open(os.path.join(scratch, path)).read()
     assert got == "\n".join(expect) + "\n", f"{path} mismatch"
     print(f"[verify] {path}: applied == expected")
