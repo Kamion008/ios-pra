@@ -80,7 +80,9 @@ both; the ring alone cannot tell them apart.
  195,731 / 196,221 / 197,566 / 207,252 / 207,742 (after 1-5),
  209,606 / 210,772 / 211,589 / 212,430 / 213,144 / 213,463 / 217,495 (1-7),
  228,312 / 238,973 / 239,556 / 251,344 (1), 282,337 / 283,150 / 283,897 /
- 284,387 (1, 1, 1, 2) — the last four straddle total=284,020.
+ 284,387 (1, 1, 1, 2) — note: 284,387 lies BEYOND total=284,020, so that
+ line is a stale fragment of an OLDER boot, not this boot's content; the
+ wedged boot's own failure lines end at 283,897 (< total).
 The 64-tick window (175,611) sits AFTER the park lines (36,149 / 136,813 /
 168,476) with ZERO failure lines between 34,675 and 175,611.
 
