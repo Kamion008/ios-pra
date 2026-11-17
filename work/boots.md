@@ -11,3 +11,9 @@ no-telemetry series (0175 kernel) — decide before starting.
 | (pre-series reference) | 0175+tweaks | n (black, wedge) | — | we=_pra_emmc_lock+0x8, launchd+backboardd UNINT | 4:08 frozen | ring34 |
 
 (Reference rows above are pre-series context, not part of the series.)
+
+## BASELINE series (kernel 0175 + tweaked root — FROZEN build, started 2026-11-17 15:58)
+
+| # | reached | boot time | uptime at photos | wedge telemetry | clock | ring |
+|---|---|---|---|---|---|---|
+| 1 | **y** | 8m30s | photo 1 pending (~10 min) | — (healthy) | pending 2-photo test | pending |
