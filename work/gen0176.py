@@ -321,11 +321,9 @@ else:
     log.append("[11] clock.h already included - skipped")
 
 # ---------------- xnu.yml ----------------
-yml = read(f"{REPO}/.github/workflows/xnu.yml")
-assert not any("0176" in l for l in yml), "yml asserts already present - move them out of the patch scope"
 # [12] marker asserts: these go into the REPO's yml via the orchestrator's
 # direct edit (same commit as the patch), NOT via this patch - see the
-# header note above.
+# header note above. The generator does not touch the yml at all.
 
 # ---------------- emit the patch ----------------
 d1 = difflib.unified_diff(read(SD), sd, fromfile="a/bsd/dev/pra_sdhci.c",
@@ -366,7 +364,7 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
 '(lock=%llu card=%llu)', 'cal=%llu.%06llu'.
 """
 with open(OUT, "w", encoding="utf-8") as f:
-    f.write(header + "\n".join(list(d1) + list(d2) + list(d3)) + "\n")
+    f.write(header + "\n".join(list(d1) + list(d2)) + "\n")
 print(f"[emit] wrote {OUT}")
 for l in log:
     print("  " + l)
