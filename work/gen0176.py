@@ -77,19 +77,27 @@ log.append(f"lock_mtx.h fields verified ({len(lmh)} lines)")
 # view (pra_sdhci.c:1449-1451 "opaque[1] is the state in either layout"),
 # the same technique the panic path's zeroing uses - zero typedef risk.
 
-# [2] counters next to the other pra_log statics
+# [2] counters ABOVE pra_log_write_sector - they are used there (:1091) and
+# in the flusher's complaint (:1281); the previous anchor (next to the other
+# pra_log statics, :1438) put the declarations AFTER the uses -> 4x "use of
+# undeclared identifier" + make[7]: *** [pra_sdhci.o] Error 1 (run #66,
+# quoted lines 19134-19191 of its job log).
 sd, m = insert_before(sd,
-    ["static uint64_t pra_log_strat_flush_at;"],
+    ["static int",
+     "pra_log_write_sector(uint32_t lba, const uint8_t *sector)"],
     ["/* 0176: flusher EBUSY attribution (the audit's conflation killer) and",
      " * the request counter for the count-limited tail flush. The owner",
      " * decoder gets a local explicit extern - pra_sdhci.c does not include",
      " * kern/thread.h (thread_t arrives via the :305 extern pattern), so an",
-     " * implicit declaration would be fatal under -Werror (CI run 44165122932). */",
+     " * implicit declaration would be fatal under the build's strict flags",
+     " * (quoted: pra_sdhci.c:1091/1096/1281 use of undeclared identifier",
+     " * 'pra_log_lock_busy'/'pra_log_card_busy', run #66 job log). */",
      "extern thread_t ctid_get_thread_unsafe(uint32_t ctid);",
      "static uint64_t pra_log_lock_busy;",
      "static uint64_t pra_log_card_busy;",
      "static uint64_t pra_emmc_req_count;",
-     ""], "[2] counters")
+     "",
+     ""], "[2] counters above write_sector")
 log.append(m)
 
 # [3] pra_log_write_sector: lock-busy vs card-busy attribution
@@ -445,6 +453,18 @@ r = subprocess.run(["git", "-C", scratch, "apply", "-v", OUT],
                    capture_output=True, text=True)
 print(f"[verify] git apply rc={r.returncode}")
 assert r.returncode == 0 and "Skipped" not in (r.stdout + r.stderr)
+# use-before-declaration guard (run #66: the counters were declared at :1438
+# while write_sector used them from :1091 - 4x "use of undeclared identifier"
+# + make[7]: *** [pra_sdhci.o] Error 1; the diff-only verify cannot catch it)
+for sym in ("pra_log_lock_busy", "pra_log_card_busy", "pra_emmc_req_count",
+            "pra_emmc_lock_busy_mark"):
+    decl = next(i for i, l in enumerate(sd) if f"static uint64_t {sym};" in l)
+    first_use = next(i for i, l in enumerate(sd)
+                     if sym in l and i != decl
+                     and not l.lstrip().startswith(("//", "/*", "*")))
+    assert first_use > decl, \
+        f"{sym}: use at {first_use+1} [{sd[first_use][1:60]}] precedes decl at {decl+1} [{sd[decl][1:60]}]"
+    print(f"[verify] {sym}: decl {decl+1} < first use {first_use+1}")
 for path, base, expect in verify_pairs:
     got = open(os.path.join(scratch, path)).read()
     assert got == "\n".join(expect) + "\n", f"{path} mismatch"

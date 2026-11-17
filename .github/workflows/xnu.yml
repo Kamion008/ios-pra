@@ -99,7 +99,16 @@ jobs:
           # objects and destination image to be rebuilt from the patched tree.
           rm -rf build/xnu.obj
           rm -f fakeroot/System/Library/Kernels/kernel.*
-          bash build.sh
+          # build.sh's patch loop skips (warn + continue) on apply failure and
+          # the run log endpoint is unreachable from this host - capture the
+          # full apply+build output and fail loudly. build.log is uploaded
+          # below with if: always(), so failures are retrievable via
+          # gh run download.
+          bash build.sh > build.log 2>&1 || { tail -80 build.log; exit 1; }
+          grep -F "patches/0176-pra-emmc-lock-scope-and-telemetry.patch" build.log \
+            || { echo "0176 never entered the apply phase"; exit 1; }
+          grep -F "patches/0177-pra-touch-hid.patch" build.log \
+            || { echo "0177 never entered the apply phase"; exit 1; }
 
       - name: Package build tree for local compiles
         if: always()
@@ -266,3 +275,13 @@ jobs:
             buildtree.tgz
           if-no-files-found: ignore
           retention-days: 3
+
+      # The full apply+build output, retrievable for failed builds too
+      # (gh run download -n build-log).
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: dxb/build.log
+          if-no-files-found: ignore
+          retention-days: 14

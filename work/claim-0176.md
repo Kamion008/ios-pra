@@ -46,6 +46,26 @@ Falsifiers: any path exiting the loop holding the lock; a compile break on
 the opaque access or the extern; header/total invariant breakage via the
 tail flush; a K3 regression that changes retry semantics.
 
+## ADDENDUM 2 — the CI Build failures, root-caused (runs #60-#66)
+
+Quoted from run #66's job log (fetched via the jobs API after gh's log
+stream refused): `pra_sdhci.c:1091/1096/1281: use of undeclared identifier
+'pra_log_lock_busy'/'pra_log_card_busy'` + `make[7]: *** [pra_sdhci.o]
+Error 1`. Root cause: the [2] counters block was inserted next to the other
+pra_log statics (:1438) — AFTER their first uses in pra_log_write_sector
+(:1091) and the flusher complaint (:1281). The patch applied completely in
+every failing run (the diff-only three-way verify cannot see C scoping).
+Fix: the declarations hoisted above pra_log_write_sector, plus a
+use-before-declaration guard in gen0176's verify (comment-aware, asserts
+decl < first use for all four new symbols). The clock line was exonerated
+by the valid bisect split (step 2 vs step 3 differ only by the clock; both
+failed with telemetry present → telemetry is the break — confirmed).
+
+CI changes in the same commit: the Build step tees build.sh's output to
+build.log (tail-80 + exit 1 on failure), asserts 0176/0177 entered the
+apply phase, and uploads build.log with if: always() (gh run download -n
+build-log) — the run-log endpoint is unreachable from this host.
+
 ## ADDENDUM — patch review round 1 (work/pkt-184450: 0 refuted / 7 weak /
 ## 3 survive); outcomes adopted
 
