@@ -54,3 +54,20 @@ file:line; INFERRED marked; anything else UNKNOWN.
 - One row per boot in work/boots.md; wedge -> ring pull BEFORE the next
   boot (dd skip=794623 count=8193); battery gate 25%; pralog=1
   praloglba=794623 always on (the cmdline gate enforces it).
+
+## Outcomes logged against these predictions (2026-11-17 evening)
+
+- P2 PARTIALLY REFUTED: boot #4's clock read 4:07 after a shorter boot.
+  A frozen gettimeofday predicts a constant 4:08 every boot regardless of
+  duration — refuted. The value = epoch + uptime at render time; within a
+  boot the label never advances (boot #1: 4:08 at ~10 and ~15 min). H2's
+  NEVER-REDRAWN branch now leads (kernel wall clock substantively fine,
+  epoch-seeded, no RTC); the 0176 clock_get_calendar_microtime sampler line
+  remains the in-ring confirmation per the standing rule.
+- P5: ring38 (boot #4, healthy) byte-identical to ring35 — 3 of 4 healthy
+  boots wrote ZERO bytes to the disk ring (header seq frozen at 9). Covered
+  by the all-EBUSY / self-erasing-evidence model or a never-started
+  flusher; the 0176 strat-flush-at-unlock + header counters are the
+  discriminator.
+- P1: boots #3-#4 healthy — series 4/4 (+ the pre-series milestone boot).
+  The ~1/3 wedge estimate weakens but is NOT refuted ((2/3)^4 ~= 20%).
