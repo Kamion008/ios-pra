@@ -36,4 +36,4 @@ starts next: same frozen-build rules, kernel 0176, rows below.
 
 | # | kernel sha | reached | boot time | wedge telemetry | clock | ring | pred |
 |---|---|---|---|---|---|---|---|
-| 1 | pending CI artifact sha | fired pending flash | — | — | — | — | predicted (predictions T1-T3) |
+| 1 | 4f26e5674eb65eeb (image; kernel 12bfcf29a91f6374c564, CI 44190353269) | fired 23:45, outcome pending | — | — | — | ring41 after TWRP — **THE FIX VALIDATOR: expect MANY successful flush ticks (vs the 0175 spectrum 9/0/0/0/2/0), (lock=/card=) attribution lines, cal= in the SMP headers** | predicted (T1-T3) |
