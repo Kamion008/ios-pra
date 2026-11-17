@@ -182,15 +182,10 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
  				continue;
  			} else {
  				/* ANY failure counts, EBUSY included: a busy
-@@ -2497,13 +2571,28 @@
+@@ -2497,13 +2571,32 @@
  				cmds++;
  			}
  		}
-+		if (++pra_emmc_req_count % 128u == 0u) {
-+			/* 0176: tail flush from inside the locked section (the
-+			 * documented strat_flush contract), count-limited, header-less. */
-+			pra_log_strat_flush(true);
-+		}
 +		lck_mtx_unlock(&pra_emmc_lock);
  		if (error) {
  			break;
@@ -208,6 +203,15 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
 +		    (uint32_t)(pra_emmc_first_lba + off / 512u), is_read,
 +		    pra_log_lock_busy, pra_log_card_busy);
 +		pra_emmc_lock_busy_mark = pra_log_lock_busy + 16;
++	}
++	if (++pra_emmc_req_count % 128u == 0u) {
++		/* 0176: the tail flush, ONCE PER 128 REQUESTS. The lock is
++		 * re-acquired here so the strat_flush contract (called with
++		 * pra_emmc_lock held) holds; bounded work - the tail flush
++		 * stops at the first failed block. */
++		lck_mtx_lock(&pra_emmc_lock);
++		pra_log_strat_flush(true);
++		lck_mtx_unlock(&pra_emmc_lock);
 +	}
  	buf_unmap(bp);
  	pra_emmc_note_io(count - buf_resid(bp), cmds, t0, is_read);

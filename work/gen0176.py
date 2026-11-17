@@ -280,11 +280,6 @@ sd, m = replace_block(sd, [
     "\t}",
     "\tlck_mtx_unlock(&pra_emmc_lock);",
 ], [
-    "\t\tif (++pra_emmc_req_count % 128u == 0u) {",
-    "\t\t\t/* 0176: tail flush from inside the locked section (the",
-    "\t\t\t * documented strat_flush contract), count-limited, header-less. */",
-    "\t\t\tpra_log_strat_flush(true);",
-    "\t\t}",
     "\t\tlck_mtx_unlock(&pra_emmc_lock);",
     "\t\tif (error) {",
     "\t\t\tbreak;",
@@ -315,7 +310,10 @@ sd, m = replace_block(sd, [
 ], "[8b] unlock before the chunk continue")
 log.append(m)
 
-# [9] the large-request line, once per request, after the loop
+# [9] the large-request line + the request-count tail flush, once per
+# REQUEST, after the loop (the first cut counted SECTORS inside the loop:
+# a 512-sector request fired the 128-block flush every 64 KiB of IO and
+# starved the boot - the user watched strat flushes every ~0.1 s).
 sd, m = insert_before(sd, ["\tbuf_unmap(bp);"], [
     "\tif (pra_log_lock_busy > pra_emmc_lock_busy_mark && count >= 64u * 512u) {",
     "\t\t/* 0176: name the big requests while the flusher is starving -",
@@ -327,7 +325,16 @@ sd, m = insert_before(sd, ["\tbuf_unmap(bp);"], [
     "\t\t    pra_log_lock_busy, pra_log_card_busy);",
     "\t\tpra_emmc_lock_busy_mark = pra_log_lock_busy + 16;",
     "\t}",
-], "[9] large-request line")
+    "\tif (++pra_emmc_req_count % 128u == 0u) {",
+    "\t\t/* 0176: the tail flush, ONCE PER 128 REQUESTS. The lock is",
+    "\t\t * re-acquired here so the strat_flush contract (called with",
+    "\t\t * pra_emmc_lock held) holds; bounded work - the tail flush",
+    "\t\t * stops at the first failed block. */",
+    "\t\tlck_mtx_lock(&pra_emmc_lock);",
+    "\t\tpra_log_strat_flush(true);",
+    "\t\tlck_mtx_unlock(&pra_emmc_lock);",
+    "\t}",
+], "[9] large-request line + request-count flush")
 log.append(m)
 
 # [9b] the mark static
