@@ -1,0 +1,758 @@
+pra: 0177 - touch driver: BL reset+launch attempt, per-slot HID injection, shared i2c2 arbitration
+
+Rung A (pratouchreset=1, OFF by default; WORKLOG sec 10.3): the descriptor
+NACK's root cause is UNKNOWN (touch rail state / deep-sleep inheritance rank
+first, per the design note sec 2). Behind the boot-arg the probe attempts the
+standard recovery: a readback-verified XRES toggle of gpio18.1 (gpio145, bank
+@0xE8A1D000), the 11-byte BL_LAUNCH_APP frame to output register 0x0004
+(mainline cyttsp5.c:609-626, CRC-ITU-T init 0xFFFF over bytes [4..7]), a
+~200 ms sleep, and the existing descriptor re-read reports the outcome. Every
+stage has a fixed tick budget (~230 ms nominal for the whole sequence; tsleep,
+so no hard upper bound); any failure is counted (pra_rst_fail) and the probe
+continues as without the boot-arg.
+
+Rung B: TT5 touch reports are injected into the live SweetHIDTouch
+IOHIDEventService via sweet_hid_touch() (SweetHID.cpp:565-571; donor
+a5xelte_touch.c:527/529 pattern) with real per-slot down[] tracking: present
+slots are pressed/moved, and any still-down slot missing from the report is
+released with its last-known coordinates (a 2-finger report followed by a
+1-finger report releases the lifted finger - no ghost touch). Worker errors
+release ALL slots. Gated on pra_live (do_read requires pra_live &&
+input_reg != 0): with a dead IC the driver is inert. The 10 s stats print is
+kept unchanged (first-test signal + CI marker).
+
+Shared i2c2 arbitration with pra_charger.c (WORKLOG sec 3 hazard + sec 10.4,
+mandatory before event plumbing): one bus mutex + owner tag; a taker that
+finds a foreign owner reconfigures the controller before transacting. The
+charger is the boot default owner. The mutex is held only across bounded MMIO
+spin loops - no tsleep/delay under the lock in either driver (worst-case hold
+~40 ms on a dead bus, microseconds on a live one).
+
+Functionally neutral without pratouchreset=1: the probe runs exactly as today
+(no reset, no injection, no controller or gpio writes); the charger's read/
+write transactions now hold the shared mutex (added locking, same sequence
+and same bytes on the wire).
+
+This patch is xnu-tree-only (the 0176 lesson, run 44141348138): the marker
+asserts 'PRA touch: hid inject' and 'PRA touch: BL_LAUNCH_APP' go into
+.github/workflows/xnu.yml as a direct commit beside this patch, never as a
+yml hunk inside a patch (that cannot apply in the dxb tree and silently
+skips the whole patch).
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -9,9 +9,11 @@
+  * gpio is 224", live/dmesg.txt:3874; UDP dts cy,irq_gpio = <&gpio28 0 0>,
+  * hi6250_udp_default_config.dtsi:479; bank reg 0xfff1d000 0x1000,
+  * hisi_6250_gpio.dtsi:404-406). The reset gpio 145 (gpio18.1 @ 0xE8A1D000)
+- * is NOT driven by this driver: no reset, no output-register writes, no
+- * rail writes - the whole probe is MMIO reads plus two HID-over-I2C read
+- * transaction types (descriptor, input report).
++ * is driven ONLY behind boot-arg pratouchreset=1 (0177 rung A: XRES toggle
++ * + BL_LAUNCH_APP; rails are never written at any rung). Without it: no
++ * reset, no output-register writes, no controller writes - the whole
++ * probe is MMIO reads plus the two HID-over-I2C read transaction types
++ * (descriptor, input report), functionally identical to 0172/0175.
+  *
+  * Everything is gated off by default: pra_touch_probe() is only called when
+  * the cmdline carries pratouch=1 (the IOFindBSDRoot block in
+@@ -65,14 +67,32 @@
+  *    worker histograms both levels and reads when the line differs from
+  *    the level sampled at probe, so no polarity assumption is baked in.
+  *
+- * Shared-bus hazard (documented, not solved in this draft): the charger
+- * driver (pra_charger.c) configures and reads the SAME controller at
+- * 0xFFD73000 every 10 s with no arbitration between its poll thread and
+- * this driver's worker. A collision corrupts one transaction on one side;
+- * both sides recover bounded (timeout -> re-setup on the next attempt).
+- * Acceptable for a default-off, read-only probe; the shared pra_i2c layer
+- * (pra-touch-plan.md sketch 0162) is the first follow-up before any real
+- * event plumbing.
++ * Shared-bus arbitration (0177): the charger driver (pra_charger.c) drives
++ * the SAME controller at 0xFFD73000 (WORKLOG sec 3 hazard, sec 10.4), so
++ * both drivers now go through one bus mutex with an owner tag (pra_i2c_
++ * bus_take/drop below). A taker that finds a foreign owner reconfigures
++ * the controller for its own client before transacting, so no transaction
++ * can run against another driver's TAR. Without pratouchreset=1 the touch
++ * side never takes the mutex, so the charger's transaction sequence is
++ * unchanged (it now holds the shared mutex around each read/write).
++ *
++ * 0177 rung A (pratouchreset=1, OFF by default; WORKLOG sec 10.3): the
++ * descriptor NACK's root cause is UNKNOWN (touch rail state / deep-sleep
++ * inheritance rank first). Behind the boot-arg the probe attempts the
++ * standard recovery: it toggles gpio18.1 readback-verified, sends the
++ * 11-byte BL_LAUNCH_APP frame to output register 0x0004 (mainline
++ * cyttsp5.c:609-626), sleeps ~200 ms, and the descriptor re-read in the
++ * probe reports the outcome. Fixed tick budgets (~230 ms nominal, tsleep,
++ * no hard upper bound); failures are counted; the probe continues
++ * exactly as without the boot-arg.
++ *
++ * 0177 rung B: valid TT5 touch reports are injected into the live
++ * SweetHIDTouch IOHIDEventService via sweet_hid_touch() (donor
++ * a5xelte_touch.c:527/529 pattern) with per-slot down[] tracking:
++ * present slots are pressed/moved and any still-down slot missing from
++ * the report is released with its last-known coordinates; worker errors
++ * release ALL slots. Gated on pra_live: with a dead IC the injection
++ * code is inert.
+  *
+  * Rate limiting: at most one worker line per 10 s (with cumulative
+  * counters in it). Probe failures print exactly one line and leave the
+@@ -98,6 +118,9 @@
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
++
++/* SweetHIDTouch entry point (iokit/Kernel/arm/hid/SweetHID.cpp:565-571). */
++extern void sweet_hid_touch(int finger, int down, int x, int y);
+ 
+ /*
+  * ADT: root-level node published by tools/mkadt_pra.py with absolute
+@@ -203,6 +226,41 @@
+  * and skipped, never drained blind. */
+ #define PRA_TOUCH_MAX_REPORT    128u
+ 
++/*
++ * 0177 rung A: RST gpio 145 = bank gpio18 pin 1 @ 0xE8A1D000 (0172 header
++ * comment; stock dmesg "reset gpio is 145", live/dmesg.txt:3875, and
++ * "cyttsp5_xres: RESET CYTTSP gpio=145", live/dmesg.txt:4052). pl061
++ * layout like the gpio28 bank above: per-pin DAT slot at bank + pin*4
++ * (level in bit 0), DIR word at bank + 0x400 (bit per pin, 1 = output).
++ * The /pra-touch ADT node carries only the i2c2 and gpio28 windows
++ * (WORKLOG sec 6), so the reset bank is a fixed map. Polarity and pulse
++ * timing follow mainline cyttsp5.c (reset asserted HIGH :873-874, >= 10 us
++ * pulse :881, device-up delay :885-886); the stock vendor toggle details
++ * are UNKNOWN (WORKLOG sec 9), which is why every stage is readback-
++ * verified and any failure just aborts the rung.
++ */
++#define PRA_TOUCH_RST_BASE      0xE8A1D000ULL
++#define PRA_TOUCH_RST_SIZE      0x1000u
++#define PRA_TOUCH_RST_DAT_OFF   (1u * 4u)       /* gpio18.1 */
++#define PRA_TOUCH_RST_DAT_BIT   0x1u            /* level in bit 0 */
++#define PRA_TOUCH_RST_DIR_OFF   0x400u
++#define PRA_TOUCH_RST_DIR_BIT   0x2u            /* pin 1 in the DIR word */
++
++/*
++ * BL_LAUNCH_APP output-register frame (mainline cyttsp5.c:34-37,609-623):
++ * u16 11, report id 0x40, reserved 0x00, SOP 0x01, cmd 0x3B, u16 0x0000,
++ * CRC-ITU-T (poly 0x1021, init 0xFFFF) over bytes [4..7], EOP 0x17. The
++ * frame goes to HID_OUTPUT_REG 0x0004 (cyttsp5.c:44) as [reg lo][reg hi]
++ * + payload - the write form WORKLOG sec 3 verified against cyttsp5_write
++ * (:240-263).
++ */
++#define PRA_TOUCH_OUT_REG       0x0004u
++#define PRA_TOUCH_BL_LEN        11u
++
++/* Shared-bus owner ids for pra_i2c_bus_take() (mirrored in pra_charger.c). */
++#define PRA_BUS_TOUCH           1
++#define PRA_BUS_CHARGER         2
++
+ /* Worker cadence and rate limit. */
+ #define PRA_TOUCH_TICK_MS       10u
+ #define PRA_TOUCH_PRINT_S       10u
+@@ -229,6 +287,19 @@
+ static int last_contact_slot = -1, last_contact_x = -1;
+ static int last_contact_y = -1, last_contact_p = -1;
+ 
++/* 0177 rung B: injection state, worker-thread only like the counters
++ * above. The tables mirror the donor's a5_touch_active/x/y
++ * (a5xelte_touch.c:484-494,527-529) sized to the 10 TT5 contacts, which
++ * is also SweetHIDTouch's SWEET_TOUCH_FINGERS (SweetHID.cpp:350). */
++static bool pra_down[MAX_CONTACTS];     /* slots currently reported down */
++static int pra_last_x[MAX_CONTACTS];    /* last-known coords per slot */
++static int pra_last_y[MAX_CONTACTS];
++
++/* 0177 rung A: boot-arg gate + bus-arbitration state + reset failures. */
++static bool pra_touch_rst;              /* pratouchreset=1 */
++static bool pra_touch_bus_on;           /* txn wrapper arbitrates */
++static uint32_t pra_rst_fail;           /* reset+launch stage failures */
++
+ static inline uint32_t
+ pra_touch_rd32(vm_offset_t regs, uint32_t off)
+ {
+@@ -245,6 +316,43 @@
+ pra_touch_le16(const uint8_t *p)
+ {
+ 	return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++/*
++ * Shared i2c2 arbitration with pra_charger.c (WORKLOG sec 3 hazard, sec
++ * 10.4: mandatory before event plumbing). One mutex serializes every
++ * transaction on the 0xFFD73000 controller; the owner tag remembers who
++ * configured it last, and a taker that finds a foreign owner re-runs its
++ * own setup before transacting. The charger is the boot default owner, so
++ * without pratouchreset=1 (the touch side never takes the mutex) the
++ * charger's transaction sequence is unchanged. Exported: pra_charger.c
++ * declares these two and passes PRA_BUS_CHARGER.
++ *
++ * No sleep runs under this mutex: every transaction body is bounded MMIO
++ * spin polls (pra_i2c_xfer/pra_i2c_setup never tsleep or delay - the
++ * only sleeps in both drivers are the worker ticks and the reset-path
++ * waits, all taken outside the lock). Worst-case hold is ~40 ms on a
++ * dead bus, microseconds on a live one.
++ */
++static LCK_GRP_DECLARE(pra_bus_grp, "pra_bus");
++static LCK_MTX_DECLARE(pra_bus_lck, &pra_bus_grp);
++static int pra_bus_owner = PRA_BUS_CHARGER;
++
++bool
++pra_i2c_bus_take(int who)
++{
++	bool reowned;
++
++	lck_mtx_lock(&pra_bus_lck);
++	reowned = pra_bus_owner != who;
++	pra_bus_owner = who;
++	return reowned;
++}
++
++void
++pra_i2c_bus_drop(void)
++{
++	lck_mtx_unlock(&pra_bus_lck);
+ }
+ 
+ /* IC_EN in ENABLE_STATUS follows ENABLE a few clocks later
+@@ -347,7 +455,15 @@
+ 			}
+ 		}
+ 		if (room) {
+-			pra_touch_wr32(r, DW_IC_DATA_CMD, wr[pushed++]);
++			uint32_t cmd = wr[pushed++];
++
++			/* 0177: write-only transaction (BL frame) - STOP on the
++			 * last byte. Read transactions keep the 0172 form: STOP
++			 * rides the last read byte. */
++			if (rlen == 0 && pushed == wlen) {
++				cmd |= DW_IC_CMD_STOP;
++			}
++			pra_touch_wr32(r, DW_IC_DATA_CMD, cmd);
+ 		} else if (error == 0) {
+ 			error = ETIMEDOUT;
+ 		}
+@@ -404,6 +520,38 @@
+ 	return error;
+ }
+ 
++/*
++ * The one transaction entry point for the touch side (WORKLOG sec 10.4).
++ * With pra_touch_bus_on (pratouchreset=1) the shared bus mutex is held
++ * across setup+transaction and the controller is reconfigured whenever
++ * the charger touched it last or after a timeout (pra_tar sentinel).
++ * WITHOUT the boot-arg the 0172 path is kept as-is: pra_tar stays 0
++ * (setup is not called), so the descriptor read returns the same ENXIO
++ * as today and nothing is written to the controller.
++ */
++static int
++pra_touch_txn(const uint8_t *wr, unsigned wlen, uint8_t *rd, unsigned rlen)
++{
++	bool reowned;
++	int error;
++
++	if (!pra_touch_bus_on) {
++		return pra_i2c_xfer(wr, wlen, rd, rlen);
++	}
++	reowned = pra_i2c_bus_take(PRA_BUS_TOUCH);
++	if (reowned) {
++		pra_tar = 0;
++	}
++	if (pra_tar == 0 && pra_i2c_setup()) {
++		pra_tar = 0;
++		pra_i2c_bus_drop();
++		return ETIMEDOUT;
++	}
++	error = pra_i2c_xfer(wr, wlen, rd, rlen);
++	pra_i2c_bus_drop();
++	return error;
++}
++
+ /* HID descriptor: write the 16-bit LE register address 0x0001, repeated
+  * start, read 32 bytes (see header comment for the addressing source). */
+ static int
+@@ -414,7 +562,7 @@
+ 		(uint8_t)(HID_DESC_REG >> 8),
+ 	};
+ 
+-	return pra_i2c_xfer(reg, 2, desc, HID_DESC_SIZE);
++	return pra_touch_txn(reg, 2, desc, HID_DESC_SIZE);
+ }
+ 
+ /*
+@@ -436,7 +584,7 @@
+ 	uint32_t size;
+ 	int error;
+ 
+-	error = pra_i2c_xfer(reg, 2, lenb, 2);
++	error = pra_touch_txn(reg, 2, lenb, 2);
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -448,11 +596,61 @@
+ 	if (size < TOUCH_MIN_REPORT || size > report_cap) {
+ 		return EIO;             /* counted, skipped */
+ 	}
+-	error = pra_i2c_xfer(reg, 2, buf, size);
++	error = pra_touch_txn(reg, 2, buf, size);
+ 	if (!error) {
+ 		*lenp = (unsigned)size;
+ 	}
+ 	return error;
++}
++
++/*
++ * 0177 rung A: one output-register write, [reg lo][reg hi] + payload with
++ * STOP on the last byte (the cyttsp5_write wire form, WORKLOG sec 3).
++ * Only the reset path calls this, behind pratouchreset=1.
++ */
++static int
++pra_touch_output_write(const uint8_t *frame, unsigned len)
++{
++	uint8_t out[2u + PRA_TOUCH_BL_LEN];
++
++	if (len != PRA_TOUCH_BL_LEN) {
++		return EINVAL;
++	}
++	out[0] = (uint8_t)(PRA_TOUCH_OUT_REG & 0xffu);
++	out[1] = (uint8_t)(PRA_TOUCH_OUT_REG >> 8);
++	memcpy(&out[2], frame, len);
++	return pra_touch_txn(out, (unsigned)sizeof(out), NULL, 0);
++}
++
++/*
++ * CRC-ITU-T V.41: poly 0x1021 MSB-first, no reflection, no final xor -
++ * the Linux crc_itu_t() algorithm (include/linux/crc-itu-t.h table form,
++ * bit-expanded; both agree on the launch frame). This is what mainline
++ * cyttsp5.c:621 computes over the four bytes after SOP.
++ */
++static uint16_t
++pra_touch_crc_itu(uint16_t crc, const uint8_t *p, unsigned len)
++{
++	unsigned i, b;
++
++	for (i = 0; i < len; i++) {
++		crc = (uint16_t)(crc ^ ((uint16_t)p[i] << 8));
++		for (b = 0; b < 8; b++) {
++			crc = (crc & 0x8000u) ?
++			    (uint16_t)((crc << 1) ^ 0x1021u) :
++			    (uint16_t)(crc << 1);
++		}
++	}
++	return crc;
++}
++
++/* ms -> whole ticks, at least 1 (bounded sleeps only, no busy spin). */
++static unsigned
++pra_touch_ms_ticks(unsigned ms)
++{
++	unsigned t = (ms * (unsigned)hz + 999u) / 1000u;
++
++	return t < 1u ? 1u : t;
+ }
+ 
+ /* Bit-field extraction with mainline cyttsp5_get_touch_axis semantics
+@@ -476,10 +674,14 @@
+  * corrupt set when a field is impossible. Buttons (report id 0x3) are
+  * dropped silently (no button node on prague, live/dmesg.txt:4817).
+  * Layout per the header comment: count = 5 bits at bit 16 from buffer+3
+- * (bits [4:0] of byte [5]), records at [7 + 10*i].
++ * (bits [4:0] of byte [5]), records at [7 + 10*i]. Every valid record
++ * also marks now[id] and records its coordinates (0177: the worker
++ * reconciles the per-slot down[] table against this contact set); the
++ * last record still fills slot/x/y/p for the stats line.
+  */
+ static unsigned
+ pra_touch_parse(const uint8_t *buf, unsigned len, bool *corrupt,
++    bool *now, unsigned *nx, unsigned *ny,
+     unsigned *slot, unsigned *x, unsigned *y, unsigned *p)
+ {
+ 	unsigned count, n = 0;
+@@ -517,9 +719,77 @@
+ 		*x = rx;
+ 		*y = ry;
+ 		*p = rp;
++		now[id] = true;
++		nx[id] = rx;
++		ny[id] = ry;
+ 		n = i + 1;
+ 	}
+ 	return n;
++}
++
++/*
++ * 0177 rung B: report one TT5 contact into the live SweetHIDTouch
++ * IOHIDEventService (SweetHID.cpp:565-571 sweet_hid_touch; it re-checks
++ * the finger bound at :468). The first injection prints one line - the
++ * CI marker and the boot-time proof the call site is live (per-event
++ * lines are SweetHID.cpp:543-546's own "SWEET HID: touch ..."). Worker
++ * thread only, like the counters above.
++ */
++static void
++pra_touch_inject(unsigned slot, bool down, int x, int y)
++{
++	static bool printed_once;
++
++	if (down) {
++		pra_down[slot] = true;
++		pra_last_x[slot] = x;
++		pra_last_y[slot] = y;
++	} else {
++		pra_down[slot] = false;
++	}
++	if (!printed_once) {
++		printed_once = true;
++		printf("PRA touch: hid inject slot=%u %s x=%d y=%d\n", slot,
++		    down ? "down" : "up", x, y);
++	}
++	sweet_hid_touch((int)slot, down ? 1 : 0, x, y);
++}
++
++/* Donor a5xelte_touch.c:484-494 pattern: everything still down goes up
++ * with its last-known coordinates. Runs after a worker error - per-slot
++ * lifts are handled by pra_touch_reconcile below. */
++static void
++pra_touch_release_all(void)
++{
++	for (unsigned slot = 0; slot < MAX_CONTACTS; slot++) {
++		if (pra_down[slot]) {
++			pra_touch_inject(slot, false, pra_last_x[slot],
++			    pra_last_y[slot]);
++		}
++	}
++}
++
++/*
++ * 0177 rung B, pra_live-gated (the worker only calls this from the
++ * do_read path, which requires pra_live && input_reg != 0): reconcile
++ * the down[] table against the report's contact set. Present slots are
++ * pressed/moved; every still-down slot missing from the report goes up
++ * with its last-known coordinates (donor a5xelte_touch.c:527/529), so
++ * a 2-finger report followed by a 1-finger report releases the lifted
++ * finger instead of leaving a ghost touch.
++ */
++static void
++pra_touch_reconcile(const bool *now, const unsigned *nx,
++    const unsigned *ny)
++{
++	for (unsigned s = 0; s < MAX_CONTACTS; s++) {
++		if (now[s]) {
++			pra_touch_inject(s, true, (int)nx[s], (int)ny[s]);
++		} else if (pra_down[s]) {
++			pra_touch_inject(s, false, pra_last_x[s],
++			    pra_last_y[s]);
++		}
++	}
+ }
+ 
+ static void
+@@ -579,29 +849,50 @@
+ 		if (do_read && backoff == 0) {
+ 			uint8_t buf[PRA_TOUCH_MAX_REPORT];
+ 			unsigned len = 0, slot = 0, x = 0, y = 0, p = 0;
++			bool now[MAX_CONTACTS] = { false };
++			unsigned nx[MAX_CONTACTS] = { 0 };
++			unsigned ny[MAX_CONTACTS] = { 0 };
+ 			bool corrupt;
+ 			int error = pra_touch_input_read(buf, &len);
+ 
+ 			if (error) {
+ 				err_total++;
++				/* Donor error recovery: a failed read must
++				 * not leave contacts stuck down (donor
++				 * a5xelte_touch.c:484-494). */
++				pra_touch_release_all();
+ 				backoff = (unsigned)loops_per_1s;
+ 			} else if (len) {
+ 				unsigned n = pra_touch_parse(buf, len,
+-				    &corrupt, &slot, &x, &y, &p);
++				    &corrupt, now, nx, ny, &slot, &x, &y, &p);
+ 
+ 				if (corrupt) {
+ 					corrupt_total++;
+ 				} else {
+ 					evt_total++;
++					/*
++					 * 0177 rung B, pra_live-gated (do_read
++					 * above is true only when pra_live &&
++					 * input_reg != 0, so nothing here runs
++					 * with a dead IC). Reconcile the down[]
++					 * table against this report's contact
++					 * set (K3): press/move for present
++					 * slots, release for lifted ones - a
++					 * 2-finger report then a 1-finger
++					 * report must not leave a ghost.
++					 */
++					pra_touch_reconcile(now, nx, ny);
++					/* 0172 store kept: the 10 s
++					 * stats line stays the first-
++					 * test signal (last record
++					 * wins, as before). */
+ 					if (n) {
+-						/* last record wins */
+ 						last_contact_slot = (int)slot;
+ 						last_contact_x = (int)x;
+ 						last_contact_y = (int)y;
+ 						last_contact_p = (int)p;
+ 						have_contact = true;
+ 					} else {
+-						/* zero contacts = release */
+ 						have_contact = false;
+ 					}
+ 				}
+@@ -636,6 +927,105 @@
+ 	}
+ }
+ 
++/*
++ * 0177 rung A (pratouchreset=1, OFF by default): readback-verified XRES
++ * toggle of gpio18.1, then the BL_LAUNCH_APP frame to output register
++ * 0x0004, then a bounded wait; the descriptor re-read in pra_touch_probe
++ * (step 4) reports the outcome. Order per mainline cyttsp5_startup
++ * (cyttsp5.c:775-799): reset, launch app, read descriptor - "the device
++ * starts in bootloader mode because of a power-on-reset" (:785-788).
++ * Every stage has a fixed tick budget (~230 ms nominal for the whole
++ * sequence; tsleep, so no hard upper bound); any failure increments
++ * pra_rst_fail, prints once and leaves the probe exactly where
++ * 0172/0175 would be.
++ */
++static void
++pra_touch_reset_launch(void)
++{
++	vm_offset_t rst;
++	uint32_t dir, v;
++	uint8_t bl[PRA_TOUCH_BL_LEN];
++	uint16_t crc;
++	int error;
++
++	/* 1. gpio18.1: set the DIR bit (pl061 pin direction, 1 = output)
++	 * and toggle DAT, both readback-verified. Polarity per mainline
++	 * cyttsp5.c (asserted HIGH :873-874, deassert :883); the stock
++	 * vendor toggle details are UNKNOWN (WORKLOG sec 9) - readback
++	 * failures abort the rung instead of guessing. */
++	rst = ml_io_map((vm_offset_t)PRA_TOUCH_RST_BASE,
++	    (vm_offset_t)PRA_TOUCH_RST_SIZE);
++	if (!rst) {
++		pra_rst_fail++;
++		printf("PRA touch: reset gpio18.1 map failed, probe "
++		    "continues\n");
++		return;
++	}
++	dir = pra_touch_rd32(rst, PRA_TOUCH_RST_DIR_OFF);
++	pra_touch_wr32(rst, PRA_TOUCH_RST_DIR_OFF, dir | PRA_TOUCH_RST_DIR_BIT);
++	v = pra_touch_rd32(rst, PRA_TOUCH_RST_DIR_OFF);
++	if ((v & PRA_TOUCH_RST_DIR_BIT) == 0) {
++		pra_rst_fail++;
++		printf("PRA touch: reset gpio18.1 dir readback failed dir=%x\n",
++		    v);
++		return;
++	}
++	pra_touch_wr32(rst, PRA_TOUCH_RST_DAT_OFF, PRA_TOUCH_RST_DAT_BIT);
++	v = pra_touch_rd32(rst, PRA_TOUCH_RST_DAT_OFF);
++	if ((v & PRA_TOUCH_RST_DAT_BIT) == 0) {
++		pra_rst_fail++;
++		printf("PRA touch: reset gpio18.1 assert readback failed "
++		    "dat=%x\n", v);
++		return;
++	}
++	/* Reset pulse: mainline needs >= 10 us (cyttsp5.c:881); a 10 ms
++	 * tsleep is far above that. */
++	(void)tsleep(&pra_touch_chan, PZERO, "pratrst",
++	    pra_touch_ms_ticks(10u));
++	pra_touch_wr32(rst, PRA_TOUCH_RST_DAT_OFF, 0);
++	v = pra_touch_rd32(rst, PRA_TOUCH_RST_DAT_OFF);
++	if ((v & PRA_TOUCH_RST_DAT_BIT) != 0) {
++		pra_rst_fail++;
++		printf("PRA touch: reset gpio18.1 deassert readback failed "
++		    "dat=%x\n", v);
++		return;
++	}
++	/* Device-up delay: 20 ms (mainline cyttsp5.c:885-886). */
++	(void)tsleep(&pra_touch_chan, PZERO, "pratrst",
++	    pra_touch_ms_ticks(20u));
++	printf("PRA touch: reset gpio18.1 done dir=%x dat=%x\n", dir, v);
++
++	/* 2. BL_LAUNCH_APP, byte-for-byte mainline cyttsp5.c:615-623. */
++	bl[0] = 0x0Bu;                  /* u16 11 = whole frame length */
++	bl[1] = 0x00u;
++	bl[2] = 0x40u;                  /* HID_BL_OUTPUT_REPORT_ID (:70) */
++	bl[3] = 0x00u;                  /* reserved (:617) */
++	bl[4] = 0x01u;                  /* SOP (:34) */
++	bl[5] = 0x3Bu;                  /* LAUNCH_APP (:36) */
++	bl[6] = 0x00u;                  /* u16 0x0000 (:620) */
++	bl[7] = 0x00u;
++	crc = pra_touch_crc_itu(0xFFFFu, &bl[4], 4);
++	bl[8] = (uint8_t)(crc & 0xffu);         /* LE16 (:622) */
++	bl[9] = (uint8_t)(crc >> 8);
++	bl[10] = 0x17u;                 /* EOP (:35) */
++	error = pra_touch_output_write(bl, PRA_TOUCH_BL_LEN);
++	if (error) {
++		pra_rst_fail++;
++		printf("PRA touch: BL_LAUNCH_APP write failed err=%d, probe "
++		    "continues\n", error);
++		return;
++	}
++	printf("PRA touch: BL_LAUNCH_APP sent crc=%#x\n", crc);
++
++	/* 3. App-up budget: mainline waits up to 200 ms for the launch
++	 * response (CY_HID_OUTPUT_TIMEOUT_MS, cyttsp5.c:87,632-638); with
++	 * no IRQ path the same budget is a ~200 ms tsleep (no hard upper
++	 * bound). The descriptor re-read in step 4 decides pra_live either
++	 * way. */
++	(void)tsleep(&pra_touch_chan, PZERO, "pratrst",
++	    pra_touch_ms_ticks(200u));
++}
++
+ /* One-shot entry point, called from the IOFindBSDRoot PRA block
+  * (iokit/bsddev/IOKitBSDInit.cpp) only when the cmdline has pratouch=1. */
+ void
+@@ -643,12 +1033,24 @@
+ {
+ 	bool want = false;
+ 	uint32_t dbg = 0;
++	uint32_t rst = 0;
+ 
+ 	if (!os_atomic_cmpxchg(&pra_touch_started, want, true, relaxed)) {
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("pratouchdbg", &dbg, sizeof(dbg));
+ 	pra_touch_dbg = dbg == 1;
++	(void)PE_parse_boot_argn("pratouchreset", &rst, sizeof(rst));
++	pra_touch_rst = rst == 1;
++	if (pra_touch_rst) {
++		/*
++		 * Rung A on: transactions go through pra_touch_txn, which
++		 * takes the shared bus mutex and configures the controller
++		 * before the first transaction (the descriptor re-read in
++		 * step 4 then decides pra_live).
++		 */
++		pra_touch_bus_on = true;
++	}
+ 
+ 	/*
+ 	 * 1. ADT windows (root-level, absolute, like /pra-emmc).
+@@ -701,6 +1103,15 @@
+ 	idle_level = (int)(dat & PRA_TOUCH_IRQ_BIT);
+ 	printf("PRA touch: irq gpio28.0 dat=%x dir=%x idle=%d\n", dat, dir,
+ 	    idle_level);
++
++	/*
++	 * 3.5 (0177, pratouchreset=1 only): readback-verified XRES toggle +
++	 * BL_LAUNCH_APP attempt (rung A). Without the boot-arg this is
++	 * skipped and step 4 below behaves exactly as in 0172/0175.
++	 */
++	if (pra_touch_rst) {
++		pra_touch_reset_launch();
++	}
+ 
+ 	/*
+ 	 * 4. Touch IC identification: one descriptor read, printed once.
+--- a/bsd/dev/pra_charger.c
++++ b/bsd/dev/pra_charger.c
+@@ -50,6 +50,20 @@
+ extern int hz;
+ 
+ /*
++ * 0177: shared i2c2 arbitration with pra_touch.c (WORKLOG sec 3 hazard,
++ * sec 10.4). The mutex and owner tag live in pra_touch.c; take() returns
++ * true when someone else configured the controller since we last did, and
++ * every transaction entry point below re-runs its setup in that case, so
++ * no transaction can run against a foreign TAR. pra_bus_owner starts at
++ * PRA_BUS_CHARGER, and without pratouchreset=1 the touch side never takes
++ * the mutex, so this driver's transaction sequence is unchanged.
++ */
++#define PRA_BUS_CHARGER 2       /* owner id, must match pra_touch.c */
++
++extern bool pra_i2c_bus_take(int who);
++extern void pra_i2c_bus_drop(void);
++
++/*
+  * DesignWare I2C register offsets (Linux v6.1 i2c-designware-core.h).
+  * The Huawei "i2c_designware-hs" driver is a DesignWare fork with a
+  * separate reset register; its register layout is assumed standard and
+@@ -211,9 +225,11 @@
+ 
+ /* Take the controller from whatever the bootloader left to a known
+  * standard-mode master pointed at addr. This is controller state, not
+- * chip state: the charger register contents are untouched. */
++ * chip state: the charger register contents are untouched. Callers hold
++ * the shared bus mutex (pra_i2c_setup) or run inside a transaction that
++ * already took it (pra_i2c_read_reg/pra_i2c_write_reg). */
+ static int
+-pra_i2c_setup(struct pra_i2c_host *h, uint8_t addr)
++pra_i2c_setup_nolock(struct pra_i2c_host *h, uint8_t addr)
+ {
+ 	vm_offset_t r = h->regs;
+ 	uint32_t total, hcnt;
+@@ -246,6 +262,18 @@
+ 	return 0;
+ }
+ 
++/* 0177: locked wrapper - the one probe-time caller (pra_probe_chip). */
++static int
++pra_i2c_setup(struct pra_i2c_host *h, uint8_t addr)
++{
++	int error;
++
++	(void)pra_i2c_bus_take(PRA_BUS_CHARGER);
++	error = pra_i2c_setup_nolock(h, addr);
++	pra_i2c_bus_drop();
++	return error;
++}
++
+ /* One register read: write the offset, then a repeated-start read with
+  * STOP. NACK is the normal probe outcome for an absent chip and maps to
+  * ENXIO; a silent bus is a timeout. */
+@@ -254,10 +282,20 @@
+ {
+ 	vm_offset_t r = h->regs;
+ 	uint32_t raw;
++	bool reowned;
+ 	int error = ETIMEDOUT;
+ 
+ 	if (h->addr == 0) {
+ 		return ENXIO;
++	}
++	/* 0177: one transaction at a time on the shared controller. If the
++	 * touch driver (or boot state) reconfigured it since we last did,
++	 * re-setup first so the read cannot run against a foreign TAR. */
++	reowned = pra_i2c_bus_take(PRA_BUS_CHARGER);
++	if (reowned && pra_i2c_setup_nolock(h, h->addr)) {
++		h->addr = 0;            /* same sentinel as the timeout below */
++		pra_i2c_bus_drop();
++		return ETIMEDOUT;
+ 	}
+ 	pra_i2c_wait_idle(r);
+ 	(void)pra_i2c_rd32(r, DW_IC_CLR_STOP_DET);
+@@ -287,6 +325,7 @@
+ 		/* Force reconfiguration before the next attempt. */
+ 		h->addr = 0;
+ 	}
++	pra_i2c_bus_drop();
+ 	return error;
+ }
+ 
+@@ -296,10 +335,18 @@
+ {
+ 	vm_offset_t r = h->regs;
+ 	uint32_t raw;
++	bool reowned;
+ 	int error = ETIMEDOUT;
+ 
+ 	if (h->addr == 0) {
+ 		return ENXIO;
++	}
++	/* 0177: same arbitration as pra_i2c_read_reg above. */
++	reowned = pra_i2c_bus_take(PRA_BUS_CHARGER);
++	if (reowned && pra_i2c_setup_nolock(h, h->addr)) {
++		h->addr = 0;
++		pra_i2c_bus_drop();
++		return ETIMEDOUT;
+ 	}
+ 	pra_i2c_wait_idle(r);
+ 	(void)pra_i2c_rd32(r, DW_IC_CLR_STOP_DET);
+@@ -326,6 +373,7 @@
+ 	if (error == ETIMEDOUT) {
+ 		h->addr = 0;
+ 	}
++	pra_i2c_bus_drop();
+ 	return error;
+ }
+ 

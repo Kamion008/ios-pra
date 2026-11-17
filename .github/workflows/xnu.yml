@@ -213,6 +213,16 @@ jobs:
           strings -a "$kernel" | grep -F 'PRA LOG: lock state data=' >/dev/null
           strings -a "$kernel" | grep -F '(lock=%llu card=%llu)' >/dev/null
           strings -a "$kernel" | grep -F 'cal=%llu.%06llu' >/dev/null
+          # 0177 touch guard: rung A (readback-verified XRES toggle + the
+          # BL_LAUNCH_APP frame, all behind pratouchreset=1 - OFF by
+          # default, the driver stays inert without it) and rung B (valid
+          # TT5 contacts injected into SweetHIDTouch via sweet_hid_touch,
+          # gated on pra_live). Both format strings are compiled in
+          # regardless of the boot-arg, so a silently skipped patch fails
+          # here instead of shipping (0155 lesson). Workflow changes are
+          # direct commits (see the 0176 note above).
+          strings -a "$kernel" | grep -F 'PRA touch: hid inject' >/dev/null
+          strings -a "$kernel" | grep -F 'PRA touch: BL_LAUNCH_APP' >/dev/null
           echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite, 0165 churn fix, 0171 GPU, 0172 touch probe and 0173 sampler kernel state are linked.'
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
