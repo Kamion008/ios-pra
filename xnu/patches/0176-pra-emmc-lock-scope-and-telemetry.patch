@@ -120,32 +120,3 @@ Markers asserted in CI: 'PRA LOG: lock state data=',
  	buf_unmap(bp);
  	pra_emmc_note_io(count - buf_resid(bp), cmds, t0, is_read);
  done:
---- a/osfmk/kern/exception.c
-+++ b/osfmk/kern/exception.c
-@@ -76,6 +76,7 @@
- #include <ipc/ipc_pset.h>
- #include <ipc/ipc_machdep.h>
- 
-+#include <kern/clock.h>
- #include <kern/ipc_tt.h>
- #include <kern/task.h>
- #include <kern/thread.h>
-@@ -1018,7 +1019,17 @@
- 		slide = sr->sr_slide;
- 		vm_shared_region_deallocate(sr);
- 	}
--	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
-+	/* 0176: the wall clock next to the per-process header - the H2
-+ * never-redrawn-vs-frozen discriminator (boots #4/#5 rendered 4:07 vs
-+ * boots #1-#3/#6 at 4:08; no in-boot advance). Also measures the real
-+ * timebase scale against the calendar. clock_sec_t/clock_usec_t are
-+ * the prototype's own types (clock.h:51-57 - usec is 32-bit). */
-+	clock_sec_t cal_s = 0;
-+	clock_usec_t cal_us = 0;
-+	clock_get_calendar_microtime(&cal_s, &cal_us);
-+	printf("SMP %s[%d] slide 0x%llx mh 0x%llx cal=%llu.%06llu\n",
-+	    name, pid, slide, task->mach_header_vm_address,
-+	    (uint64_t)cal_s, (uint64_t)cal_us);
- 
- 	task_lock(task);
- 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
