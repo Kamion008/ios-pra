@@ -109,6 +109,12 @@ jobs:
             || { echo "0176 never entered the apply phase"; exit 1; }
           grep -F "patches/0177-pra-touch-hid.patch" build.log \
             || { echo "0177 never entered the apply phase"; exit 1; }
+          grep -F "patches/0178-pra-touch-dat-window.patch" build.log \
+            || { echo "0178 never entered the apply phase"; exit 1; }
+          # entry in the apply list is not success: build.sh skips with a
+          # warning naming the patch - fail on any skip of OUR patches.
+          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch)" build.log \
+            || { echo "one of our patches was SKIPPED"; exit 1; }
 
       - name: Package build tree for local compiles
         if: always()
@@ -232,6 +238,10 @@ jobs:
           # direct commits (see the 0176 note above).
           strings -a "$kernel" | grep -F 'PRA touch: hid inject' >/dev/null
           strings -a "$kernel" | grep -F 'PRA touch: BL_LAUNCH_APP' >/dev/null
+          # 0178 pinmux guard: gpio18.1's pad (pmx0 pin 52) is muxed to its
+          # GPIO function before the reset toggle (the ring42 readback
+          # failure's fix). Workflow changes are direct commits.
+          strings -a "$kernel" | grep -F 'PRA touch: pmx0 pin 52 set to gpio fn' >/dev/null
           echo 'PRA charger, panic flush, Setup probe, 0164-0170 eMMC suite, 0165 churn fix, 0171 GPU, 0172 touch probe and 0173 sampler kernel state are linked.'
 
       - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)

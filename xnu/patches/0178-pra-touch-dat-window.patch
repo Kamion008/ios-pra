@@ -1,0 +1,48 @@
+pra: 0178 - the touch reset toggled the WRONG PL061 masked window
+
+ring42 (the first pratouchreset=1 boot): "reset gpio18.1 assert readback
+failed dat=0" -> the descriptor NACK unchanged. The defines had
+PRA_TOUCH_RST_DAT_OFF = (1u*4u) = 0x4 - PIN 0's masked window. The PL061
+masked address for pin N is 4 << pin: the bootloader's own decode anchors
+it ("fingerprint,irq_gpio = fff1d008" = gpio225 = bank 28 PIN 1 = offset
+8), and gpio145 = bank 18 PIN 1 sits at the same position. So the reset
+pulsed an unknown pin 0 for 10 ms while pin 1 was never toggled - the IC
+never reset, the descriptor NACK followed.
+
+Fix: DAT_OFF = (4u << 1u) = 0x8 AND DAT_BIT = 0x2 - the two defines are
+COUPLED: at the masked window 4 << pin, only bit N is written or
+returned, so the 0177 code (window 0x4 + value/mask 0x1) wrote value-bit-0
+at pin 0's window and would write pin 1 LOW and read it in the wrong bit
+at the corrected window (review pkt-163857 K3, FAULT). DIR (0x400, bit
+0x2) already correct - ring42's DIR readback PASSED, which also proves
+the bank address, the map and the clock gate are fine (the pmx0 pinmux
+theory from the first 0178 draft is refuted by review pkt-163249 K2:
+dat=0 is fully explained by the window). Falsifier: if the toggle at 0x8
+with the value in bit 1 still reads 0, the pad is clamped or unpowered -
+the touch rails (VCI=LDO17/VDDIO=LDO4, enable offsets UNKNOWN) are the
+next hunt. A PASS prints "reset gpio18.1 done dir=%x dat=%x" (the base's
+own line) and the ladder proceeds to BL_LAUNCH_APP.
+
+No binary marker: a define change emits no string. The CI guard is the
+apply-phase grep for this patch's filename (added to the Build step in
+the same commit - the 0176 lesson).
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -241,8 +241,15 @@
+  */
+ #define PRA_TOUCH_RST_BASE      0xE8A1D000ULL
+ #define PRA_TOUCH_RST_SIZE      0x1000u
+-#define PRA_TOUCH_RST_DAT_OFF   (1u * 4u)       /* gpio18.1 */
+-#define PRA_TOUCH_RST_DAT_BIT   0x1u            /* level in bit 0 */
++#define PRA_TOUCH_RST_DAT_OFF   (4u << 1u)      /* gpio18.1: PL061
++	 * masked window for pin 1 - 4 << pin, per the bootloader's own
++	 * decode ("fingerprint,irq_gpio = fff1d008" = gpio225 = bank 28
++	 * PIN 1 -> offset 8; gpio145 = bank 18 pin 1, the same position).
++	 * The old pin*4 = 0x4 was PIN 0's window: ring42's dat=0 was read
++	 * through the wrong window. */
++#define PRA_TOUCH_RST_DAT_BIT   0x2u            /* pin 1's level in
++	 * bit 1 of the masked word (the window is 4 << pin, so bit N is
++	 * written and returned at bit N - review pkt-163857 K3). */
+ #define PRA_TOUCH_RST_DIR_OFF   0x400u
+ #define PRA_TOUCH_RST_DIR_BIT   0x2u            /* pin 1 in the DIR word */
+ 
