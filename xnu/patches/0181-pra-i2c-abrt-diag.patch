@@ -1,0 +1,234 @@
+pra: 0181 - the I2C abort-source diagnostic (ABRT_SOURCE + the TAR/CON verify)
+
+work/i2c-research-2026-11-18.md (VERIFIED): the DW controller's
+abort-reason register IC_TX_ABRT_SOURCE (0xFFD73000 + 0x80) names the
+exact failure of every aborted transaction - bit 0 = the 7-bit target
+address was NACKed, bit 3 = a data byte NACKed, bit 12 = arbitration
+lost, bit 11 = master disabled, bit 9 = the sticky restart-disabled
+abort, bit 16 = software abort; bits [31:23] = TX_FLUSH_CNT, the count
+of queued TX commands the abort destroyed (13 = the whole 13-byte BL
+frame flushed at address time; smaller = the abort won mid-push - the
+count is race-dependent vs the push loop; the register preamble's
+"cleared on the CLR read except Bit 9" makes it per-transaction, and
+the field doc adds a clear-on-disable). The numeric assignments are
+cross-verified
+against Linux v6.1 i2c-designware-core.h:145-158 and the Huawei
+i2c_designware-hs fork (i2c-designware-core.c:134-146) that runs on
+this silicon; COMP_VERSION 3132302a = "120*" = DW v1.20*.
+
+THE CAPTURE ORDER IS THE POINT: pra_i2c_xfer's exit reads CLR_TX_ABRT
+(read-to-clear), and reading it WIPES TX_ABRT_SOURCE ("...cleared
+whenever the IC_CLR_TX_ABRT is read. Preserve it beforehand",
+i2c-designware-master.c:687-694; the fork duplicates the comment at
+core.c:1005-1011). So the snapshot is taken INSIDE the xfer exit,
+before that clear; the reset/launch failure sites (the BL_LAUNCH_APP
+write, the descriptor read) print it through pra_i2c_diag. The
+descriptor site is gated on pra_touch_bus_on (without pratouchreset=1
+no transaction ever runs - the print would be inert noise on every
+standard boot).
+
+This patch adds no CONTROLLER writes and no retries. The new reads
+(TAR/CON/ENABLE/ABRT_SOURCE + the live ver/type) sit in the same
+mapped 4 KiB window
+the transaction path actively uses, but they ARE new fault sites in
+the narrow sense: a window dying between the xfer's last read and the
+capture would fault on them where the old code would have continued.
+Accepted, not engineered around - the diag runs at most twice per
+boot against a window that answered MMIO microseconds earlier, and
+hiding the reads would defeat the diagnostic. The transaction
+sequence stays byte-for-byte comparable and the boot adds one decode
+line per failed transaction.
+
+Decodes (the next pratouchreset=1 boot; NOTE the raw abrt word carries
+the TX_FLUSH_CNT field in [31:23]: flush=13 shifts to 0x06800000, so a
+bit-0 abort with 13 commands flushed reads 06800001, not 00000001 -
+read the low 17 bits as the cause and [31:23] as the count):
+abrt=06800001 flush=13 tar=0000001c/1c ver=3132302a = "the IC at 0x1C
+NACKed its address on a live controller with the config intact"
+(IC-side: mode/timing/the address itself). flush = the queued TX
+commands the abort destroyed - race-dependent vs the push loop; the
+preamble's except-Bit-9 rule makes it per-transaction.
+abrt=00001000 = arbitration lost (bus clamp); abrt=00000008 = data
+NACK (IC alive, rejecting the payload); abrt=00000000 = no abort
+fired (bus hang or no STOP, or the setup never ran - tar=00/1c
+discriminates). The fix follows from the line.
+
+Marker asserted in CI (direct yml commit): 'PRA i2c: '.
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -164,6 +164,8 @@
+ #define DW_IC_ENABLE            0x6Cu
+ #define DW_IC_STATUS            0x70u
+ #define DW_IC_TXFLR             0x74u
++#define DW_IC_TX_ABRT_SOURCE    0x80u   /* abort reason bits; wiped
++	 * by the CLR_TX_ABRT (0x54) read-to-clear */
+ #define DW_IC_ENABLE_STATUS     0x9Cu
+ #define DW_IC_COMP_VERSION      0xF8u
+ #define DW_IC_COMP_TYPE         0xFCu
+@@ -177,6 +179,24 @@
+ #define DW_IC_INTR_RX_FULL      (1u << 2)
+ #define DW_IC_INTR_TX_ABRT      (1u << 6)
+ #define DW_IC_INTR_STOP_DET     (1u << 9)
++/* 0181: IC_TX_ABRT_SOURCE decode - the numeric bit assignments
++ * VERIFIED against Linux v6.1 i2c-designware-core.h:145-158 AND the
++ * Huawei i2c_designware-hs fork (i2c-designware-core.c:134-146, the
++ * driver that runs on this silicon); USER_ABRT bit 16 + the
++ * TX_FLUSH_CNT field [31:23] per the RP2040 DW register reference.
++ * Slave-side bits (13-15) cannot fire with CON SLAVE_DIS set. */
++#define DW_IC_ABRT_7B_ADDR_NOACK    (1u << 0)   /* target addr NACK */
++#define DW_IC_ABRT_TXDATA_NOACK     (1u << 3)   /* data byte NACK */
++#define DW_IC_ABRT_SBYTE_NORSTRT    (1u << 9)   /* restart disabled
++	 * (sticky: survives CLR_TX_ABRT until the source is fixed) */
++#define DW_IC_ABRT_MASTER_DIS       (1u << 11)  /* master disabled */
++#define DW_IC_ABRT_ARB_LOST         (1u << 12)  /* lost arbitration */
++#define DW_IC_ABRT_USER_ABRT        (1u << 16)  /* software abort via
++	 * the ENABLE ABORT bit */
++#define DW_IC_ABRT_FLUSH_CNT        0xff800000u /* [31:23] = the TX
++	 * commands the abort destroyed; the register preamble's
++	 * "cleared on the CLR read except Bit 9" makes it per-txn;
++	 * the field doc adds a clear-on-disable */
+ #define DW_IC_STATUS_BUSY       0x21u   /* ACTIVITY | MASTER_ACTIVITY */
+ #define DW_IC_STATUS_RFNE       0x08u   /* RX FIFO not empty */
+ #define DW_IC_EN_STATUS_IC_EN   (1u << 0)
+@@ -277,6 +297,19 @@
+ static vm_offset_t pra_i2c_regs;        /* 0xFFD73000 window */
+ static vm_offset_t pra_gpio_regs;       /* 0xFFF1D000 window */
+ static uint8_t pra_tar;                 /* configured TAR, 0 = needs setup */
++/* 0181: the transaction-exit state, captured INSIDE pra_i2c_xfer
++ * before its read-to-clear (reading CLR_TX_ABRT wipes the volatile
++ * TX_ABRT_SOURCE bits; a call-site read would keep only the sticky
++ * bit 9). Written on every exit by the probe AND the worker; read
++ * only by the probe's pra_i2c_diag, before the worker starts. No
++ * MMIO writes anywhere - reads and static stores only. */
++static uint32_t pra_i2c_last_abrt;      /* IC_TX_ABRT_SOURCE at exit */
++static uint32_t pra_i2c_last_tar;       /* IC_TAR at exit */
++static uint32_t pra_i2c_last_con;       /* IC_CON at exit */
++static uint32_t pra_i2c_last_en;        /* IC_ENABLE at exit */
++static uint32_t pra_i2c_last_enstat;    /* IC_ENABLE_STATUS at exit */
++static uint32_t pra_i2c_last_stat;      /* IC_STATUS at exit */
++
+ static bool pra_live;                   /* descriptor parsed, reads allowed */
+ static uint16_t input_reg;              /* HID input register from descriptor */
+ static uint16_t report_cap;             /* max bytes one report read may pull */
+@@ -517,6 +550,15 @@
+ 		}
+ 	}
+ 
++	/* 0181: snapshot the exit state BEFORE the read-to-clears below -
++	 * reading CLR_TX_ABRT wipes TX_ABRT_SOURCE (the abort reason),
++	 * so a call-site diagnostic would always read 0. */
++	pra_i2c_last_abrt = pra_touch_rd32(r, DW_IC_TX_ABRT_SOURCE);
++	pra_i2c_last_tar = pra_touch_rd32(r, DW_IC_TAR);
++	pra_i2c_last_con = pra_touch_rd32(r, DW_IC_CON);
++	pra_i2c_last_en = pra_touch_rd32(r, DW_IC_ENABLE);
++	pra_i2c_last_enstat = pra_touch_rd32(r, DW_IC_ENABLE_STATUS);
++	pra_i2c_last_stat = pra_touch_rd32(r, DW_IC_STATUS);
+ 	(void)pra_touch_rd32(r, DW_IC_CLR_TX_ABRT);
+ 	(void)pra_touch_rd32(r, DW_IC_CLR_STOP_DET);
+ 	if (error == ETIMEDOUT) {
+@@ -549,6 +591,15 @@
+ 	if (reowned) {
+ 		pra_tar = 0;
+ 	}
++	/* 0181: invalidate the exit snapshot for this attempt - a failed
++	 * setup (below) would otherwise report the previous
++	 * transaction's abort state. The xfer exit re-captures. */
++	pra_i2c_last_abrt = 0;
++	pra_i2c_last_tar = 0;
++	pra_i2c_last_con = 0;
++	pra_i2c_last_en = 0;
++	pra_i2c_last_enstat = 0;
++	pra_i2c_last_stat = 0;
+ 	if (pra_tar == 0 && pra_i2c_setup()) {
+ 		pra_tar = 0;
+ 		pra_i2c_bus_drop();
+@@ -935,6 +986,71 @@
+ }
+ 
+ /*
++ * 0181: decode the captured transaction-exit state after a FAILED
++ * transaction in the reset/launch path. The abort-source bit numbers
++ * are VERIFIED (Linux v6.1 i2c-designware-core.h:145-158 + the Huawei
++ * fork core.c:134-146 on this silicon): bit 0 = the 7-bit TARGET
++ * ADDRESS was NACKed (no chip at TAR, or a silent/dead IC), bit 3 =
++ * a data byte was NACKed (IC alive, rejecting payload), bit 12 =
++ * arbitration lost (something holds the bus), bit 11 = master
++ * disabled (config lost), bit 9 = the sticky restart-disabled abort,
++ * bit 16 = software abort. The high field [31:23] = TX_FLUSH_CNT,
++ * the count of queued TX commands the abort destroyed: for the
++ * 13-byte BL frame 13 = flushed at address time; smaller = the
++ * abort won mid-push (race-dependent vs the push loop). The
++ * register preamble's "cleared whenever the IC_CLR_TX_ABRT is
++ * read - Except for Bit 9" covers the count field (per-txn);
++ * the count field's own description adds "cleared whenever I2C
++ * is disabled" (RP2040 i2c.h:1908-1910 vs :1929-1931, quoted in
++ * work/evidence-abrt-sources.md). tar/con print the FULL registers
++ * so the verify sees TAR[12] (10-bit mode) and CON[15:8] too.
++ * tar/con are the ENGINE's
++ * actual config against what pra_i2c_setup wrote (0x1c/0x63): a
++ * mismatch means the config never took. ver/type re-read live:
++ * 3132302a/44570140 = the controller window still answers (a
++ * clock-gated host reads as an external abort, not data; the
++ * IOMCU-reset read behavior itself is UNKNOWN).
++ */
++static void
++pra_i2c_diag(const char *what, int error)
++{
++	uint32_t abrt = pra_i2c_last_abrt;
++	uint32_t ver = pra_touch_rd32(pra_i2c_regs, DW_IC_COMP_VERSION);
++	uint32_t type = pra_touch_rd32(pra_i2c_regs, DW_IC_COMP_TYPE);
++
++	printf("PRA i2c: %s err=%d abrt=%08x tar=%08x/%02x con=%08x "
++	    "en=%02x enstat=%02x stat=%02x flush=%u ver=%08x type=%08x",
++	    what, error, abrt, pra_i2c_last_tar,
++	    PRA_TOUCH_ADDR & 0x7fu, pra_i2c_last_con,
++	    pra_i2c_last_en & 0xffu, pra_i2c_last_enstat & 0xffu,
++	    pra_i2c_last_stat & 0xffu,
++	    (abrt & DW_IC_ABRT_FLUSH_CNT) >> 23, ver, type);
++	if (abrt == 0) {
++		printf(" abrt=none\n");
++		return;
++	}
++	if (abrt & DW_IC_ABRT_7B_ADDR_NOACK) {
++		printf(" ADDR7_NACK");
++	}
++	if (abrt & DW_IC_ABRT_TXDATA_NOACK) {
++		printf(" DATA_NACK");
++	}
++	if (abrt & DW_IC_ABRT_ARB_LOST) {
++		printf(" ARB_LOST");
++	}
++	if (abrt & DW_IC_ABRT_MASTER_DIS) {
++		printf(" MASTER_DIS");
++	}
++	if (abrt & DW_IC_ABRT_SBYTE_NORSTRT) {
++		printf(" SBYTE_NORSTRT");
++	}
++	if (abrt & DW_IC_ABRT_USER_ABRT) {
++		printf(" USER_ABRT");
++	}
++	printf("\n");
++}
++
++/*
+  * 0177 rung A (pratouchreset=1, OFF by default): readback-verified XRES
+  * toggle of gpio18.1, then the BL_LAUNCH_APP frame to output register
+  * 0x0004, then a bounded wait; the descriptor re-read in pra_touch_probe
+@@ -1077,6 +1193,7 @@
+ 		pra_rst_fail++;
+ 		printf("PRA touch: BL_LAUNCH_APP write failed err=%d, probe "
+ 		    "continues\n", error);
++		pra_i2c_diag("bl_launch", error);
+ 		return;
+ 	}
+ 	printf("PRA touch: BL_LAUNCH_APP sent crc=%#x\n", crc);
+@@ -1186,6 +1303,9 @@
+ 		printf("PRA touch: HID desc read failed err=%d "
+ 		    "(%s); irq polling continues\n", error,
+ 		    error == ENXIO ? "address NACK" : "bus timeout");
++		if (pra_touch_bus_on) {
++			pra_i2c_diag("hid_desc", error);
++		}
+ 	} else {
+ 		uint32_t dlen = pra_touch_le16(desc + 0);
+ 		uint32_t bcd = pra_touch_le16(desc + 4);
