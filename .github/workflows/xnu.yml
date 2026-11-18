@@ -113,9 +113,11 @@ jobs:
             || { echo "0178 never entered the apply phase"; exit 1; }
           grep -F "patches/0179-pra-aks-devstate-unsupported.patch" build.log \
             || { echo "0179 never entered the apply phase"; exit 1; }
+          grep -F "patches/0180-pra-touch-rails-enable.patch" build.log \
+            || { echo "0180 never entered the apply phase"; exit 1; }
           # entry in the apply list is not success: build.sh skips with a
           # warning naming the patch - fail on any skip of OUR patches.
-          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch|0179-pra-aks)" build.log \
+          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch|0179-pra-aks|0180-pra-touch)" build.log \
             || { echo "one of our patches was SKIPPED"; exit 1; }
 
       - name: Package build tree for local compiles
@@ -240,6 +242,9 @@ jobs:
           # direct commits (see the 0176 note above).
           strings -a "$kernel" | grep -F 'PRA touch: hid inject' >/dev/null
           strings -a "$kernel" | grep -F 'PRA touch: BL_LAUNCH_APP' >/dev/null
+          # 0180 rails guard: the touch IC's rails (LDO17/LDO4) are read
+          # and enabled before the reset (the ring44 BL_LAUNCH NACK's fix).
+          strings -a "$kernel" | grep -F 'PRA touch: rails raw: vbus=' >/dev/null
           # NOTE: the first 0178 draft's pmx0 assert was REMOVED - the review
           # refuted the pinmux theory (the real bug = the PL061 masked window,
           # fixed by the 0178 define change which emits no string; its guard =

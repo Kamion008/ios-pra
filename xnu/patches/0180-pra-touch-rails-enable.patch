@@ -1,0 +1,89 @@
+pra: 0180 - enable the touch IC's rails (LDO17/LDO4) before the reset
+
+work/rails-research-2026-11-18.md (VERIFIED): the touch IC's rails - VCI =
+LDO17, VDDIO = LDO4 (hi6555) - were never enabled by the port; the PMIC
+access = 0xFFF34000 + (reg << 2); LDO4's enable = 0xFFF34064 bit 0 (reg
+0x19), LDO17's = 0xFFF34094 bit 0 (reg 0x25), cross-sourced from two dts
+files + the GPL hisi_pmic driver. ring44: the reset line worked (the 0178
+window fix: "reset gpio18.1 done dir=2 dat=0") but BL_LAUNCH_APP and the
+descriptor address-NACKed - an unpowered IC NACKs everything.
+
+This patch: in pra_touch_reset_launch, BEFORE the gpio18.1 stage - map the
+PMIC window, read the vbus falsification anchor (reg 0x18 bit 1) + both
+LDO ctrl registers, print the states, enable any off rail (RMW bit 0,
+readback), wait 10 ms for the ramp, then the existing reset+launch ladder
+runs against a (hopefully) powered IC. All failures abort the rung via the
+existing pra_rst_fail pattern.
+
+Falsification: the vbus read (bit 1) proves the PMIC window is live; if
+vbus reads plausibly and the LDO bits read 0, the rails were unpowered -
+confirmed. If the enables pass but the descriptor still NACKs, the rails
+are not the (only) problem - the I2C address/controller is next.
+
+Marker asserted in CI (direct yml commit): 'PRA touch: rails vbus='.
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -955,6 +955,63 @@
+ 	uint16_t crc;
+ 	int error;
+ 
++	/* 0180: the IC's rails - VCI = LDO17, VDDIO = LDO4 (hi6555).
++	 * The PMIC registers: 0xFFF34000 + (reg << 2) (the hisi_pmic
++	 * driver convention, VERIFIED against hisi_6555v100_pmic.dtsi:
++	 * 62-68,157-163 + hisi_6250_lowpm.dtsi:645-652 + the GPL
++	 * hisi_pmic driver). LDO4's enable = 0xFFF34064 bit 0 (reg
++	 * 0x19), LDO17's = 0xFFF34094 bit 0 (reg 0x25). An unpowered IC
++	 * address-NACKs everything (ring44: BL_LAUNCH_APP write failed
++	 * err=6 AFTER the reset line worked - the rails were never
++	 * enabled). Read both + the vbus falsification anchor (reg
++	 * 0x18 bit 1 = bus alive), print, enable if off, readback. */
++	{
++		vm_offset_t pmic = ml_io_map(0xFFF34000ULL, 0x1000u);
++		uint32_t vbus, ldo4, ldo17;
++		if (!pmic) {
++			pra_rst_fail++;
++			printf("PRA touch: pmic map failed, the reset rung 			    aborted\n");
++			return;
++		}
++		/* raw words printed: an all-0xFF or all-0x00 pattern across the
++		 * three reads = the window is not live from our kernel entry,
++		 * and every conclusion below would be void (the access-method
++		 * problem, not the rails). */
++		vbus = pra_touch_rd32(pmic, 0x18u);
++		ldo4 = pra_touch_rd32(pmic, 0x64u);
++		ldo17 = pra_touch_rd32(pmic, 0x94u);
++		printf("PRA touch: rails raw: vbus=%08x ldo4=%08x ldo17=%08x\n",
++		    vbus, ldo4, ldo17);
++		if (vbus == ldo4 && ldo4 == ldo17) {
++			/* three DIFFERENT registers reading identical values = the
++			 * window is dead from our kernel entry (the access-method
++			 * problem); the per-register 0/0xff checks below are the
++			 * legitimate OFF states, not proof of a dead window. */
++			pra_rst_fail++;
++			printf("PRA touch: PMIC window not live, the reset rung 			    aborted\n");
++			return;
++		}
++		/* the enables: the hisi_pmic driver writes the value in the
++		 * low byte of the 32-bit slot (the upper lanes are ignored by
++		 * the PMIC's 8-bit bus) - mirror that convention, RMW the 8-bit
++		 * register so the eco bit is preserved. */
++		if ((ldo4 & 1u) == 0u) {
++			pra_touch_wr32(pmic, 0x64u, (ldo4 & 0xffu) | 1u);
++			ldo4 = pra_touch_rd32(pmic, 0x64u);
++		}
++		if ((ldo17 & 1u) == 0u) {
++			pra_touch_wr32(pmic, 0x94u, (ldo17 & 0xffu) | 1u);
++			ldo17 = pra_touch_rd32(pmic, 0x94u);
++		}
++		if ((ldo4 & 1u) == 0u || (ldo17 & 1u) == 0u) {
++			pra_rst_fail++;
++			printf("PRA touch: rail enable readback failed, the reset 			    rung aborted (the rails next)\n");
++			return;
++		}
++		printf("PRA touch: rails on: VDDIO VCI enabled, 20 ms ramp\n");
++		(void)tsleep(&pra_touch_chan, PZERO, "prarails",
++		    pra_touch_ms_ticks(20u));
++	}
+ 	/* 1. gpio18.1: set the DIR bit (pl061 pin direction, 1 = output)
+ 	 * and toggle DAT, both readback-verified. Polarity per mainline
+ 	 * cyttsp5.c (asserted HIGH :873-874, deassert :883); the stock
