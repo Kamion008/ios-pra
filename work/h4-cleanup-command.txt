@@ -1,0 +1,35 @@
+# H4: remove the three churn jobs from the rootfs image (run as shown; sudo)
+LOOP=$(sudo losetup --find --show /home/kamion008/Ai/ios/ios-pra/research/iosroot/ios16-root-v12.img)
+sudo mkdir -p /mnt/pra-root
+sudo mount -t hfsplus -o force "$LOOP" /mnt/pra-root
+sudo python3 - <<'PYEOF'
+import os, plistlib
+path = "/mnt/pra-root/System/Library/xpc/launchd.plist"
+st = os.stat(path)
+with open(path, "rb") as f:
+    plist = plistlib.load(f)
+jobs = plist["LaunchDaemons"]
+targets = ("fairplayd.H2", "bluetoothd", "nanotimekitcompaniond")
+removed = [k for k, j in jobs.items()
+           if any(t in str(j.get("Label", "")) for t in targets)]
+for k in removed:
+    del jobs[k]
+with open(path, "wb") as f:
+    plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
+os.chown(path, st.st_uid, st.st_gid)
+os.chmod(path, st.st_mode & 0o7777)
+print("removed jobs:", removed)
+PYEOF
+sudo umount /mnt/pra-root
+sudo fsck.hfsplus "$LOOP" || true
+sudo losetup -d "$LOOP"
+rmdir /mnt/pra-root 2>/dev/null || true
+
+# 0179's falsifier verdict (ring45): the Unsupported answer did NOT collapse
+# the churn (1294 exec lines vs ring43's 1248) - the retry loop is not
+# error-driven. The churn lever = the plist removals for the top AKS
+# callers. REPLACE the targets tuple in the block above with:
+targets = ("contextstored", "coreduetd", "suggestd", "searchd", "dasd",
+           "peopled", "duetexpertd", "profiled", "privacyaccountingd",
+           "biomed", "assistantd", "akd", "fairplayd.H2",
+           "nanotimekitcompaniond", "bluetoothd")
