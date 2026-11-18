@@ -51,8 +51,11 @@ def insert_before(lines, anchor, new, tag):
 sk = read(f"{BASE}/{TARGET}")
 log = []
 
-# [0] the unlock flag, file scope (after the enum block closes)
-sk, m = insert_before(sk, [
+# [0] the unlock flag, file scope (after the enum block closes) -
+# replace_block CONSUMES the anchor; the [8b] lesson: an insert_before
+# whose replacement repeats the anchor duplicates it (run 44355456445:
+# "extraneous closing brace" at SweetKeyStore.cpp:60).
+sk, m = replace_block(sk, [
     "};",
     "",
     "/* The system (device) bag handle. */",

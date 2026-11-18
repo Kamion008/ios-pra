@@ -24,7 +24,7 @@ the apply-phase grep for this patch's filename + the skip detector (the
 Build step, same commit - the 0176 lesson).
 --- a/iokit/Kernel/arm/SweetKeyStore.cpp
 +++ b/iokit/Kernel/arm/SweetKeyStore.cpp
-@@ -50,6 +50,15 @@
+@@ -50,6 +50,12 @@
  	kAKSAssertConsume    = 101,     /* aks_assert_consume */
  };
  
@@ -34,13 +34,10 @@ Build step, same commit - the 0176 lesson).
 + * get the state). */
 +static bool pra_aks_unlocked;
 +
-+/* The system (device) bag handle. */
-+};
-+
  /* The system (device) bag handle. */
  #define SWEET_AKS_SYSTEM_HANDLE 0
  
-@@ -189,6 +198,9 @@
+@@ -189,6 +195,9 @@
  	case kAKSSetSystem:
  	case kAKSUnlockDevice:
  	case kAKSUnlockBag:
@@ -50,7 +47,7 @@ Build step, same commit - the 0176 lesson).
  	case kAKSLockBag:
  	case kAKSAssertHold:
  	case kAKSAssertDrop:
-@@ -224,7 +236,20 @@
+@@ -224,7 +233,20 @@
  		break;
  	case kAKSGetDeviceState:
  	case kAKSGetExtDeviceState:
