@@ -48,6 +48,17 @@ index-stripped diffs. Local `git apply --check` proves nothing (git 2.56
 skip-detects already-applied patches with rc=0). Never trust a green CI without
 checking the asserts.
 
+## Arithmetic (scripts/calculators, never mental math)
+Every calculation that lands anywhere durable — a claim, a boots.md
+row, a patch header/comment, a handoff entry, a decode: address
+arithmetic, shifts/masks, byte/sector/KiB conversions, counts, rates,
+base conversions — is computed with a script or calculator
+(`python3 -c …`, bc) and the tool output is quoted beside the result
+as the anchor. Mental arithmetic in prose is how the 13<<23 and the
+155.0-KiB slips happened (both caught by review rounds; both
+preventable). If a review round refutes arithmetic, the fix quotes
+the recomputed tool output, not a new hand calculation.
+
 ## Safety (the handoff do-not-do list is authoritative)
 - Flash only p27 via `pra_flash_skip.sh` — never p30/p32, bootloaders, recovery,
   modem, persist, EFS, BOOT. Battery ≥25%; force-flash only on explicit approval.
