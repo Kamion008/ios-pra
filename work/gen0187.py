@@ -89,6 +89,8 @@ pt, m = replace_block(pt, [
     " * CHANGE from the probe-sampled idle (the polarity UNKNOWN -",
     " * either direction counts), bounded ~200 ms in 5 ms tsleep",
     " * ticks. Called OUTSIDE the bus mutex (between the txns). */",
+    "static unsigned pra_touch_ms_ticks(unsigned ms);   /* defined later */",
+    "",
     "static int",
     "pra_touch_desc_wait_int(void)",
     "{",
