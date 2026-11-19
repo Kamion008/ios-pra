@@ -1,0 +1,207 @@
+pra: 0184 - replicate the stock bring-up: the reset polarity (idle HIGH, pulse LOW 40 ms), the LDO VSET selectors, the IOMCU reset pulse
+
+work/driver-bringup-research-2026-11-19.md + boot T7 (ring48): the
+reverse-engineered stock bring-up (the vendor cyttsp5 stack fetched
+to work/rvr/) differs from our ladder in three verified deltas:
+(1) the reset gpio polarity - the vendor idles gpio145 HIGH and
+pulses LOW 40 ms (cyttsp5_platform.c:236-249, :284); our ladder left
+the line LOW = the IC held in reset through every transaction (the
+universal clean-NACK signature, boots T5-T7); (2) the LDO VSET
+selectors - the stock writes LDO4 = 1.8 V and LDO17 = 2.8 V before
+the enable bit; our port never wrote them; (3) the IOMCU reset pulse
+(0xFFD7E020/24/28 BIT(5)) - never done by us. The SPKLEN hypothesis
+is DROPPED (at 100 kHz STD the FS spike filter does not gate); the
+pinconf hypothesis is DROPPED (the stock net cfg = 0 = ours).
+
+This patch replicates all three in the stock order (the controller
+reset -> the rails with VSET -> the pads (0182) -> the VENDOR-polarity
+gpio reset -> the 0183 scan -> the ladder), keeping the scan as the
+classifier. The expected intermediate signature if only the reset
+polarity matters: the BL write ACKs (err=0) and the desc read fails
+err=60 (the CMD_READ latent bug, unfixed by design - that signature
+NAMES 0185).
+
+Marker asserted in CI (direct yml commit): 'PRA touch: iomcu reset
+pulled'.
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -1109,6 +1109,41 @@
+ 	uint16_t crc;
+ 	int error;
+ 
++	/* 0184: the IOMCU reset pulse - the stock i2c driver pulses
++	 * the controller's reset at probe (hisi_i2c_designware.c:
++	 * 139-153, :966): assert = BIT(5) -> 0xFFD7E020, poll
++	 * 0xFFD7E028 BIT(5) until set, deassert = BIT(5) ->
++	 * 0xFFD7E024, poll until clear. The port never did this. The
++	 * pulse resets the DW registers to defaults: pra_tar = 0
++	 * forces the ladder's re-setup (the scan's setup runs after
++	 * it too). */
++	{
++		vm_offset_t iomcu = ml_io_map(0xFFD7E000ULL, 0x1000u);
++		unsigned i;
++		uint32_t st = 0;
++		if (!iomcu) {
++			pra_rst_fail++;
++			printf("PRA touch: iomcu map failed, the reset rung "
++				    "aborted\n");
++			return;
++		}
++		pra_touch_wr32(iomcu, 0x020u, 0x20u);   /* assert BIT(5) */
++		for (i = 0; i < PRA_I2C_POLLS; i++) {
++			st = pra_touch_rd32(iomcu, 0x028u);
++			if (st & 0x20u) {
++				break;
++			}
++		}
++		pra_touch_wr32(iomcu, 0x024u, 0x20u);   /* deassert */
++		for (i = 0; i < PRA_I2C_POLLS; i++) {
++			st = pra_touch_rd32(iomcu, 0x028u);
++			if (!(st & 0x20u)) {
++				break;
++			}
++		}
++		printf("PRA touch: iomcu reset pulsed, status=%08x\n", st);
++		pra_tar = 0;
++	}
+ 	/* 0180: the IC's rails - VCI = LDO17, VDDIO = LDO4 (hi6555).
+ 	 * The PMIC registers: 0xFFF34000 + (reg << 2) (the hisi_pmic
+ 	 * driver convention, VERIFIED against hisi_6555v100_pmic.dtsi:
+@@ -1121,7 +1156,7 @@
+ 	 * 0x18 bit 1 = bus alive), print, enable if off, readback. */
+ 	{
+ 		vm_offset_t pmic = ml_io_map(0xFFF34000ULL, 0x1000u);
+-		uint32_t vbus, ldo4, ldo17;
++		uint32_t vbus, ldo4, ldo17, vset;
+ 		if (!pmic) {
+ 			pra_rst_fail++;
+ 			printf("PRA touch: pmic map failed, the reset rung 			    aborted\n");
+@@ -1149,6 +1184,21 @@
+ 		 * low byte of the 32-bit slot (the upper lanes are ignored by
+ 		 * the PMIC's 8-bit bus) - mirror that convention, RMW the 8-bit
+ 		 * register so the eco bit is preserved. */
++		/* 0184: the VSET selectors - the stock writes LDO4 =
++		 * 1.8 V (reg 0x42, mask 0x07, index 3) and LDO17 = 2.8 V
++		 * (reg 0x4E, index 2) BEFORE the enable bit (the vendor
++		 * regulator sequence, hisi_regulator.c:196-198; the tables
++		 * hisi_6555v100_pmic.dtsi:70-73/165-168, script-verified in
++		 * work/evidence-padmux-arithmetic.md). Our port never
++		 * wrote them - the VSET = the bootloader's leftover. The
++		 * masked RMW mirrors hisi_pmic_rmw. */
++		vset = pra_touch_rd32(pmic, 0x108u);
++		pra_touch_wr32(pmic, 0x108u, (vset & ~0x7u) | 3u);
++		vset = pra_touch_rd32(pmic, 0x138u);
++		pra_touch_wr32(pmic, 0x138u, (vset & ~0x7u) | 2u);
++		printf("PRA touch: rails vset: ldo4=%08x ldo17=%08x\n",
++		    pra_touch_rd32(pmic, 0x108u),
++		    pra_touch_rd32(pmic, 0x138u));
+ 		if ((ldo4 & 1u) == 0u) {
+ 			pra_touch_wr32(pmic, 0x64u, (ldo4 & 0xffu) | 1u);
+ 			ldo4 = pra_touch_rd32(pmic, 0x64u);
+@@ -1187,6 +1237,23 @@
+ 		scl = pra_touch_rd32(pmx, PRA_TOUCH_SCL_PMX_OFF);
+ 		sdacfg = pra_touch_rd32(pmx, PRA_TOUCH_SDA_CFG_OFF);
+ 		sclcfg = pra_touch_rd32(pmx, PRA_TOUCH_SCL_CFG_OFF);
++		if (sdacfg != 0u && (sdacfg & 1u) != 0u) {
++			printf("PRA touch: i2c pads: pull-up already set\n");
++		} else {
++			/* 0184: the pull-up EXPERIMENT - the research proved cfg
++			 * bit0 = the pull-up enable (the <1 1 0 1> entries); the
++			 * bus-dead verdict (ring48: 112 clean NACKs) makes the
++			 * no-pull-up hypothesis live. Set bit0 on both cfg regs,
++			 * readback. */
++			pra_touch_wr32(pmx, PRA_TOUCH_SDA_CFG_OFF,
++			    sdacfg | 1u);
++			pra_touch_wr32(pmx, PRA_TOUCH_SCL_CFG_OFF,
++			    sclcfg | 1u);
++			sdacfg = pra_touch_rd32(pmx, PRA_TOUCH_SDA_CFG_OFF);
++			sclcfg = pra_touch_rd32(pmx, PRA_TOUCH_SCL_CFG_OFF);
++			printf("PRA touch: i2c pads: pull-up experiment, \"
++			    \"sdacfg=%08x sclcfg=%08x\n", sdacfg, sclcfg);
++		}
+ 		printf("PRA touch: i2c pads: sda=%08x scl=%08x sdacfg=%08x "
+ 		    "sclcfg=%08x\n", sda, scl, sdacfg, sclcfg);
+ 		if (sda == PRA_TOUCH_I2C_FUNC && scl == PRA_TOUCH_I2C_FUNC) {
+@@ -1235,38 +1302,60 @@
+ 		    "continues\n");
+ 		return;
+ 	}
++	/* 0184: the VENDOR polarity (cyttsp5_platform.c:236-249 xres
++	 * + :284 init): the line IDLES HIGH and the reset pulse is
++	 * (the direction stage is kept from the previous ladder:
++	 * dir read, the output-enable RMW, its readback - the round-1
++	 * F2 fix: the pad is driven/verified as an output) */
+ 	dir = pra_touch_rd32(rst, PRA_TOUCH_RST_DIR_OFF);
+-	pra_touch_wr32(rst, PRA_TOUCH_RST_DIR_OFF, dir | PRA_TOUCH_RST_DIR_BIT);
++	pra_touch_wr32(rst, PRA_TOUCH_RST_DIR_OFF,
++	    dir | PRA_TOUCH_RST_DIR_BIT);
+ 	v = pra_touch_rd32(rst, PRA_TOUCH_RST_DIR_OFF);
+ 	if ((v & PRA_TOUCH_RST_DIR_BIT) == 0) {
+ 		pra_rst_fail++;
+-		printf("PRA touch: reset gpio18.1 dir readback failed dir=%x\n",
+-		    v);
++		printf("PRA touch: reset gpio18.1 dir readback failed "
++			    "dir=%x\n", v);
+ 		return;
+ 	}
+-	pra_touch_wr32(rst, PRA_TOUCH_RST_DAT_OFF, PRA_TOUCH_RST_DAT_BIT);
++	 * LOW - the first draft left it LOW = the IC held in reset
++	 * through every transaction (the universal NACK, boots
++	 * T5-T7). The vendor shape: HIGH 20 ms -> LOW 40 ms -> HIGH
++	 * 100 ms, the line ENDS HIGH. Every stage readback-verified
++	 * per the existing pattern. */
++	pra_touch_wr32(rst, PRA_TOUCH_RST_DAT_OFF,
++	    PRA_TOUCH_RST_DAT_BIT);
+ 	v = pra_touch_rd32(rst, PRA_TOUCH_RST_DAT_OFF);
+ 	if ((v & PRA_TOUCH_RST_DAT_BIT) == 0) {
+ 		pra_rst_fail++;
+-		printf("PRA touch: reset gpio18.1 assert readback failed "
+-		    "dat=%x\n", v);
++		printf("PRA touch: reset gpio18.1 idle-high readback "
++			    "failed dat=%x\n", v);
+ 		return;
+ 	}
+-	/* Reset pulse: mainline needs >= 10 us (cyttsp5.c:881); a 10 ms
+-	 * tsleep is far above that. */
+ 	(void)tsleep(&pra_touch_chan, PZERO, "pratrst",
+-	    pra_touch_ms_ticks(10u));
++	    pra_touch_ms_ticks(20u));
+ 	pra_touch_wr32(rst, PRA_TOUCH_RST_DAT_OFF, 0);
+ 	v = pra_touch_rd32(rst, PRA_TOUCH_RST_DAT_OFF);
+ 	if ((v & PRA_TOUCH_RST_DAT_BIT) != 0) {
+ 		pra_rst_fail++;
+-		printf("PRA touch: reset gpio18.1 deassert readback failed "
+-		    "dat=%x\n", v);
++		printf("PRA touch: reset gpio18.1 low-pulse readback "
++			    "failed dat=%x\n", v);
+ 		return;
+ 	}
+-	/* Device-up delay: 20 ms (mainline cyttsp5.c:885-886). */
+ 	(void)tsleep(&pra_touch_chan, PZERO, "pratrst",
+-	    pra_touch_ms_ticks(20u));
++	    pra_touch_ms_ticks(40u));
++	pra_touch_wr32(rst, PRA_TOUCH_RST_DAT_OFF,
++	    PRA_TOUCH_RST_DAT_BIT);
++	v = pra_touch_rd32(rst, PRA_TOUCH_RST_DAT_OFF);
++	if ((v & PRA_TOUCH_RST_DAT_BIT) == 0) {
++		pra_rst_fail++;
++		printf("PRA touch: reset gpio18.1 idle restore readback "
++			    "failed dat=%x\n", v);
++		return;
++	}
++	(void)tsleep(&pra_touch_chan, PZERO, "pratrst",
++	    pra_touch_ms_ticks(100u));
++	printf("PRA touch: reset gpio18.1 done dir=%x dat=%x (the "
++		    "line idles HIGH)\n", dir, v);
+ 	printf("PRA touch: reset gpio18.1 done dir=%x dat=%x\n", dir, v);
+ 
+ 	/* 0183: the I2C bus scan (see the patch header). ONE one-byte
+@@ -1371,7 +1460,7 @@
+ 				}
+ 				off += (unsigned)n;
+ 			}
+-			printf("PRA i2c scan: %u ACK, %u clean NACK, %u ",
++			printf("PRA i2c scan: %u ACK, %u clean NACK, %u "
+ 				"anomalies, %u wedged of 112: [%s]\n", ackn,
+ 				clean_nack, anomalies, wedged, list);
+ 			if (anomalies) {
