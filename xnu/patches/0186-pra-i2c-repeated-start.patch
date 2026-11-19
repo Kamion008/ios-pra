@@ -1,0 +1,85 @@
+pra: 0186 - the REPEATED-START form: the write does not stop, the
+register pointer survives the wr->rd switch
+
+work/rvr/ts/ + boot T9 (ring50): the read path WORKS (32 bytes
+received, err=0, the interleaved push-and-drain flawless) but the
+data = VARIED bytes, NOT the HID descriptor (len=0 bcd=0x76d2
+rid=0x5ac7...; the parse gate rejected correctly). = the predicted
+pointer-drop branch: the SEPARATE-STOP form (0185) makes the IC drop
+its register pointer on the STOP - the fresh addr+R read without the
+pointer returns the IC's default-read data, not register 0x0001's
+descriptor. The base comment's ORIGINAL design (the repeated-start
+read - the HID-over-I2C spec form, RESTART_EN in CON) is the
+alternative: the register pointer STAYS set across the restart.
+
+This patch: the write phase does NOT stop when a read follows (the
+last write byte goes out WITHOUT STOP; the first read command
+triggers the repeated start at the wr->rd switch; RESTART_EN is
+already in CON=0x63). The interleaved read phase stays. The
+write-only transactions (the BL frame) keep their STOP.
+
+Decodes (the next pratouchreset=1 boot): the descriptor read
+returns len=32 bcd=0x100 = the app mode + the routing confirmed -
+pra_live=true, the reports flow (touch!); the same varied garbage =
+the pointer was not the (only) problem - the IC's MODE rung next
+(the BL status read: the IC may still be in bootloader mode despite
+the ACKed BL_LAUNCH frame); a different fixed pattern = the pointer
+landed in a different register space (the address/rung question).
+
+Marker: no new print - the observable = the existing 'HID desc'
+line's outcome (the CI assert covers the path).
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -535,14 +535,17 @@
+ 		if (room) {
+ 			uint32_t cmd = wr[pushed++];
+ 
+-			/* 0185: the write phase ALWAYS ends with STOP - the
+-			 * read transaction starts fresh (the vendor's wire
+-			 * shape; the repeated-start form never ran on this
+-			 * hardware - the read commands were never pushed at
+-			 * all before 0185, so neither form was proven: this
+-			 * patch tests the simpler one, and the falsifier
+-			 * ladder covers both outcomes). */
+-			if (pushed == wlen) {
++			/* 0186: the REPEATED-START form - when a read follows,
++			 * the write phase does NOT stop: the last write byte
++			 * goes out WITHOUT STOP and the first read command
++			 * triggers the REPEATED START at the wr->rd switch
++			 * (RESTART_EN is in CON=0x63). The register pointer
++			 * STAYS set across the restart - the read returns the
++			 * descriptor bytes (the separate-STOP form dropped the
++			 * pointer: boot T9's ring50, varied non-descriptor
++			 * bytes). The STOP still rides the last write byte for
++			 * WRITE-ONLY transactions (the BL frame). */
++			if (rlen == 0 && pushed == wlen) {
+ 				cmd |= DW_IC_CMD_STOP;
+ 			}
+ 			pra_touch_wr32(r, DW_IC_DATA_CMD, cmd);
+@@ -551,15 +554,17 @@
+ 		}
+ 	}
+ 
+-	/* 0185: the read phase - push ONE read command, drain ONE
+-	 * byte, repeat (the INTERLEAVED form): the write phase's STOP
+-	 * terminates the write transaction and each CMD_READ runs a
+-	 * fresh START+addr+R+byte+STOP. The 0172-0184 code never
+-	 * pushed read commands - no data could ever clock in (the
+-	 * err=60 signature, boot T8's desc read with abrt=none).
+-	 * Interleaved, NOT push-all-then-drain: the RX FIFO is 64
+-	 * entries and the report reads run up to 128 bytes - the
+-	 * push-all form overflows above 64 (the round-1 K4 FAULT). */
++	/* 0186: the read phase - push ONE read command, drain ONE
++	 * byte, repeat (the INTERLEAVED form): the write phase's
++	 * last byte went out WITHOUT STOP, and the FIRST CMD_READ
++	 * triggers the REPEATED START at the wr->rd switch
++	 * (RESTART_EN) - the register pointer stays set, rlen bytes
++	 * clock in, the last carries STOP. The 0172-0184 code never
++	 * pushed read commands at all; 0185 tested the separate-STOP
++	 * form (the pointer dropped - ring50); 0186 tests the
++	 * repeated-start form (the HID spec). Interleaved, NOT
++	 * push-all-then-drain: the RX FIFO is 64 entries and the
++	 * report reads run up to 128 bytes (the round-1 K4 FAULT). */
+ 	if (error == 0 && rlen > 0) {
+ 		unsigned cmd_pushed = 0;
+ 		while (error == 0 && cmd_pushed < rlen) {
