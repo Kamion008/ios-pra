@@ -1,0 +1,165 @@
+pra: 0183 - the I2C bus scan: probe 0x08-0x77 with one-byte reads -
+the classified bus-dead vs deaf-IC discriminator
+
+work/evidence-padmux-arithmetic.md + boot T6 (ring47): the 0182
+pad-mux fix CONFIRMED a real defect - the SDA/SCL pads sat in the
+idle function (0x0) since 0172, and the fix moved them to I2C (0x1,
+readback sda=00000001 scl=00000001) - AND the ladder STILL NACKs
+(ADDR7_NACK x2, tar=1c/1c verified in-engine, COMP live, identical
+to T5). The routing was necessary but not sufficient. The remaining
+fork, indistinguishable by a single-address probe: the bus
+electrically dead (the cfg words = 0, no pull config; the board's
+external pull-ups unverified) vs a deaf IC at 0x1c.
+
+This patch (v3): the I2C bus scan. Addresses 0x08-0x77 (0x77-0x08+1
+= 112, computed in work/evidence-padmux-arithmetic.md), ONE one-byte
+READ command each (START+addr+R+STOP: nothing is written to any
+device - the probe cannot disturb a live device). The scan
+ESTABLISHES ITS OWN CONFIG (pra_i2c_setup once, before the loop -
+the sole CON/HCNT/LCNT writer; probing on the bootloader's leftovers
+could make DATA_CMD start no transfer at all), takes the bus mutex
+(the scan writes SHARED-controller state), and classifies every
+non-ACK: the abort reason is captured from TX_ABRT_SOURCE BEFORE the
+read-to-clear wipes it (the 0181 lesson) - a clean bit-0 NACK counts
+as no-device, any other abort pattern is an ANOMALY (master-disabled,
+arb-lost, ...) printed with its address, and the wedged case (the
+enable never followed) has its own counter instead of silently
+scoring as no-ACK. The classified print:
+'PRA i2c scan: <ACK> ACK, <n> clean NACK, <m> anomalies, <w> wedged
+of 112: [list]' - the dead-bus verdict is only derivable when m = 0
+and w = 0.
+
+Decodes (the next pratouchreset=1 boot): '0 ACK, 112 clean NACK, 0
+anomalies, 0 wedged' = the bus is electrically dead (the pull-up
+question first); the ACK list contains 1c = the IC answers its
+address (the bus alive, the IC alive - the ladder's next steps
+become real); ACKs but not 1c = the bus is alive and the touch IC is
+dead or mis-addressed (the power/mode rung); anomalies > 0 = the
+controller is misbehaving (the named abort word + address); wedged >
+0 = the controller stopped responding DURING the scan (the 0181
+prints bracket it). The scan runs after the gpio reset (the IC in
+its freshest bootloader-mode state - mainline cyttsp5 powers on in
+bootloader mode and ACKs there) and before the BL_LAUNCH frame.
+
+Marker asserted in CI (direct yml commit): 'PRA i2c scan:'.
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -1269,6 +1269,118 @@
+ 	    pra_touch_ms_ticks(20u));
+ 	printf("PRA touch: reset gpio18.1 done dir=%x dat=%x\n", dir, v);
+ 
++	/* 0183: the I2C bus scan (see the patch header). ONE one-byte
++	 * READ command per address - START+addr+R+STOP, nothing is
++	 * written to any device. The classified print: the dead-bus
++	 * verdict is only derivable when EVERY non-ACK was a clean
++	 * bit-0 NACK and nothing wedged. The scan establishes its own
++	 * config (pra_i2c_setup - the sole CON/HCNT/LCNT writer) and
++	 * takes the bus mutex (SHARED-controller state). Leaves TAR
++	 * changed: pra_tar = 0 forces the ladder's re-setup to 0x1c. */
++	{
++		uint8_t acks[112];
++		char list[(112 * 3) + 8];
++		unsigned ackn = 0, addr, i, off;
++		unsigned clean_nack = 0, anomalies = 0, wedged = 0;
++		uint32_t an_abrt = 0;
++		uint8_t an_addr = 0;
++		int n;
++		bool scanned = false;
++
++		list[0] = '\0';
++		off = 0;
++		pra_i2c_bus_take(PRA_BUS_TOUCH);
++		if (pra_i2c_setup() == 0) {
++			scanned = true;
++			for (addr = 0x08u; addr <= 0x77u; addr++) {
++				uint32_t raw, abrt;
++				bool nack = true;
++
++				pra_touch_wr32(pra_i2c_regs, DW_IC_ENABLE, 0);
++				if (pra_i2c_wait_enable(false)) {
++					wedged++;   /* the controller never disabled */
++					continue;
++				}
++				(void)pra_touch_rd32(pra_i2c_regs,
++					    DW_IC_CLR_TX_ABRT);
++				(void)pra_touch_rd32(pra_i2c_regs,
++					    DW_IC_CLR_STOP_DET);
++				pra_touch_wr32(pra_i2c_regs, DW_IC_TAR,
++					    addr & 0x7fu);
++				__asm__ volatile("dsb sy" : : : "memory");
++				pra_touch_wr32(pra_i2c_regs, DW_IC_ENABLE, 1);
++				if (pra_i2c_wait_enable(true)) {
++					wedged++;   /* the controller never enabled */
++					continue;
++				}
++				pra_touch_wr32(pra_i2c_regs, DW_IC_DATA_CMD,
++					    DW_IC_CMD_READ | DW_IC_CMD_STOP);
++				for (i = 0; i < PRA_I2C_POLLS; i++) {
++					raw = pra_touch_rd32(pra_i2c_regs,
++						    DW_IC_RAW_INTR_STAT);
++					if (raw & DW_IC_INTR_TX_ABRT) {
++						break;      /* abort */
++					}
++					if (raw & DW_IC_INTR_STOP_DET) {
++						nack = false;   /* ACK */
++						break;
++					}
++				}
++				if (nack) {
++					/* 0181's own lesson: reading CLR_TX_ABRT DESTROYS
++					 * TX_ABRT_SOURCE - capture the reason FIRST, else a
++					 * controller-side abort prints identical to a clean
++					 * address NACK and the dead-bus verdict is not
++					 * derivable (the round-2 K4 refutation fixed). */
++					abrt = pra_touch_rd32(pra_i2c_regs,
++						    DW_IC_TX_ABRT_SOURCE);
++					/* the [31:23] TX_FLUSH_CNT rides in the same word on
++					 * EVERY abort (the ladder's own words: flush 24/2) -
++					 * the predicate MASKS it, else the clean-NACK branch
++					 * is unreachable (the round-3 K4 refutation fixed) */
++					if ((abrt & ~DW_IC_ABRT_FLUSH_CNT) ==
++						    DW_IC_ABRT_7B_ADDR_NOACK) {
++						clean_nack++;
++					} else if (anomalies == 0) {
++						anomalies++;
++						an_abrt = abrt;
++						an_addr = (uint8_t)addr;
++					}
++					(void)pra_touch_rd32(pra_i2c_regs,
++						    DW_IC_CLR_TX_ABRT);
++				} else {
++					(void)pra_touch_rd32(pra_i2c_regs,
++						    DW_IC_DATA_CMD);   /* drain the byte */
++					(void)pra_touch_rd32(pra_i2c_regs,
++						    DW_IC_CLR_STOP_DET);
++					if (ackn < sizeof(acks)) {
++						acks[ackn++] = (uint8_t)addr;
++					}
++				}
++			}
++		} else {
++			printf("PRA i2c scan: skipped, setup failed\n");
++		}
++		pra_i2c_bus_drop();
++		if (scanned) {
++			for (i = 0; i < ackn; i++) {
++				n = snprintf(list + off, sizeof(list) - off,
++				    "%s%02x", i ? " " : "", acks[i]);
++				if (n < 0 || (unsigned)n >= sizeof(list) - off) {
++					break;      /* the list truncated */
++				}
++				off += (unsigned)n;
++			}
++			printf("PRA i2c scan: %u ACK, %u clean NACK, %u ",
++				"anomalies, %u wedged of 112: [%s]\n", ackn,
++				clean_nack, anomalies, wedged, list);
++			if (anomalies) {
++				printf("PRA i2c scan: anomaly abrt=%08x at %02x\n",
++					    an_abrt, an_addr);
++			}
++		}
++		pra_tar = 0;    /* the ladder's txn re-setups to 0x1c */
++	}
+ 	/* 2. BL_LAUNCH_APP, byte-for-byte mainline cyttsp5.c:615-623. */
+ 	bl[0] = 0x0Bu;                  /* u16 11 = whole frame length */
+ 	bl[1] = 0x00u;

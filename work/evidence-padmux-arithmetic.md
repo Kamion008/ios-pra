@@ -29,6 +29,14 @@ desc flush (0x01000001 & 0xff800000) >> 23                     = 2 (0x2)
 BL frame commands 2 reg + 11 payload                           = 13 (0xd)
 T5 fresh slice length (168959+1)-512 = 168448 B -> //1024    = 164 (0xa4)
 
+0183 bus-scan arithmetic:
+addresses swept  0x77 - 0x08 + 1                                = 112 (0x70)
+scan ACK-list buffer (112 * 3) + 8                              = 344 bytes
+worst-case runtime bound: 112 addresses x 3 bounded polls x
+PRA_I2C_POLLS (20000 spins) - the abort/stop paths exit at the
+address-byte time (~90 us at 100 kHz); the waits dominate only on
+a wedged controller. One-time at probe.
+
 NOTE the two anomalies the script surfaces (recorded, not hidden):
 - gpio192: the formula gives 0x38 but the dtsi says 0x034 -> the pmx1
   bank is PACKED (the absent gpio191); the per-entry dtsi values are
