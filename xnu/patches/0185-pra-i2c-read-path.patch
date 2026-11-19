@@ -1,0 +1,127 @@
+pra: 0185 - the I2C read path: the interleaved push-and-drain (the
+vendor's wire shape) - the descriptor read's first real test
+
+work/rvr/ts/ + boot T8 (ring49): the bring-up replication WORKED -
+the scan ACKed [1c] (the only device on the bus, 111 clean NACKs, 0
+anomalies, 0 wedged), and BL_LAUNCH_APP was SENT (err=0, crc=0xc720)
+- the first successful I2C transactions in the project's history.
+The descriptor read then failed err=60 (ETIMEDOUT) with abrt=none,
+flush=0 - the predicted CMD_READ latent bug: pra_i2c_xfer never
+pushed read commands (the read loop only pops the RX FIFO), so no
+data could ever clock in - a "read" was just the 2-byte
+register-address write with an empty RX FIFO.
+
+This patch (v2): (1) the write phase ALWAYS ends with STOP - the
+read transaction starts fresh; (2) the INTERLEAVED read phase: per
+byte - TXFLR-gated push of ONE CMD_READ (STOP on the last), a
+bounded wait, a pop - any rlen works (the push-all form overflowed
+the 64-entry RX FIFO above 64 bytes: the reports run up to 128).
+The existing drain loop stays as the no-op safety net. The BL write
+(rlen=0) is byte-identical; the scan is unaffected (its read
+commands are pushed inline).
+
+Neither multi-byte read form was ever proven on this hardware (the
+read commands were never pushed at all before 0185) - this patch
+tests the simpler separate-STOP form first; the falsifier ladder
+covers both outcomes.
+
+Decodes (the next pratouchreset=1 boot): the descriptor read
+returns the REAL HID descriptor - len=32 bcd=0x100 = app mode
+confirmed, pra_live=true, the reports flow (touch, at the 1 Hz
+heartbeat pace until the IRQ rung); a DIFFERENT descriptor = the IC
+is in a different mode than assumed (the desc length and rid name
+it); err=60 again with the read commands pushed = the IC accepted
+the write but never sent data (the read-side deeper rung); err=6
+again = a regression against T8 - investigate as a
+state-persistence question (the mux/pull-up/reset state lost).
+
+Marker: no new print - the observable = the existing 'HID desc'
+line's outcome (the CI assert covers the path).
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -535,15 +535,81 @@
+ 		if (room) {
+ 			uint32_t cmd = wr[pushed++];
+ 
+-			/* 0177: write-only transaction (BL frame) - STOP on the
+-			 * last byte. Read transactions keep the 0172 form: STOP
+-			 * rides the last read byte. */
+-			if (rlen == 0 && pushed == wlen) {
++			/* 0185: the write phase ALWAYS ends with STOP - the
++			 * read transaction starts fresh (the vendor's wire
++			 * shape; the repeated-start form never ran on this
++			 * hardware - the read commands were never pushed at
++			 * all before 0185, so neither form was proven: this
++			 * patch tests the simpler one, and the falsifier
++			 * ladder covers both outcomes). */
++			if (pushed == wlen) {
+ 				cmd |= DW_IC_CMD_STOP;
+ 			}
+ 			pra_touch_wr32(r, DW_IC_DATA_CMD, cmd);
+ 		} else if (error == 0) {
+ 			error = ETIMEDOUT;
++		}
++	}
++
++	/* 0185: the read phase - push ONE read command, drain ONE
++	 * byte, repeat (the INTERLEAVED form): the write phase's STOP
++	 * terminates the write transaction and each CMD_READ runs a
++	 * fresh START+addr+R+byte+STOP. The 0172-0184 code never
++	 * pushed read commands - no data could ever clock in (the
++	 * err=60 signature, boot T8's desc read with abrt=none).
++	 * Interleaved, NOT push-all-then-drain: the RX FIFO is 64
++	 * entries and the report reads run up to 128 bytes - the
++	 * push-all form overflows above 64 (the round-1 K4 FAULT). */
++	if (error == 0 && rlen > 0) {
++		unsigned cmd_pushed = 0;
++		while (error == 0 && cmd_pushed < rlen) {
++			bool room = false;
++			for (unsigned i = 0; i < PRA_I2C_POLLS; i++) {
++				if (pra_touch_rd32(r, DW_IC_RAW_INTR_STAT) &
++				    DW_IC_INTR_TX_ABRT) {
++					error = ENXIO;
++					break;
++				}
++				if (pra_touch_rd32(r, DW_IC_TXFLR) <
++				    DW_IC_TXFLR_PUSH) {
++					room = true;
++					break;
++				}
++			}
++			if (!room) {
++				if (error == 0) {
++					error = ETIMEDOUT;
++				}
++				break;
++			}
++			uint32_t cmd = DW_IC_CMD_READ;
++			cmd_pushed++;
++			if (cmd_pushed == rlen) {
++				cmd |= DW_IC_CMD_STOP;
++			}
++			pra_touch_wr32(r, DW_IC_DATA_CMD, cmd);
++			bool have = false;
++			for (unsigned i = 0; i < PRA_I2C_BYTE_POLLS && error == 0;
++				    i++) {
++				uint32_t raw = pra_touch_rd32(r,
++					    DW_IC_RAW_INTR_STAT);
++				if (raw & DW_IC_INTR_TX_ABRT) {
++					error = ENXIO;
++					break;
++				}
++				if ((raw & DW_IC_INTR_RX_FULL) ||
++					    (pra_touch_rd32(r, DW_IC_STATUS) &
++					    DW_IC_STATUS_RFNE)) {
++					have = true;
++					break;
++				}
++			}
++			if (have) {
++				rd[got++] = (uint8_t)pra_touch_rd32(r,
++					    DW_IC_DATA_CMD);
++			} else if (error == 0) {
++				error = ETIMEDOUT;
++			}
+ 		}
+ 	}
+ 
