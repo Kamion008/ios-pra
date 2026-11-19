@@ -1,0 +1,28 @@
+pra: 0184 - replicate the stock bring-up: the reset polarity (idle HIGH, pulse LOW 40 ms), the LDO VSET selectors, the IOMCU reset pulse, the pull-up experiment, the scan-printf fix
+
+work/driver-bringup-research-2026-11-19.md + boot T7 (ring48): the
+reverse-engineered stock bring-up differs from our ladder in three
+verified deltas: (1) the reset gpio polarity - the vendor idles
+gpio145 HIGH and pulses LOW 40 ms (cyttsp5_platform.c:236-249, :284,
+VERIFIED first-hand in the fetched source); our ladder left the line
+LOW = the IC held in reset through every transaction (the universal
+clean-NACK signature, boots T5-T7); (2) the LDO VSET selectors - the
+stock writes LDO4 = 1.8 V and LDO17 = 2.8 V before the enable bit;
+our port never wrote them; (3) the IOMCU reset pulse
+(0xFFD7E020/24/28 BIT(5)) - never done by us. The SPKLEN hypothesis
+is DROPPED (at 100 kHz STD the FS spike filter does not gate); the
+pinconf hypothesis is an EXPERIMENT (cfg bit0 = the pull-up enable
+per the research's <1 1 0 1> proof; the PRA product dts is absent).
+The 0183 scan-printf concatenation bug is FIXED here (the base's
+separator comma made the second literal an argument - ring48's
+garbled line; the falsifier's scan verdicts need the print).
+
+The order: the IOMCU pulse -> the rails with VSET -> the pads (0182)
++ the pull-up experiment -> the VENDOR-polarity gpio reset -> the
+0183 scan -> the ladder. The expected intermediate signature if only
+the reset polarity matters: the BL write ACKs (err=0) and the desc
+read fails err=60 (the CMD_READ latent bug, unfixed by design - that
+signature NAMES 0185).
+
+Markers asserted in CI (direct yml commit): 'PRA touch: iomcu reset
+pulsed' and 'PRA touch: rails vset:'.
