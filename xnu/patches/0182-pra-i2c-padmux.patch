@@ -1,0 +1,164 @@
+pra: 0182 - the i2c2 pad mux (gpio187/188 -> I2C func 0x1) before the ladder
+
+work/i2c-research-2026-11-18.md + boot T5 (ring46): the 0181 diag
+falsified every controller-side hypothesis - tar=0000001c IN THE
+ENGINE (the setup's write landed), con=00000063, en=01/enstat=01,
+COMP re-read live, and BOTH transactions still return ABRT bit 0 =
+the 7-bit target address was NACKed. The remaining fork: a deaf IC,
+or the bus wiring.
+
+The wiring branch has a concrete, never-written suspect: the i2c2
+SDA/SCL pad registers (gpio187/188) - the MUX words at
+0xFFF11000+0x024/0x028 (gpio187_pmx_func = <0x024 0x1>,
+gpio188_pmx_func = <0x028 0x1>, hi6250_udp_default_pin.dtsi:714-725,
+inside the pinmux@fff11000 node :650-939; func 0x1 = I2C, 0x0 =
+idle) and the CFG words at 0xFFF1182C/0xFFF11830 (gpio187_cfg_func =
+<0x02C 0>, gpio188_cfg_func = <0x030 0>, :2477-2480/:2492-2495; the
+pull/drive fields, stock value 0; the cfg entries belong to the
+pinmux@fff11800 node, REACHABLE from the pmx1 map: 0xFFF11000 +
+0x82C = 0xFFF1182C). Both windows are live (live/iomem.txt:92-93:
+fff11000-fff110ab, fff11800-fff118bb). The dtsi's per-pin offsets
+are per-entry facts, not a formula (the bank has gaps: gpio222's
+actual 0x0a8 sits 8 bytes below the linear 0xb0). No file in the
+tree writes these windows (grep-verified across post0181): pads not
+at the stock I2C function = the controller drives into nowhere -
+CONSISTENT WITH the observed address NACK (the round-6 review: an
+unmuxed pad's idle level is unknown - it can equally read low), and
+consistent with the reset pin working: pl061's own bank needed no
+pinmux write for gpio18.1's DAT readback. The first draft targeted
+pmx0 = gpio012/013's registers (the round-2 review); the second
+draft read the cfg from gpio189/190's mux (the round-4 review) -
+both fixed.
+
+This patch (the 0180 pattern): map 0xFFF11000/0x1000 (ONE map
+covering both register groups: the mux at +0x024/+0x028, the cfg at
++0x82C/+0x830), read + print the four pad registers, write the
+stock func value 0x1 PER-PAD to the mux registers ONLY where the
+read value differs, readback - the POST-WRITE VALUES printed (a
+whole-word write that clobbered upper register bits would otherwise
+pass invisibly; pinctrl-single,function-mask is absent from the
+dtsi, so the stock driver's own i2c2 bring-up write is the same
+whole-word form we replicate) - and abort the rung on a failed
+readback. The cfg registers stay read-only (the pull/drive fields -
+the bus's pull-up arrangement is UNKNOWN and the prints will show
+what the bootloader left). Then the existing ladder reruns against
+a possibly fixed bus.
+
+Decodes (the next pratouchreset=1 boot): 'i2c pads: sda=...00000001
+scl=...00000001' + 'already muxed' = the wiring branch falsified -
+the NACK means a deaf IC at 0x1c (mode/power rung next); any other
+value + 'muxed to I2C func, readback OK' = the pads WERE unmuxed and
+are now fixed - the ladder's ACK/NACK verdict becomes real;
+'pad mux write failed' = the mux write did not take (a deeper block).
+
+Marker asserted in CI (direct yml commit): 'PRA touch: i2c pads:'.
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -274,6 +274,44 @@
+ #define PRA_TOUCH_RST_DIR_BIT   0x2u            /* pin 1 in the DIR word */
+ 
+ /*
++ * 0182: the i2c2 pad registers live in TWO windows (the dtsi's
++ * per-pin offsets are per-entry facts, not a formula - the pmx1
++ * bank is even PACKED after the absent gpio191: gpio192 = 0x034,
++ * not 0x38):
++ * - the MUX: gpio187_pmx_func = <0x024 0x1> and gpio188_pmx_func
++ *   = <0x028 0x1> (hi6250_udp_default_pin.dtsi:714-725; the
++ *   entries sit INSIDE the pinmux@fff11000 node :650-939):
++ *   func 0x1 = I2C, 0x0 = idle;
++ * - the CFG: gpio187_cfg_func = <0x02C 0> and gpio188_cfg_func =
++ *   <0x030 0> (:2477-2480, :2492-2495; bank base 176: gpio176_cfg
++ *   = 0x000, gpio177 = 0x004, gpio178 = 0x008) - the pull/drive
++ *   fields, stock value 0. The cfg entries belong to the
++ *   pinmux@fff11800 node, whose addresses 0xFFF1182C/0xFFF11830
++ *   are REACHABLE from the pmx1 map: 0xFFF11000 + 0x82C =
++ *   0xFFF1182C (computed) - so ONE map of 0xFFF11000/0x1000
++ *   covers both register groups (the round-6 review's nit: the
++ *   second map was redundant).
++ * Both windows are live (iomem.txt:92-93: fff11000-fff110ab,
++ * fff11800-fff118bb). The port never writes them anywhere in the
++ * tree (grep-verified across post0181) - pads not at the stock
++ * I2C function = the controller drives into nowhere = consistent
++ * with the observed address NACK (the round-6 review: an
++ * unmuxed pad's idle level is NOT known - it can equally read
++ * low, so the signature is consistent-with, not exactly).
++ */
++#define PRA_TOUCH_PMX_BASE      0xFFF11000ULL   /* the mux AND the
++	 * cfg registers (0xFFF1182C/0xFFF11830 = base + 0x82C/0x830)
++	 * both live inside this 4 KiB span */
++#define PRA_TOUCH_PMX_SIZE      0x1000u
++#define PRA_TOUCH_SDA_PMX_OFF   0x024u
++#define PRA_TOUCH_SCL_PMX_OFF   0x028u
++#define PRA_TOUCH_SDA_CFG_OFF   0x82Cu  /* = 0xFFF1182C, the
++	 * pinmux@fff11800 window's 0x02C; read-only here */
++#define PRA_TOUCH_SCL_CFG_OFF   0x830u  /* = 0xFFF11830; read-only
++	 * here */
++#define PRA_TOUCH_I2C_FUNC      0x1u
++
++/*
+  * BL_LAUNCH_APP output-register frame (mainline cyttsp5.c:34-37,609-623):
+  * u16 11, report id 0x40, reserved 0x00, SOP 0x01, cmd 0x3B, u16 0x0000,
+  * CRC-ITU-T (poly 0x1021, init 0xFFFF) over bytes [4..7], EOP 0x17. The
+@@ -1128,6 +1166,62 @@
+ 		(void)tsleep(&pra_touch_chan, PZERO, "prarails",
+ 		    pra_touch_ms_ticks(20u));
+ 	}
++	/* 0182: the i2c2 pad mux in the PMX1 window at 0xFFF11000
++	 * (see the define block above). Read +
++	 * print all four pad registers; if a pad's mux value differs
++	 * from the stock I2C function, write THAT pad and readback - the ladder
++	 * then reruns against a possibly fixed bus. The cfg registers
++	 * stay read-only: they gate signal quality (pull/drive), not
++	 * connectivity, and the stock func value is 0 anyway. */
++	{
++		vm_offset_t pmx = ml_io_map((vm_offset_t)PRA_TOUCH_PMX_BASE,
++		    (vm_offset_t)PRA_TOUCH_PMX_SIZE);
++		uint32_t sda, scl, sdacfg, sclcfg;
++		if (!pmx) {
++			pra_rst_fail++;
++			printf("PRA touch: pmx map failed, the reset rung "
++			    "aborted\n");
++			return;
++		}
++		sda = pra_touch_rd32(pmx, PRA_TOUCH_SDA_PMX_OFF);
++		scl = pra_touch_rd32(pmx, PRA_TOUCH_SCL_PMX_OFF);
++		sdacfg = pra_touch_rd32(pmx, PRA_TOUCH_SDA_CFG_OFF);
++		sclcfg = pra_touch_rd32(pmx, PRA_TOUCH_SCL_CFG_OFF);
++		printf("PRA touch: i2c pads: sda=%08x scl=%08x sdacfg=%08x "
++		    "sclcfg=%08x\n", sda, scl, sdacfg, sclcfg);
++		if (sda == PRA_TOUCH_I2C_FUNC && scl == PRA_TOUCH_I2C_FUNC) {
++			printf("PRA touch: i2c pads already muxed to I2C, no "
++			    "write\n");
++		} else {
++			/* per-pad: never write a pad that already reads the
++			 * stock function (the round-1 review's refuted-falsifier
++			 * fix - a write lands only on the differing pad) */
++			if (sda != PRA_TOUCH_I2C_FUNC) {
++				pra_touch_wr32(pmx, PRA_TOUCH_SDA_PMX_OFF,
++				    PRA_TOUCH_I2C_FUNC);
++			}
++			if (scl != PRA_TOUCH_I2C_FUNC) {
++				pra_touch_wr32(pmx, PRA_TOUCH_SCL_PMX_OFF,
++				    PRA_TOUCH_I2C_FUNC);
++			}
++			sda = pra_touch_rd32(pmx, PRA_TOUCH_SDA_PMX_OFF);
++			scl = pra_touch_rd32(pmx, PRA_TOUCH_SCL_PMX_OFF);
++			if (sda != PRA_TOUCH_I2C_FUNC ||
++			    scl != PRA_TOUCH_I2C_FUNC) {
++				pra_rst_fail++;
++				printf("PRA touch: i2c pad mux write failed, the "
++				    "reset rung aborted\n");
++				return;
++			}
++			/* the post-write VALUES printed: a whole-word write that
++			 * clobbered upper register bits would read back 1 and
++			 * pass silently otherwise (round-6 K4) */
++			printf("PRA touch: i2c pads muxed to I2C func, readback "
++			    "sda=%08x scl=%08x\n", sda, scl);
++		}
++	}
++	/* the gpio18.1 stage follows: the bus wiring is now as ready as
++	 * this rung can make it */
+ 	/* 1. gpio18.1: set the DIR bit (pl061 pin direction, 1 = output)
+ 	 * and toggle DAT, both readback-verified. Polarity per mainline
+ 	 * cyttsp5.c (asserted HIGH :873-874, deassert :883); the stock

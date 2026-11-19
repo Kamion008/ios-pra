@@ -117,9 +117,11 @@ jobs:
             || { echo "0180 never entered the apply phase"; exit 1; }
           grep -F "patches/0181-pra-i2c-abrt-diag.patch" build.log \
             || { echo "0181 never entered the apply phase"; exit 1; }
+          grep -F "patches/0182-pra-i2c-padmux.patch" build.log \
+            || { echo "0182 never entered the apply phase"; exit 1; }
           # entry in the apply list is not success: build.sh skips with a
           # warning naming the patch - fail on any skip of OUR patches.
-          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch|0179-pra-aks|0180-pra-touch|0181-pra-i2c)" build.log \
+          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch|0179-pra-aks|0180-pra-touch|0181-pra-i2c|0182-pra-i2c)" build.log \
             || { echo "one of our patches was SKIPPED"; exit 1; }
 
       - name: Package build tree for local compiles
@@ -250,6 +252,10 @@ jobs:
           # 0181 i2c diag guard: the abort-source snapshot + decode line
           # names the exact DW failure after a failed reset/launch txn.
           strings -a "$kernel" | grep -F 'PRA i2c: ' >/dev/null
+          # 0182 pad-mux guard: the i2c2 SDA/SCL pads are read (and
+          # muxed to func 0x1 if the bootloader left them elsewhere)
+          # before the reset+launch ladder.
+          strings -a "$kernel" | grep -F 'PRA touch: i2c pads:' >/dev/null
           # NOTE: the first 0178 draft's pmx0 assert was REMOVED - the review
           # refuted the pinmux theory (the real bug = the PL061 masked window,
           # fixed by the 0178 define change which emits no string; its guard =
