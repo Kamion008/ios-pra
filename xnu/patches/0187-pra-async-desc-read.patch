@@ -1,0 +1,128 @@
+pra: 0187 - the ASYNCHRONOUS descriptor read: the request, the INT
+wait, the pure read (the TT5's command/response model)
+
+work/driver-bringup-research-2026-11-19.md + the vendor sources
+(work/rvr/cyttsp5/, fetched and verified) + boots T8-T10: the TT5 is
+a COMMAND/RESPONSE device, not a register file. The vendor's
+descriptor read (cyttsp5_core.c:2968-3010) = write the 2-byte
+descriptor-register request, WAIT for the IC's INTERRUPT
+(wait_event_timeout), then read the response via the INPUT path.
+The pure read (cyttsp5_i2c.c:162-200, read_default_nosize) =
+addr+R with NO register write - the IC's default pointer IS the
+response buffer. Our ladder's synchronous write-pointer+read forms
+(0172-0186: both the separate-STOP and the repeated-start) returned
+the IC's fixed default-read state block (~28 identical bytes across
+forms and boots, ring50/ring51) - the register-file model does not
+exist on this silicon's HID interface.
+
+This patch: the ASYNCHRONOUS descriptor read.
+1. The request: pra_touch_txn([0x01 0x00], 2, NULL, 0) - the write
+   with STOP.
+2. The INT wait: poll gpio28.0 for a level CHANGE from the
+   probe-sampled idle (the polarity UNKNOWN - either direction
+   counts), bounded ~200 ms in 5 ms tsleep ticks, called OUTSIDE
+   the bus mutex (between the txns).
+3. The PURE read: pra_touch_txn(NULL, 0, desc, HID_DESC_SIZE) - the
+   0185 interleaved phase pushes the CMD_READs and drains (the 0183
+   scan's 1-byte pure read already ACKed on this bus - the form is
+   hardware-verified).
+The BL_LAUNCH's reset_expected = 1 (cyttsp5_core.c:2864-2867): the
+IC resets itself after the launch - the sequence is issued TWICE
+(the second attempt survives the reset window). Each attempt
+prints one line.
+
+Decodes (the next pratouchreset=1 boot): the response received and
+the parse gates pass (len=32 bcd=0x100) = app mode confirmed,
+pra_live=true, the reports flow (touch, at the 1 Hz heartbeat pace
+until the IRQ rung); the response received but the parse fails =
+the response framing rung (the length-prefix offset question -
+the bytes print for the offline decode); the INT never changing =
+the INT routing/polarity rung (the worker's histogram is the
+cross-check); err=6 on the request = a regression against T8.
+
+Marker asserted in CI (direct yml commit): 'PRA touch: desc
+attempt'.
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -719,17 +719,73 @@
+ 	return error;
+ }
+ 
+-/* HID descriptor: write the 16-bit LE register address 0x0001, repeated
+- * start, read 32 bytes (see header comment for the addressing source). */
++/* 0187: the INT wait - the TT5 signals the response on its INT
++ * line (gpio28.0, the pad the worker already histograms). The
++ * vendor waits on the wait queue for the descriptor timeout
++ * class (cyttsp5_core.c:2988-2994); we poll the pad level for a
++ * CHANGE from the probe-sampled idle (the polarity UNKNOWN -
++ * either direction counts), bounded ~200 ms in 5 ms tsleep
++ * ticks. Called OUTSIDE the bus mutex (between the txns). */
++static int
++pra_touch_desc_wait_int(void)
++{
++	unsigned waited = 0;
++
++	while (waited < 200u) {
++		uint32_t dat = pra_touch_rd32(pra_gpio_regs,
++			    PRA_TOUCH_IRQ_DAT_OFF) & PRA_TOUCH_IRQ_BIT;
++		if ((int)(dat ? 1u : 0u) != idle_level) {
++			return 0;   /* the line changed: the response is ready */
++		}
++		(void)tsleep(&pra_touch_chan, PZERO, "pradescw",
++			    pra_touch_ms_ticks(5u));
++		waited += 5u;
++	}
++	return ETIMEDOUT;
++}
++
++/* 0187: the ASYNCHRONOUS descriptor read - the TT5 is a
++ * command/response device, not a register file (the vendor:
++ * cyttsp5_core.c:2968-3010 writes the request, waits for the
++ * INT, and reads the response via the default pointer;
++ * cyttsp5_i2c.c:175+ read_default_nosize = addr+R with NO
++ * register write). Our synchronous write-pointer+read returned
++ * the IC's fixed default-read state block (boots T9/T10: the
++ * ~28 identical bytes across forms). The sequence, issued
++ * TWICE (the BL_LAUNCH's reset_expected = 1 - cyttsp5_core.c
++ * :2864-2867: the IC resets itself after the launch, so the
++ * second attempt survives the reset window): (1) the request
++ * [0x01 0x00] with STOP; (2) the INT wait; (3) the PURE read -
++ * pra_touch_txn(NULL, 0, desc, 32): the 0185 interleaved phase
++ * pushes the CMD_READs and drains (the 0183 scan's 1-byte pure
++ * read already ACKed on this bus). */
+ static int
+ pra_touch_desc_read(uint8_t *desc)
+ {
+-	uint8_t reg[2] = {
+-		(uint8_t)(HID_DESC_REG & 0xffu),
+-		(uint8_t)(HID_DESC_REG >> 8),
+-	};
+-
+-	return pra_touch_txn(reg, 2, desc, HID_DESC_SIZE);
++	uint8_t req[2] = { 0x01u, 0x00u };
++	int error = 0;
++	int attempt;
++
++	for (attempt = 0; attempt < 2; attempt++) {
++		printf("PRA touch: desc attempt %d: request...\n",
++			    attempt + 1);
++		error = pra_touch_txn(req, 2, NULL, 0);
++		if (error == 0) {
++			error = pra_touch_desc_wait_int();
++		}
++		if (error == 0) {
++			error = pra_touch_txn(NULL, 0, desc, HID_DESC_SIZE);
++		}
++		if (error == 0) {
++			printf("PRA touch: desc attempt %d: the response ",
++				"received (%u bytes)\n", attempt + 1,
++					    (unsigned)HID_DESC_SIZE);
++			return 0;
++		}
++		printf("PRA touch: desc attempt %d failed err=%d\n",
++			    attempt + 1, error);
++	}
++	return error;
+ }
+ 
+ /*
