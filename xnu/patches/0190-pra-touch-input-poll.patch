@@ -1,0 +1,86 @@
+pra: 0190 - the touch INPUT poll every worker tick (the end of the 1 Hz gate)
+
+Boot T13 (ring54, fresh [512, 161280) = 160,768 B / 2,795 lines) +
+the vendor read model (work/rvr/cyttsp5/): the 0189 length poll
+PASSED - the descriptor came back on the FIRST attempt (32 bytes,
+hdr=0x20, bcd=0x100), app mode was confirmed (input reg 0x3,
+max_input 254), the worker parsed 42 real reports, and 9 contacts
+were injected through sweet_hid_touch with real coordinates. The
+user's touches reached the driver; the UI still did not react.
+
+The worker's read gate was the 1 Hz heartbeat: idle_level is sampled
+0 at probe (the pad is stuck LOW - T11-T13 histograms irq lo/hi =
+1000/0, 2000/0, ..., 62500/0) and level never differs, so the level
+branch never fires. T13 measured the result: 42 reports over ~50 s
+(~1 Hz) - far too coarse for a swipe or a tap sequence.
+
+This patch (0190):
+1. With pra_live && input_reg != 0, do_read is set EVERY worker tick
+   (10 ms) - the vendor's IRQ-rate read with the stuck INT line
+   replaced by polling. The input read (2-byte length word; 0 or 2 =
+   nothing pending; then the payload) and the 1 s error backoff are
+   unchanged.
+2. One new line at the first poll: 'PRA touch: input poll every
+   %u ms (the INT line is stuck LOW)' - the marker and the proof the
+   new mode is live.
+3. The now-dead last_heartbeat state is removed.
+
+Decodes (the next pratouchreset=1 boot): the poll line prints once;
+a finger down should raise reports by ~10/s and print dense SWEET HID
+down/up lines. Dense reports + the UI still ignoring = the
+SweetHID-delivery/AKS rung (the input side is proven); reports still
+at ~1/s = the IC's own cadence (unlikely).
+
+Marker asserted in CI (direct yml commit): 'PRA touch: input poll'.
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -1080,9 +1080,9 @@
+ {
+ 	unsigned tick = (unsigned)hz / 100u;
+ 	uint64_t loops_per_1s, loops_per_10s, loops = 0, last_print = 0;
+-	uint64_t last_heartbeat = 0;
+ 	uint32_t evt_mark, err_mark, corrupt_mark, printed = 0;
+ 	unsigned backoff = 0;
++	static bool poll_announced;   /* 0190: the poll-mode line once */
+ 
+ 	if (tick < 1) {
+ 		tick = 1;
+@@ -1112,21 +1112,26 @@
+ 		}
+ 
+ 		/*
+-		 * Reads happen when the line differs from the level sampled
+-		 * at probe (polarity UNKNOWN - both levels are histogrammed
+-		 * so the boot log fixes it), plus a 1 Hz heartbeat so a dead
+-		 * or muxed-away IRQ line cannot wedge the driver silently
+-		 * (pra-touch-plan.md rung 3). Every error backs reads off
+-		 * for 1 s, so a stuck line with a dead bus costs at most a
+-		 * handful of bounded transactions per second.
++		 * 0190: read EVERY worker tick (10 ms). The pad is stuck
++		 * LOW on this board (T11-T13: irq lo/hi = N/0), so the
++		 * old level-diff gate never fired and the 1 Hz heartbeat
++		 * sampled the panel at ~1 Hz (T13: 42 reports over ~50 s)
++		 * - far too coarse for a gesture. The input read is a
++		 * 2-byte length word, with the payload only when data is
++		 * pending; at 10 ms this is the vendor's IRQ-rate read
++		 * with the stuck INT line replaced by polling. Every
++		 * error still backs reads off for 1 s, so a dead bus
++		 * costs at most a handful of bounded transactions per
++		 * second.
+ 		 */
+ 		do_read = false;
+ 		if (pra_live && input_reg != 0) {
+-			if ((uint32_t)idle_level != level) {
+-				do_read = true;
+-			} else if (loops - last_heartbeat >= loops_per_1s) {
+-				do_read = true;
+-				last_heartbeat = loops;
++			do_read = true;
++			if (!poll_announced) {
++				poll_announced = true;
++				printf("PRA touch: input poll every %u ms "
++				    "(the INT line is stuck LOW)\n",
++				    (unsigned)((tick * 1000u) / (unsigned)hz));
+ 			}
+ 		}
+ 		if (do_read && backoff == 0) {
