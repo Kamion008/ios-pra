@@ -127,9 +127,11 @@ jobs:
             || { echo "0186 never entered the apply phase"; exit 1; }
           grep -F "patches/0187-pra-async-desc-read.patch" build.log \
             || { echo "0187 never entered the apply phase"; exit 1; }
+          grep -F "patches/0188-pra-touch-int-level.patch" build.log \
+            || { echo "0188 never entered the apply phase"; exit 1; }
           # entry in the apply list is not success: build.sh skips with a
           # warning naming the patch - fail on any skip of OUR patches.
-          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch|0179-pra-aks|0180-pra-touch|0181-pra-i2c|0182-pra-i2c|0183-pra-i2c|0184-pra-bringup|0185-pra-i2c|0186-pra-i2c|0187-pra-async)" build.log \
+          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch|0179-pra-aks|0180-pra-touch|0181-pra-i2c|0182-pra-i2c|0183-pra-i2c|0184-pra-bringup|0185-pra-i2c|0186-pra-i2c|0187-pra-async|0188-pra-touch)" build.log \
             || { echo "one of our patches was SKIPPED"; exit 1; }
 
       - name: Package build tree for local compiles
@@ -270,6 +272,9 @@ jobs:
           # 0187 async-desc guard: the descriptor request + the INT
           # wait + the pure read (the TT5's command/response model).
           strings -a "$kernel" | grep -F 'PRA touch: desc attempt' >/dev/null
+          # 0188 int-level guard: the level-semantics wait + the
+          # unconditional pure read + the raw framing trail.
+          strings -a "$kernel" | grep -F 'PRA touch: desc raw=' >/dev/null
           # 0184 bring-up guard: the IOMCU pulse + the vendor-polarity
           # reset + the LDO VSET writes (the stock-delta replication).
           strings -a "$kernel" | grep -F 'PRA touch: iomcu reset pulsed' >/dev/null
