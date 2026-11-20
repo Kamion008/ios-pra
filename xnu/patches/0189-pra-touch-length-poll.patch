@@ -1,0 +1,189 @@
+pra: 0189 - the descriptor RESPONSE-LENGTH poll + the attempt printf fix
+
+Boot T12 (ring53, fresh [512, 252032) = 251,529 B / 5,496 lines) +
+the vendor sources (work/rvr/cyttsp5/): the 0188 level wait samples
+gpio28.0 LOW before power and the pad never changes (T12: the
+worker's irq lo/hi 1000/0, then 2000/0), so "LOW = asserted" fires
+instantly - the pure read lands before the IC has prepared the
+response. T12's 32-byte read started 00 00 = the vendor's zero-length
+"nothing pending" response word (cyttsp5_i2c.c:175+
+read_default_nosize: size = LE16, 0 or 2 = nothing pending, else a
+pure read of `size` bytes, the length word repeated at the payload
+start). The remaining 30 bytes were stale buffer; len=0
+bcd=0x76d2, so the parse failed. The read path itself worked: err=0,
+32 bytes transferred, and the unconditional-read gate did its job.
+
+The 0188 attempt line also printed a pointer's low word (118017742)
+instead of the attempt number: the patch emitted
+    printf("PRA touch: desc attempt %d: the response ",
+        "received (%u bytes), ...", attempt + 1, ...);
+i.e. the second string became a printf ARGUMENT, so %d consumed the
+pointer and the wait levels never printed. 0189 fixes the argument
+list and prints hdr/irq on every outcome.
+
+This patch (0189):
+1. After the request, poll the 2-byte response length word (pure
+   read, 5 ms ticks, 200 ms - the vendor's descriptor timeout class)
+   instead of trusting the pad level: 0 or 2 = nothing pending,
+   retry; any other value = the response is ready.
+2. Read exactly `hlen` bytes (hl=en <= HID_DESC_SIZE; oversize is
+   refused), zero-filling the rest of the 32-byte descriptor buffer.
+3. The attempt line prints irq start->end, the wait outcome, and hdr;
+   the 0188 argument bug is gone.
+4. The parse-failure trail prints all 32 raw bytes.
+
+Decodes (the next pratouchreset=1 boot): hdr=0x20 + the parse
+passes (len=32 bcd=0x100) = app mode confirmed, pra_live=true, the
+reports flow; hdr=0x20 + the parse fails = the framing/offset rung
+with all 32 bytes in the ring; `no response after 200 ms (hdr=0)` on
+both attempts = the IC never prepared a response (the mode/command
+rung - the BL_LAUNCH did not take); err=6/60 with a txn error = the
+bus rung.
+
+Marker asserted in CI (direct yml commit): 'no response after'.
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -761,50 +761,85 @@
+ 	return ETIMEDOUT;
+ }
+ 
+-/* 0188: the ASYNCHRONOUS descriptor read (the 0187 model: the
+- * vendor's cyttsp5_core.c:2968-3010 = request, wait, response;
+- * the pure read = cyttsp5_i2c.c:175+ read_default_nosize)
+- * with the T11 fixes: the wait's LEVEL semantics (above) and
+- * the pure read issued UNCONDITIONALLY after a successful
+- * request - the T11 wait's timeout skipped the read, so the
+- * response framing was never tested; the line can be
+- * unreadable (stuck/misrouted) while the response sits in the
+- * IC's buffer, and the read is write-free. Issued TWICE (the
+- * BL_LAUNCH's reset_expected = 1 - cyttsp5_core.c:2864-2867).
+- * Each attempt prints its irq start/end levels. */
++/* 0189: the RESPONSE-LENGTH poll (boot T12, ring53). The 0188
++ * level wait samples the pad LOW before power and it never changes
++ * (T12: irq lo/hi 1000/0, 2000/0), so "LOW = asserted" fires
++ * instantly and the pure read lands before the IC has prepared the
++ * response: T12's 32 bytes started 00 00 = the vendor's zero-length
++ * "nothing pending" word, and the rest was stale buffer. The
++ * vendor never reads on a timer: its IRQ handler runs
++ * cyttsp5_i2c.c:175+ read_default_nosize = a PURE 2-byte read,
++ * size = LE16, 0 or 2 = nothing pending, else a pure read of
++ * `size` bytes (the length word repeats at the payload start). The
++ * pad is unusable, so poll the length word itself: 5 ms ticks to
++ * 200 ms (the descriptor timeout class), then read `size` bytes.
++ * The level wait stays as the fast path and its levels still print.
++ * Issued TWICE (the BL_LAUNCH reset window - cyttsp5_core.c:2864-
++ * 2867). */
+ static int
+ pra_touch_desc_read(uint8_t *desc)
+ {
+ 	uint8_t req[2] = { 0x01u, 0x00u };
++	uint8_t lenb[2];
+ 	int error = 0;
+ 	int attempt;
+ 
+ 	for (attempt = 0; attempt < 2; attempt++) {
+ 		unsigned irq_start = 0, irq_end = 0;
++		unsigned waited_ms = 0;
++		uint32_t hlen = 0;
+ 		int waited = 0, wait_error = 0;
+ 
+ 		printf("PRA touch: desc attempt %d: request...\n",
+-			    attempt + 1);
++		    attempt + 1);
+ 		error = pra_touch_txn(req, 2, NULL, 0);
+ 		if (error == 0) {
+ 			waited = 1;
+ 			wait_error = pra_touch_desc_wait_int(&irq_start,
+ 			    &irq_end);
+-			error = pra_touch_txn(NULL, 0, desc, HID_DESC_SIZE);
++			for (waited_ms = 0; waited_ms < 200u;
++			    waited_ms += 5u) {
++				error = pra_touch_txn(NULL, 0, lenb, 2);
++				if (error) {
++					break;
++				}
++				hlen = pra_touch_le16(lenb);
++				if (hlen != 0 && hlen != 2) {
++					break;
++				}
++				(void)tsleep(&pra_touch_chan, PZERO,
++				    "pradescl", pra_touch_ms_ticks(5u));
++			}
++			if (error == 0 && hlen != 0 && hlen != 2 &&
++			    hlen > HID_DESC_SIZE) {
++				printf("PRA touch: desc attempt %d: "
++				    "oversize response hdr=%#x\n",
++				    attempt + 1, hlen);
++				error = EIO;
++			}
++		}
++		if (error == 0 && hlen != 0 && hlen != 2) {
++			memset(desc, 0, HID_DESC_SIZE);
++			error = pra_touch_txn(NULL, 0, desc, hlen);
++		}
++		if (error == 0 && hlen != 0 && hlen != 2) {
++			printf("PRA touch: desc attempt %d: the response "
++			    "received (%u bytes, hdr=%#x), irq %u->%u%s\n",
++			    attempt + 1, hlen, hlen, irq_start, irq_end,
++			    wait_error ? ", the wait timed out" : "");
++			return 0;
+ 		}
+ 		if (error == 0) {
+-			printf("PRA touch: desc attempt %d: the response ",
+-				"received (%u bytes), irq %u->%u%s\n",
+-				    attempt + 1, (unsigned)HID_DESC_SIZE,
+-				    irq_start, irq_end, wait_error ?
+-				    ", read past a wait timeout" : "");
+-			return 0;
+-		}
+-		if (waited) {
++			printf("PRA touch: desc attempt %d: no response "
++			    "after %u ms (hdr=%#x), irq %u->%u%s\n",
++			    attempt + 1, waited_ms, hlen, irq_start, irq_end,
++			    wait_error ? ", the wait timed out" : "");
++			error = ETIMEDOUT;
++		} else if (waited) {
+ 			printf("PRA touch: desc attempt %d failed err=%d "
+-			    "(irq %u->%u, wait=%s)\n", attempt + 1, error,
+-			    irq_start, irq_end,
+-			    wait_error ? "timeout" : "asserted");
++			    "(irq %u->%u, wait=%s, hdr=%#x)\n", attempt + 1,
++			    error, irq_start, irq_end,
++			    wait_error ? "timeout" : "asserted", hlen);
+ 		} else {
+ 			printf("PRA touch: desc attempt %d failed err=%d "
+ 			    "(the request)\n", attempt + 1, error);
+@@ -1793,17 +1828,24 @@
+ 		} else {
+ 			printf("PRA touch: descriptor invalid (len=%u "
+ 			    "bcd=%#x), touch reads disabled\n", dlen, bcd);
+-			/* 0188: the framing trail - the first 16 bytes print
+-			 * on EVERY failed parse (not only under pratouchdbg):
+-			 * a leading 0x20/0x22 word = the response is
+-			 * length-prefixed (the HID input-read framing) and
+-			 * the parse offset is the next fix. */
++			/* 0189: the framing trail - all 32 bytes print on
++			 * EVERY failed parse (not only under pratouchdbg):
++			 * the first word is the vendor's response length
++			 * (0x20 = the descriptor is ready); 0000 = nothing
++			 * pending (the read raced the response). */
+ 			printf("PRA touch: desc raw=%02x %02x %02x %02x "
+ 			    "%02x %02x %02x %02x %02x %02x %02x %02x "
+-			    "%02x %02x %02x %02x\n", desc[0], desc[1],
+-			    desc[2], desc[3], desc[4], desc[5], desc[6],
+-			    desc[7], desc[8], desc[9], desc[10], desc[11],
+-			    desc[12], desc[13], desc[14], desc[15]);
++			    "%02x %02x %02x %02x %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x\n",
++			    desc[0], desc[1], desc[2], desc[3],
++			    desc[4], desc[5], desc[6], desc[7],
++			    desc[8], desc[9], desc[10], desc[11],
++			    desc[12], desc[13], desc[14], desc[15],
++			    desc[16], desc[17], desc[18], desc[19],
++			    desc[20], desc[21], desc[22], desc[23],
++			    desc[24], desc[25], desc[26], desc[27],
++			    desc[28], desc[29], desc[30], desc[31]);
+ 		}
+ 	}
+ 
