@@ -1,0 +1,101 @@
+pra: 0193 - the PRA touch SURFACE geometry (the real panel + the real mm)
+
+DONOR PROOF (research/herolte-ref): the S7 (HEROLTE) board reaches the
+iOS home screen with WORKING touch on the SAME SweetHID delivery path.
+Its 0211 patch differs from PRA in two ways - both are the likely PRA
+touch-death root cause:
+
+1. CLAMP: herolte clamps the finger to the REAL panel (fPanelW/fPanelH)
+   then normalizes against the logical display; PRA clamps x to 1079 and
+   y to fLogicalH (the 1125x2436 presented display) - a finger in the
+   bottom 36 logical rows or off the 1080x2400 panel edge is
+   mis-normalized and can map off the rendered surface.
+
+2. SURFACE: herolte publishes its REAL physical mm (64x113 for the S7);
+   PRA publishes the iPhone X's 68x151 (the #else branch). The PRA
+   framebuffer's own constants (SWEET_FB_DOT_PITCH = 424 ppi, 1080 px
+   across 5.2 in) give the REAL panel: width 132.08 mm (5.2 x 25.4),
+   height 143.77 mm (2400 / 424 x 25.4). backboardd/UIKit normalizes
+   the absolute digitizer against the published mm surface - claiming a
+   132x144 mm panel as 68x151 mm maps every touch ~2x off in x and in a
+   wrong aspect ratio, which can break the gesture recognizers and the
+   touch-to-display correlation (the T14-T16 "drained but dead" rung).
+
+THIS PATCH (0193):
+1. start(): fPanelW=1080 fPanelH=2400, the herolte offsets
+   ((logical - panel) / 2), the logical display unchanged (1125x2436).
+2. touch(): clamp to fPanelW-1/fPanelH-1; the edge test to the panel.
+3. SurfaceWidth = 8655995 (132.08 mm), SurfaceHeight = 9422111
+   (143.77 mm) in 16.16 fixed - the REAL PRA panel, matching what the
+   framebuffer renders.
+
+The falsifier (next pratouchreset=1 boot): touch works (the UI reacts)
+= the surface/correlation rung was the blocker; still dead = the
+normalization was not (or not the only) cause - the delivery rung is
+then fully proven and the AKS/backboardd-userland path is next.
+
+Marker asserted in CI (direct yml commit): 'SWEET HID: surface'.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -374,7 +374,7 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
+ 	IOLock *fLock;
+-	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fLogicalW, fLogicalH, fOffX, fOffY, fPanelW, fPanelH;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -446,21 +446,25 @@
+ 	fLogicalH = 1920;
+ 	fOffX = fOffY = 0;
+ #else
+-	fLogicalW = native ? 1080 : 1125;
++	fPanelW = 1080;	/* the PRA panel (the framebuffer's native) */
++	fPanelH = 2400;
++	fLogicalW = native ? 1080 : 1125;	/* the presented iPhone X display */
+ 	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	fOffX = (fLogicalW - fPanelW) / 2;
++	fOffY = (fLogicalH - fPanelH) / 2;
+ #endif
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+-	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
++	setProperty("SurfaceWidth", (unsigned long long)(8655995ull), 32);	/* mm, 16.16 - the PRA panel: 5.2 in x 25.4 */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	setProperty("SurfaceHeight", (unsigned long long)(121 << 16), 32);
+ #else
+-	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	setProperty("SurfaceHeight", (unsigned long long)(9422111ull), 32);	/* mm, 16.16 - 2400 px / 424 ppi x 25.4 */
+ #endif
+ 	gSweetTouch = this;
+ 	registerService();
++	IOLog("SWEET HID: surface %ux%u mm panel %ux%u\n",
++	    8655995 >> 16, 9422111 >> 16, fPanelW, fPanelH);
+ 	IOLog("SWEET HID: touch registered\n");
+ 	return true;
+ }
+@@ -475,8 +479,8 @@
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y >= fLogicalH ? fLogicalH - 1 : y);
++	x = x < 0 ? 0 : (x >= fPanelW ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y >= fPanelH ? fPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -489,8 +493,8 @@
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > fLogicalH - 1 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
