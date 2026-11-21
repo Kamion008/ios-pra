@@ -1,0 +1,83 @@
+pra: 0194 - the touch panel init in the COMPILED arm (the -1,-1 fix)
+
+THE BOOTED KERNEL PROVED THE ROOT CAUSE (work/ci193/dl, T17 kernel
+cc83d49c): the PRA compile line defines BOTH -DARM64_BOARD_CONFIG_PRA
+and -DARM64_BOARD_CONFIG_A5XELTE (work/ci193/fail/build.log:34742), so
+SweetHIDTouch::start() is compiled with the A5XELTE arm (the const pool
+@0x702e720 holds 1080,1920,0,0). 0193 added fPanelW/fPanelH ONLY to the
+#else arm; in the compiled arm start() never stores them (the
+disassembly has no str to [x19,#0xc0]/[x19,#0xc4]) and they stay zero.
+touch() then clamps with `x >= fPanelW ? fPanelW - 1 : x`; fPanelW = 0
+subtracts 1 into -1, so every real coordinate became -1,-1 - exactly
+ring58: "PRA touch: hid inject slot=0 down x=550 y=1911" followed by
+"SWEET HID: touch 0 down at -1,-1 edge".
+
+THIS PATCH (0194):
+1. Initialize fPanelW/fPanelH in BOTH arms. The compiled A5XELTE arm is
+   the PRA panel: 1080x1920 (pra_touch.c PANEL_X_MAX/PANEL_Y_MAX, and
+   the framebuffer swaps 1080x1920), logical 1080x1920, zero offsets.
+2. Publish the working A5 board's real 68x121 mm in that arm. 0193 made
+   SurfaceWidth unconditional 8655995 (132.08 mm) from treating the
+   5.2-inch diagonal as the width; the #else arm keeps 132x144 mm.
+3. One-time marker "SWEET HID: panel arm" in the compiled arm so a
+   silently skipped 0194 fails the CI strings guard.
+
+The falsifier (next pratouchreset=1 boot): SWEET HID touch lines carry
+the real injected coordinates (e.g. 550,1911) instead of -1,-1, and the
+UI reacts. Still -1,-1 = the compiled arm differs from this source;
+real coords but no UI = the next rung is userland routing.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -441,10 +441,27 @@
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	/*
++	 * 0194: BOTH ARM64_BOARD_CONFIG_PRA and ARM64_BOARD_CONFIG_A5XELTE
++	 * are on the PRA compile line, so THIS arm is the one that runs on
++	 * PRA. 0193 added fPanelW/fPanelH only to the #else arm, leaving
++	 * them zero here - the panel clamp then turned every real touch
++	 * into (-1,-1). Initialize the panel in BOTH arms.
++	 * PRA's panel is 1080x1920 (pra_touch.c PANEL_X_MAX/PANEL_Y_MAX
++	 * and the framebuffer's 1080x1920 swaps), the same geometry as the
++	 * working A5 board, so publish that board's real 68x121 mm.
++	 */
++	int surfaceWmm, surfaceHmm;
++
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	fPanelW = 1080;
++	fPanelH = 1920;
+ 	fLogicalW = 1080;
+ 	fLogicalH = 1920;
+ 	fOffX = fOffY = 0;
++	surfaceWmm = 68;	/* the 1080x1920 panel's real ~68x121 mm */
++	surfaceHmm = 121;
++	IOLog("SWEET HID: panel arm A5XELTE 1080x1920\n");
+ #else
+ 	fPanelW = 1080;	/* the PRA panel (the framebuffer's native) */
+ 	fPanelH = 2400;
+@@ -452,19 +469,17 @@
+ 	fLogicalH = native ? 2400 : 2436;
+ 	fOffX = (fLogicalW - fPanelW) / 2;
+ 	fOffY = (fLogicalH - fPanelH) / 2;
++	surfaceWmm = 132;
++	surfaceHmm = 144;
+ #endif
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+-	setProperty("SurfaceWidth", (unsigned long long)(8655995ull), 32);	/* mm, 16.16 - the PRA panel: 5.2 in x 25.4 */
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-	setProperty("SurfaceHeight", (unsigned long long)(121 << 16), 32);
+-#else
+-	setProperty("SurfaceHeight", (unsigned long long)(9422111ull), 32);	/* mm, 16.16 - 2400 px / 424 ppi x 25.4 */
+-#endif
++	setProperty("SurfaceWidth", (unsigned long long)((unsigned)surfaceWmm << 16), 32);	/* mm, 16.16 */
++	setProperty("SurfaceHeight", (unsigned long long)((unsigned)surfaceHmm << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: surface %ux%u mm panel %ux%u\n",
+-	    8655995 >> 16, 9422111 >> 16, fPanelW, fPanelH);
++	    surfaceWmm, surfaceHmm, fPanelW, fPanelH);
+ 	IOLog("SWEET HID: touch registered\n");
+ 	return true;
+ }
