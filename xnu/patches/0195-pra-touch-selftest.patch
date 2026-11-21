@@ -1,0 +1,148 @@
+pra: 0195 - touch self-test + worker heartbeat
+
+T18 (0194, ring59) is the anchor: the boot reached SpringBoard, the probe
+printed `app mode confirmed, input reg 0x3 max_input=254`, and the worker's
+only two 10 s samples both carried `reports=0 errs=0 corrupt=0`. There was
+no `PRA touch: hid inject` and no `SWEET HID: touch` line, so 0194's panel
+clamp was never reached. The ring cannot distinguish a worker that stopped
+or blocked after its first 20 s from an IC that returned "nothing pending"
+on every read, because the driver only logs when a counter moves.
+
+THIS PATCH (0195) IS THE INSTRUMENT:
+1. pra_touch.c: `pratouchdbg=1` prints every 10 s telemetry sample and adds
+   `reads` (input reads attempted) and `last_len` (the IC's last length-word
+   response; 0 = nothing pending). A continuing heartbeat proves the worker
+   is alive; a frozen `reads` proves it is blocked; `reads` climbing with
+   `last_len=0` proves the worker is polling a silent IC.
+2. SweetHID.cpp: behind `pratouchselftest=1`, a one-shot synthetic touch
+   at the OUT-OF-BOUNDS raw point 2000,3000 (down and up), fired when the
+   touch queue is mapped. It bypasses pra_touch and the IC, so it forces
+   0194's clamp: with fPanelW/H = 1080/1920 touch() must print 1079,1919;
+   with the old zeroed dims it prints -1,-1. An in-bounds point would not
+   invoke the clamp.
+3. IOHIDEventServiceUserClient.cpp: call the selftest after the queue map
+   returns, when the client state is open and the command gate is not held;
+   pass _owner so the callee ignores the SweetHIDButtons map.
+
+No behavior change without the two boot args. The falsifier for T19:
+selftest prints 1079,1919 = the clamp ran with 1080/1920; -1,-1 = 0194
+not effective; any other value = investigate the clamp; heartbeat stops/
+reads frozen = worker issue; reads climbing + last_len=0 = IC silent;
+selftest clamped + queue drains but UI inert = userland routing is next.
+--- a/bsd/dev/pra_touch.c
++++ b/bsd/dev/pra_touch.c
+@@ -1081,6 +1081,7 @@
+ 	unsigned tick = (unsigned)hz / 100u;
+ 	uint64_t loops_per_1s, loops_per_10s, loops = 0, last_print = 0;
+ 	uint32_t evt_mark, err_mark, corrupt_mark, printed = 0;
++	uint32_t reads_total = 0, last_len = 0;
+ 	unsigned backoff = 0;
+ 	static bool poll_announced;   /* 0190: the poll-mode line once */
+ 
+@@ -1143,6 +1144,8 @@
+ 			bool corrupt;
+ 			int error = pra_touch_input_read(buf, &len);
+ 
++			reads_total++;
++			last_len = len;
+ 			if (error) {
+ 				err_total++;
+ 				/* Donor error recovery: a failed read must
+@@ -1193,15 +1196,19 @@
+ 		/*
+ 		 * At most one line per 10 s, and only when something moved
+ 		 * (or for the first two lines, so a silent boot still
+-		 * publishes the level histogram once).
++		 * publishes the level histogram once). 0195: pratouchdbg=1
++		 * makes every 10 s sample print and adds reads/last_len, so a
++		 * silent IC and a dead or blocked worker are distinguishable.
+ 		 */
+ 		if (loops - last_print >= loops_per_10s &&
+-		    ((evt_total != evt_mark) || (err_total != err_mark) ||
+-		    (corrupt_total != corrupt_mark) || printed < 2)) {
++		    (pra_touch_dbg || (evt_total != evt_mark) ||
++		    (err_total != err_mark) || (corrupt_total != corrupt_mark) ||
++		    printed < 2)) {
+ 			printf("PRA touch: irq lo/hi=%u/%u idle=%d reports=%u "
+-			    "errs=%u corrupt=%u last: slot=%d x=%d y=%d p=%d\n",
++			    "errs=%u corrupt=%u reads=%u last_len=%u "
++			    "last: slot=%d x=%d y=%d p=%d\n",
+ 			    irq_lo, irq_hi, idle_level, evt_total, err_total,
+-			    corrupt_total,
++			    corrupt_total, reads_total, last_len,
+ 			    have_contact ? last_contact_slot : -1,
+ 			    have_contact ? last_contact_x : -1,
+ 			    have_contact ? last_contact_y : -1,
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -384,6 +384,7 @@
+ 
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
++static bool gSweetTouchSelfTest;	/* 0195: pratouchselftest=1 */
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -440,7 +441,13 @@
+ 		return false;
+ 	}
+ 	int native = 0;
++	uint32_t selftest = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	if (PE_parse_boot_argn("pratouchselftest", &selftest,
++	    sizeof(selftest)) && selftest) {
++		gSweetTouchSelfTest = true;
++		IOLog("SWEET HID: selftest armed\n");
++	}
+ 	/*
+ 	 * 0194: BOTH ARM64_BOARD_CONFIG_PRA and ARM64_BOARD_CONFIG_A5XELTE
+ 	 * are on the PRA compile line, so THIS arm is the one that runs on
+@@ -595,3 +602,23 @@
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/*
++ * 0195: one-shot synthetic touch, called by the user client after the
++ * touch queue is mapped. This bypasses pra_touch and the IC: it tests
++ * the 0194 panel clamp and the SweetHID queue with an out-of-bounds raw
++ * point (2000,3000) even when the digitizer reports nothing. The clamp
++ * must turn it into 1079,1919; zeroed dims would give -1,-1. The svc
++ * check keeps the SweetHIDButtons queue map from firing it.
++ */
++extern "C" void
++sweet_hid_touch_selftest(IOHIDEventService *svc)
++{
++	if (!gSweetTouch || svc != gSweetTouch || !gSweetTouchSelfTest) {
++		return;
++	}
++	gSweetTouchSelfTest = false;
++	IOLog("SWEET HID: selftest raw 2000,3000\n");
++	gSweetTouch->touch(0, true, 2000, 3000);
++	gSweetTouch->touch(0, false, 2000, 3000);
++}
+--- a/iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp
++++ b/iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp
+@@ -33,6 +33,9 @@
+ #include "IOHIDFamilyTrace.h"
+ #include <pexpert/pexpert.h>
+ 
++/* 0195: implemented in SweetHID.cpp; called after the touch queue map. */
++extern "C" void sweet_hid_touch_selftest(IOHIDEventService *svc);
++
+ #define kQueueSizeMin   0
+ #define kQueueSizeFake  128
+ #define kQueueSizeMax   16384
+@@ -158,6 +161,12 @@
+     require_action(!isInactive(), exit, result=kIOReturnOffline);
+     
+     result = _commandGate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &IOHIDEventServiceUserClient::clientMemoryForTypeGated), options, memory);
++
++    /* 0195: the map returned, so the client state is open and its queue
++     * exists; run the one-shot synthetic touch outside the command gate. */
++    if (result == kIOReturnSuccess && _state == kUserClientStateOpen) {
++        sweet_hid_touch_selftest(_owner);
++    }
+   
+ exit:
+   
