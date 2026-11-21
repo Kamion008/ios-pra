@@ -135,9 +135,11 @@ jobs:
             || { echo "0190 never entered the apply phase"; exit 1; }
           grep -F "patches/0191-pra-hid-queue-telemetry.patch" build.log \
             || { echo "0191 never entered the apply phase"; exit 1; }
+          grep -F "patches/0192-pra-hid-drain-telemetry.patch" build.log \
+            || { echo "0192 never entered the apply phase"; exit 1; }
           # entry in the apply list is not success: build.sh skips with a
           # warning naming the patch - fail on any skip of OUR patches.
-          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch|0179-pra-aks|0180-pra-touch|0181-pra-i2c|0182-pra-i2c|0183-pra-i2c|0184-pra-bringup|0185-pra-i2c|0186-pra-i2c|0187-pra-async|0188-pra-touch|0189-pra-touch|0190-pra-touch|0191-pra-hid)" build.log \
+          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch|0179-pra-aks|0180-pra-touch|0181-pra-i2c|0182-pra-i2c|0183-pra-i2c|0184-pra-bringup|0185-pra-i2c|0186-pra-i2c|0187-pra-async|0188-pra-touch|0189-pra-touch|0190-pra-touch|0191-pra-hid|0192-pra-hid)" build.log \
             || { echo "one of our patches was SKIPPED"; exit 1; }
 
       - name: Package build tree for local compiles
@@ -292,6 +294,9 @@ jobs:
           # to backboardd); the rate-limited drop/stats/mapped lines prove
           # whether events reach the queue and whether backboardd drains it.
           strings -a "$kernel" | grep -F 'SWEET HID: queue' >/dev/null
+          # 0192 drain-telemetry guard: the head/tail drain rate, the
+          # notify-armed wake-up, and the event size/sender correlation.
+          strings -a "$kernel" | grep -F 'SWEET HID: queue notify' >/dev/null
           # 0184 bring-up guard: the IOMCU pulse + the vendor-polarity
           # reset + the LDO VSET writes (the stock-delta replication).
           strings -a "$kernel" | grep -F 'PRA touch: iomcu reset pulsed' >/dev/null

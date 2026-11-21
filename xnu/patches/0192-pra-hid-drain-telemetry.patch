@@ -1,0 +1,119 @@
+pra: 0192 - the SweetHID drain/notify/payload telemetry
+
+Boot T15 (ring56): 0191 proved the enqueue AND the drain - enq=271 with
+drop=0 throughout, while 271 x ~304 B = ~80.5 KiB would overflow the
+16 KiB queue ~5x if userland never drained. So backboardd IS reading the
+queue. The UI still ignored the touches. The AKS sel-8 loop is
+EXONERATED as the touch blocker: all SpringBoard AKS calls (incl. sel 8
+-> 0xe00002c7 = kIOReturnUnsupported, the default case in SweetKeyStore)
+END before the touch burst at byte 143,607 - zero SpringBoard AKS calls
+during/after the touch. So the remaining rung is what backboardd does
+with the drained events.
+
+This patch (0192) closes the last three observation gaps - all
+diagnostic, rate-limited like 0191 (per-window caps, never per-event):
+1. IOHIDEventServiceQueue.h: getHead()/getTail() accessors (the queue
+   internals already read dataQueue->head/tail; the subclass can expose
+   them). head advances ONLY when userland dequeues - the drain rate.
+2. enqueueEventGated: the 1 s stats line now prints head/tail:
+   head advancing alongside tail = userland is draining; tail advancing
+   with head stuck = enqueued but never dequeued.
+3. registerNotificationPortGated: ONE 'SWEET HID: queue notify armed'
+   line per instance - backboardd arming the mach wake-up proves it
+   will be woken when data lands.
+4. dispatchEvent (SweetHID.cpp): one 'SWEET HID: event size=...'
+   line per second with the serialized size + the senderID (the value
+   IOHIDEventSystem uses to correlate a touch to its service).
+
+The decodes (next pratouchreset=1 boot): head advancing = drained (the
+T15 conclusion, now with the rate); head stuck = the events sit; notify
+armed never prints = backboardd mapped but never armed the wake-up
+(the mach-message rung); event size wrong or sender=0 = the payload
+correlation rung.
+
+Marker asserted in CI (direct yml commit): 'SWEET HID: queue notify'.
+--- a/iokit/Kernel/arm/hid/IOHIDEventServiceQueue.h
++++ b/iokit/Kernel/arm/hid/IOHIDEventServiceQueue.h
+@@ -61,6 +61,9 @@
+     inline void setState(Boolean state) { _state = state; }
+     
+     inline OSObject *getOwner() { return _owner; }
++    /* 0192: the queue head/tail - head advances as userland dequeues. */
++    UInt32 getHead();
++    UInt32 getTail();
+ 
+     virtual Boolean enqueueEvent(IOHIDEvent * event);
+ 
+--- a/iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp
++++ b/iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp
+@@ -264,6 +264,18 @@
+ 
+ //---------------------------------------------------------------------------
+ 
++UInt32
++IOHIDEventServiceQueue::getHead()
++{
++    return dataQueue ? dataQueue->head : 0;
++}
++
++UInt32
++IOHIDEventServiceQueue::getTail()
++{
++    return dataQueue ? dataQueue->tail : 0;
++}
++
+ bool IOHIDEventServiceQueue::serialize(OSSerialize * serializer) const {
+     
+     bool ret;
+--- a/iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp
++++ b/iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp
+@@ -133,6 +133,11 @@
+     _queuePort = port;
+     
+     if (_queue) {
++        if (!_notifyAnnounced) {
++            _notifyAnnounced = true;
++            printf("SWEET HID: queue notify armed by %s\n",
++                getService() ? getService()->getName() : "?");
++        }
+         _queue->setNotificationPort(port);
+     }
+     
+@@ -635,8 +640,9 @@
+     uint64_t now = mach_continuous_time();
+     if (_lastStatsPrint == 0 || now - _lastStatsPrint >= 1920000ull) {
+         _lastStatsPrint = now;
+-        printf("SWEET HID: queue stats enq=%llu drop=%u type=%u\n",
+-            _eventCount, _droppedEventCount, _lastEventType);
++        printf("SWEET HID: queue stats enq=%llu drop=%u type=%u head=%u tail=%u\n",
++            _eventCount, _droppedEventCount, _lastEventType,
++            _queue ? _queue->getHead() : 0, _queue ? _queue->getTail() : 0);
+     }
+     if (_queue) {
+         ++_eventCount;
+--- a/iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.h
++++ b/iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.h
+@@ -67,6 +67,7 @@
+     uint64_t                    _eventCount;
+     uint64_t                 _lastStatsPrint;	/* 0191: 1 s stats gate */
+     bool                     _mappedAnnounced;	/* 0191: map line once */
++    bool                     _notifyAnnounced;	/* 0192: notify line once */
+     mach_port_t                 _queuePort;
+   
+     void eventServiceCallback(  IOHIDEventService *             sender,
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -213,6 +213,13 @@
+ 	clients->retain();
+ 	IOLockUnlock(_clientLock);
+ 
++	static uint64_t last_evlog;	/* 0192: 1 s cadence */
++	uint64_t evnow = mach_absolute_time();
++	if (last_evlog == 0 || evnow - last_evlog >= 1920000ull) {
++		last_evlog = evnow;
++		printf("SWEET HID: event size=%u sender=0x%llx\n",
++		    (unsigned)event->getLength(), getRegistryEntryID());
++	}
+ 	for (unsigned int i = 0; i < clients->getCount(); i++) {
+ 		IOHIDEventServiceClient *data = (IOHIDEventServiceClient *)clients->getObject(i);
+ 		if (data->action) {
