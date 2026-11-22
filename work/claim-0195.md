@@ -85,3 +85,51 @@ selftest marker = 0194 is not effective at runtime; an unclamped
 freezes = worker died/blocked; `reads` climbs with `last_len=0` = the IC
 is silent; selftest clamped to 1079,1919 + queue enqueue = the clamp is
 fixed and the remaining question is userland routing.
+
+========================================================================
+T19 OUTCOME (ring61, decoded 2026-11-22) — THE FALSIFIER FIRED AND HIT
+========================================================================
+
+K7 (VERIFIED): THE 0194 CLAMP IS EFFECTIVE AT RUNTIME. ring61 (the full
+216,150-B text, not the stale-header 35,665-B readout) lines 1001-1007:
+`SWEET HID: SweetHIDTouch open ...`, `queue mapped by SweetHIDTouch`,
+`SWEET HID: selftest raw 2000,3000`, `SWEET HID: touch 0 down at
+1079,1919 edge`, `SWEET HID: touch 0 up at 1079,1919 edge`. The
+out-of-bounds point was clamped to (1080-1, 1920-1) exactly as
+predicted; -1,-1 and unclamped 2000,3000 both absent.
+
+K8 (VERIFIED): THE WHOLE KERNEL TOUCH HALF WORKS. 84 telemetry samples
+over 84,000 x 10 ms polls = 840 s = 14.0 min (python3:
+84000*0.010=840); final `reports=579 errs=16 corrupt=0 reads=82451`
+(err rate 16/579 = 2.8%); 36 `SWEET HID: touch` transitions (18/18
+down/up) ALL in-bounds (min (168,907), max (1079,1919) on 1080x1920);
+`PRA touch: hid inject slot=0 down x=168 y=907` with real coords;
+`-1,-1` appears nowhere.
+
+K9 (VERIFIED): DELIVERY TO THE QUEUE AND DRAIN, AGAIN. `queue mapped`
+x2, `queue notify armed` x2, `queue stats` 15 lines, last
+`enq=514 drop=0 type=11 head=9600 tail=9600`. 514 events x 236 B =
+121,304 B = 118.5 KiB through the 16 KiB queue = 7.4x overflow with
+drop=0 and head==tail at every sample (the T16 drain method).
+
+K10 (VERIFIED, user report): THE UI DID NOT REACT. The user confirms
+(2026-11-22): many taps/swipes over the run; the iOS UI showed NO
+reaction at all. The blocker is confirmed downstream of the kernel:
+backboardd drains the queue but its HIDEventSystem does not route the
+digitizer events to SpringBoard's gesture recognizers. The SweetHID
+service and event code is identical to the donor path (A5XELTE 0123
+device-verified touch; herolte 0216 working touch), so a kernel event-
+format difference is the low-probability branch.
+
+K11 (INFERRED): THE LOCK-SCREEN HYPOTHESIS — every PRA touch test so
+far (T13-T19) was observed on the LOCK SCREEN (the empty
+com.apple.SetupDone.plist bypass), while the working donor evidence was
+taken on the HOME SCREEN after Setup was marked complete (the sweet
+donor v14 purplebuddy data_ark path; A5 0123 / herolte 0216). An inert
+lock screen with a working delivery path is not excluded. The clean
+discriminator: a root image that boots past the lock screen (or a
+home-button press to reach the home screen), then touch.
+
+EVIDENCE: work/evidence-ring61.md. Ring: work/ring61-true.txt
+(216,150 B, 3,703 lines). The stale-header truncation bug that hid the
+real tail is fixed in tools/pra_readlog.sh.

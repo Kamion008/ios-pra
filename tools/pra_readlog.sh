@@ -40,10 +40,24 @@ version, size = struct.unpack('<II', data[8:16])
 total, seq = struct.unpack('<QQ', data[16:32])
 print(f'version {version} ring {size >> 20} MiB total {total} seq {seq}')
 ring = data[512:512 + size]
-n = min(total, size)
-start = (total - n) % size
-buf = ring[start:start + n] if start + n <= size else \
-    ring[start:] + ring[:start + n - size]
+if total < size:
+    # The header total is only rewritten by a flush. A boot that is cut
+    # before its next flush leaves the PREVIOUS boot's total in the
+    # header; trusting it truncates the dump (ring61 was cut at ring60's
+    # 35,665 B while the ring really held 216,150 B). The ring has not
+    # wrapped, so the first NUL is the end of the text this boot wrote.
+    nul = ring.find(b'\x00')
+    if nul > total:
+        print(f'NOTE: header total {total} is stale; using NUL end {nul}')
+        total = nul
+    n = min(total, size)
+    start = 0
+    buf = ring[:n]
+else:
+    n = min(total, size)
+    start = (total - n) % size
+    buf = ring[start:start + n] if start + n <= size else \
+        ring[start:] + ring[:start + n - size]
 text = buf.decode('latin1')
 open(sys.argv[2], 'w').write(text)
 
