@@ -336,7 +336,11 @@ jobs:
           # evidence in ring64 (work/digitizer-gate-2026-11-22.md section 4);
           # if 0201 is skipped none of them exists and the whole 0202/0203 fork
           # would be decided on memories of an older ring.
-          strings -a "$kernel" | grep -F 'SWEET HID: setElementValue' >/dev/null
+          # NOTE: assert on the bare name, not on 'SWEET HID: setElementValue':
+          # the format string is 'SWEET HID: %s setElementValue page ...', so the
+          # contiguous form never exists in the binary and this assert failed a
+          # GREEN build (CI 45074770951) before the fix.
+          strings -a "$kernel" | grep -F 'setElementValue page 0x%x' >/dev/null
           strings -a "$kernel" | grep -F 'SWEET FB: powerreq' >/dev/null
           strings -a "$kernel" | grep -F 'SWEET HID: digitizer events marked display-integrated' >/dev/null
           # 0184 bring-up guard: the IOMCU pulse + the vendor-polarity
