@@ -92,7 +92,8 @@ $ python3 -c "print(hex(0x100000126), 0x100000126, hex(0x100000131), 0x100000131
 ```
 
 `head` advances 240 B per event while the printed serialization is 236 B
-(python3: 240*22 = 5280 vs 236*22 = 5192, a 4 B per-event difference).
+(python3: 240*22 = 5280 vs 236*22 = 5192, a 4 B per-event difference) —
+RESOLVED below: the 4 B is the per-entry queue header.
 UNKNOWN: which figure is the payload vs the queue slot. The delivery
 conclusion does not depend on it — head==tail and drop=0 do.
 
@@ -103,6 +104,32 @@ $ grep -o "event size=[0-9]* sender=0x[0-9a-f]*" work/ring61-true.txt | sort | u
 
 Ring61 (T19) logged the same senderID on 17 lines, so K7's "not a signal"
 is direct: the difference from T16's 0x100000126 is per-boot ordering.
+
+## 3b. The 4 B/event gap resolved (it is the queue entry header)
+
+```
+$ grep -n "DATA_QUEUE_ENTRY_HEADER_SIZE" xnu-src/iokit/IOKit/IODataQueueShared.h
+79:#define DATA_QUEUE_ENTRY_HEADER_SIZE (sizeof(IODataQueueEntry) - 4)
+$ sed -n '43,46p' xnu-src/iokit/IOKit/IODataQueueShared.h
+typedef struct _IODataQueueEntry {
+	UInt32  size;
+	UInt8   data[4];
+} IODataQueueEntry;
+$ python3 -c "print('236 + 4 =', 236+4); print('5280/240 =', 5280/240); print('60 + 4 =', 60+4)"
+236 + 4 = 240
+5280/240 = 22.0
+60 + 4 = 64
+```
+
+`sizeof(IODataQueueEntry)` = 8 (a `UInt32 size` plus `UInt8 data[4]`), so
+`DATA_QUEUE_ENTRY_HEADER_SIZE` = 4. `IOHIDEventServiceQueue::enqueueEvent`
+computes `dataSize = ALIGNED_DATA_SIZE(eventSize, 4)` then
+`entrySize = dataSize + DATA_QUEUE_ENTRY_HEADER_SIZE` (lines 90-106), which
+is exactly 236 + 4 = 240 B per touch event and 60 + 4 = 64 B per key event
+— the observed head stride and 5280 B for 22 events. The "unexplained 4 B"
+was a missing header term in the earlier record, not an inconsistency in
+the queue accounting. T21's expected consumption for a power press+release
+pair is therefore 2 x 64 = 128 B.
 
 ## 4. Acceptance (K4) — AKS comparison
 

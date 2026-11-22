@@ -64,6 +64,26 @@ Do NOT re-run the T20 swipe as-is. If a digitizer retry is wanted, change
 the shape or the timing deliberately and say why in the claim.
 
 FACTS YOU CAN RELY ON (do not re-derive)
+- T21 MECHANICS ARE ALREADY SOURCE-READ (claim-0197 K11/K12), do not spend
+a session rediscovering them: `SweetHIDButtons::key()` takes
+`(usage, down)`, builds `IOHIDEvent::keyboardEvent(..., kHIDPage_Consumer,
+usage, down)` and calls `dispatchEvent`; there is no finger slot, no latch
+and no PMIC/key-driver dependency, and the registered instance is reachable
+as `gSweetButtons` (`sweet_hid_key()` already maps index 0 to
+`kHIDUsage_Csmr_Power` = 0x30). A press should log `SWEET HID: key 0x30
+down (1 clients)` and `SWEET HID: event size=60`; a down+up pair costs
+128 B of the 16,384 B queue (60 + 4 B entry header = 64 per entry).
+- The sampler needs NO patch: it takes a COMMA LIST and its built-in
+default is already "SpringBoard,backboardd"; the PRA cmdline simply
+overrides it with `sweetsample=Setup`, which never runs. Drop that arg (or
+set it explicitly) and the target becomes SpringBoard/backboardd. Match is
+exact case-sensitive `p_comm` equality truncated at 16 chars (both names
+fit); first sample at 90 s, then every 120 s, up to 90 samples. A missing
+`SMP SpringBoard[` line then means the process was not alive at a sample
+instant, not that the sampler failed.
+- The 236 B vs 240 B queue stride is NOT a mystery: each entry is a 4 B
+header plus the event (`DATA_QUEUE_ENTRY_HEADER_SIZE` =
+`sizeof(IODataQueueEntry) - 4` = 4, IODataQueueShared.h:79).
 - 0195/T19 proved the clamp at runtime: `selftest raw 2000,3000` ->
   `touch 0 down/up at 1079,1919 edge`; 579 reports, 2.8% read errors,
   36 in-bounds transitions over 840 s. T20 reproduced the clamp on a

@@ -94,6 +94,43 @@ total silence makes the failure generic to this port. T21 = that
 control, with `pratouch=1 pratouchreset=1` restored (killing K5's
 confound) and the sampler aimed at SpringBoard for the first time.
 
+K11 (VERIFIED - the 4 B/event "accounting gap" is RESOLVED, it was my own
+missing header term): `head` advances 240 B per event while the serialized
+event is 236 B, because every queue entry carries a 4 B header. Source:
+`xnu-src/iokit/IOKit/IODataQueueShared.h:79`
+`#define DATA_QUEUE_ENTRY_HEADER_SIZE (sizeof(IODataQueueEntry) - 4)`, with
+the struct at :43-46 being `{ UInt32 size; UInt8 data[4]; }` (sizeof 8, so
+the header is 4); the enqueue path is
+`IOHIDEventServiceQueue::enqueueEvent` -> `dataSize =
+ALIGNED_DATA_SIZE(eventSize, 4)`, `entrySize = dataSize +
+DATA_QUEUE_ENTRY_HEADER_SIZE` (IOHIDEventServiceQueue.cpp:90-106).
+```
+$ python3 -c "print('236 + 4 =', 236+4); print('ALIGNED(236,4) =', (236+3)//4*4); print('5280/240 =', 5280/240)"
+236 + 4 = 240
+ALIGNED(236,4) = 236
+5280/240 = 22.0
+```
+So 236 B payload + 4 B header = the observed 240 B stride and 5280 B for
+22 events. Nothing about the delivery verdict changes; the earlier record
+simply lacked the header term.
+
+K12 (VERIFIED, source-read - T21 mechanics a future session must not
+re-derive): (a) the key path is UNGATED by hardware: `SweetHIDButtons::
+key()` builds `IOHIDEvent::keyboardEvent(..., kHIDPage_Consumer, usage,
+down)` and calls `dispatchEvent` - no finger slot, no latch, no PMIC
+dependency; the registered instance is reachable as `gSweetButtons`, and
+the C wrapper `sweet_hid_key()` already maps index 0 to
+`kHIDUsage_Csmr_Power` (0x30). (b) A press should log `SWEET HID: key 0x30
+down (1 clients)` plus `SWEET HID: event size=60`, and a down+up pair costs
+128 B of the 16,384 B queue (python3: 60 + 4 header = 64 per entry, x2).
+(c) The sampler takes a COMMA LIST and its built-in default is ALREADY
+"SpringBoard,backboardd"; the PRA cmdline overrides it with
+`sweetsample=Setup`, a process that never runs - so aiming it needs NO
+patch, only dropping that arg. Match is exact, case-sensitive `p_comm`
+equality truncated to 16 chars, so both names fit; first sample at 90 s,
+then every 120 s, up to 90 samples. That is why no ring has ever contained
+a SpringBoard sample: the target list was always "Setup".
+
 Not claimed: that touch works, that touch is broken for a specific
 reason, that any frame count is known (the 0046 swap log is capped at 16
 and skips masked surfaces - ring62 printed 8 lines with counters
