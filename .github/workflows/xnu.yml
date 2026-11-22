@@ -331,6 +331,14 @@ jobs:
           # alive) adds no format string, so it has no marker of its own -
           # its guard is the 0199 assert above plus the apply-phase grep and
           # skip detector in the Build step (same situation as 0178).
+          # 0201 instrumentation guards: the host-state push, the display-power
+          # request and the display-integrated event mark are each one line of
+          # evidence in ring64 (work/digitizer-gate-2026-11-22.md section 4);
+          # if 0201 is skipped none of them exists and the whole 0202/0203 fork
+          # would be decided on memories of an older ring.
+          strings -a "$kernel" | grep -F 'SWEET HID: setElementValue' >/dev/null
+          strings -a "$kernel" | grep -F 'SWEET FB: powerreq' >/dev/null
+          strings -a "$kernel" | grep -F 'SWEET HID: digitizer events marked display-integrated' >/dev/null
           # 0184 bring-up guard: the IOMCU pulse + the vendor-polarity
           # reset + the LDO VSET writes (the stock-delta replication).
           strings -a "$kernel" | grep -F 'PRA touch: iomcu reset pulsed' >/dev/null

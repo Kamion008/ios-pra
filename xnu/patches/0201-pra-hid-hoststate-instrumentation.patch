@@ -1,0 +1,279 @@
+pra: 0201 - instrument the digitizer host-state and display-power interfaces
+
+Provenance: backboardd's own persisted log from the T21a boot (the 10.4 MB
+Persist/0000000000000001.tracev3 read out in
+work/digitizer-gate-2026-11-22.md section 0) says the digitizer is matched and
+alive - a BKIOHIDService "Status: matched" record, a BKDigitizerStreamClient -
+and at the same time the winning BKSHIDUISensorMode (SpringBoard's, score 4108
+against backboardd's baseline 1) carries digitizerEnabled: NO with
+display: off, and its multitouchHostStateKeys list (WakeOnTap...) names a
+contract this port never advertises and never accepts: SweetHIDTouch publishes
+DisplayIntegrated/SurfaceWidth/SurfaceHeight and nothing else,
+IOHIDEventService::setElementValue returns kIOReturnUnsupported, setProperties
+returns success while doing nothing, and no digitizer event has ever carried
+kIOHIDEventFieldDigitizerIsDisplayIntegrated. The blank behind display: off is
+BacklightServices' own "idle timer" transition, i.e. the normal sleep mode, and
+it only costs the taps that arrive while it is latched. On the other hand the
+panel is provably lit while userland believes it is off: `grep -c
+'display-off request ignored (keep_on)'` gives 2 (ring62), 2 (ring63), 0
+(ring60), 0 (ring61), and none of those four rings contains a single
+`notifications type` or `sel 72` line (grep -c, 0 each) - no client has ever
+registered a framebuffer notification, so the kernel's only display-state
+output is the vsync.
+
+BASE: the old side of this patch is the post-0171 state of
+iokit/Kernel/arm/SweetFramebuffer.cpp and the post-0200 state of
+iokit/Kernel/arm/hid/SweetHID.cpp. Only 0150, 0171 and this patch touch the
+framebuffer file, and `patch -p1 --fuzz=0 --dry-run` of both 0150 and 0171
+against xnu-src/iokit/Kernel/arm/SweetFramebuffer.cpp answers "previously
+applied", so that working-tree copy IS the CI state after 0171; the HID side is
+work/0200/SweetHID-post0200.cpp (cmp rc=0). Durable copies
+work/0201/SweetFramebuffer-pre0201.cpp and -post0201.cpp were re-derived from
+those exact bases and this patch re-applies to them with fuzz=0 and cmp rc=0
+for both files (an earlier copy of the framebuffer file came from a different
+base and was discarded - it carried a prague_gpu_present_slot block that the
+CI tree does not have at this point in the stack).
+
+Every guess about that split is currently unfalsifiable in a ring, so this patch
+changes no behaviour - nothing is accepted, applied or delivered differently -
+and only makes the three interfaces observable:
+
+ 1. display power: log EVERY kSweetFBRequestPowerChange call with the raw
+    argument, the derived off, whether keep_on swallowed it and whether the
+    request differs from the current state; record the request in fUserlandOff
+    even when keep_on refuses it; and log each frame presented while
+    fUserlandOff is set (present() is bounded to 26,000,000/10 = 2,600,000
+    ticks = 0.1 s = 10 Hz by fMinGap, python3: 26000000//10 -> 2600000,
+    (26000000//10)/26000000 -> 0.1).
+ 2. notification registration: log every kSweetFBNotifications call with its
+    type and function pointer - today only a once-per-selector line exists,
+    behind a guard that hides repeats.
+ 3. host state: log the refused setElementValue calls (return value unchanged)
+    and the keys pushed through setProperties (8 per call), and mark our
+    digitizer events display-integrated on the collection and on every finger
+    child, logged once per boot. This last item is the only one that touches
+    what userland sees; it is the final two hunks of SweetHID.cpp and both new
+    lines carry the 0201 (7) marker, so a bisect can drop item 7 alone.
+
+Ring lines that prove the gate moved (next boot, work/ring64-full.txt):
+
+    SWEET HID: SweetHIDTouch setElementValue page 0x.. usage 0x.. ->
+        backboardd IS pushing host state.
+    SWEET HID: SweetHIDTouch setProperties key ..
+        backboardd IS pushing properties.
+    SWEET FB: powerreq n=2 arg=0 off=1 keep=1 applied=1
+        a second, refused display-off request - visible instead of silent.
+    SWEET FB: swap N while userland-display-off
+        frames presented into a state userland calls "off".
+
+Ring lines that falsify it:
+
+  - No setElementValue and no setProperties line in the whole boot: backboardd
+    never configures the digitizer through the event service, so 0202 is the
+    wrong lever and the gate is downstream (SpringBoard routing) - stop there
+    and do the tracev3 decode instead.
+  - powerreq shows arg=1 only (no off=1) in a boot whose sensor-mode records
+    still say displayState: off: the blank is entirely BLS-side, the framebuffer
+    is not even consulted, the display-state lever is dead and only the
+    host-state/wake path (0202) remains.
+  - notifyreg lines appear with a type != 5: someone does subscribe to display
+    notifications, so implementing them (0203) becomes cheap and testable; their
+    absence keeps 0203 speculative.
+
+FALSIFIER: expect per boot 1-2 `SWEET FB: powerreq n=<k> arg=0 off=1 keep=1
+applied=<0|1>` lines (ring62 and ring63 each hold exactly 2 refused off
+requests), 0.. a few `SWEET FB: notifyreg type <t> func 0x<f>` lines, and - only
+if backboardd pushes host state during the harvest - `SWEET HID: SweetHIDTouch
+setElementValue ...` / `setProperties key ...` lines. `SWEET HID: digitizer
+events marked display-integrated` must appear at most once per boot, before the
+first `SWEET HID: touch N down`. A boot that still logs `A5XELTE FB: display-off
+request ignored (keep_on)` but has zero `SWEET FB: powerreq` lines is impossible
+(both live in the same case arm) and means this patch did not land.
+
+BASE (this patch's old side is the post-0200 stack, derived, not assumed):
+
+  SweetHID.cpp - work/0200/SweetHID-post0200.cpp. Re-derived here:
+      patch -p1 --fuzz=0 of work/0198/SweetHID-pre0198.cpp + 0198 + 0199 + 0200
+      rc=0 at every step, `cmp` rc=0 against work/0199/SweetHID-post0199.cpp
+      and work/0200/SweetHID-post0200.cpp.
+
+  iokit/Kernel/arm/SweetFramebuffer.cpp - no patch in the 0198-0200 range
+  touches it. The last patch in xnu/patches/ that modifies it is
+  0171-pra-gpu-consolidated.patch: a grep for
+  `iokit/Kernel/arm/SweetFramebuffer.cpp` over every patch in the stack with a
+  `---`/`+++` file section finds 0054, 0056, 0061, 0067, 0079, 0088, 0109,
+  0118, 0124, 0150, 0171 and zero between 0171 and 0200. xnu-src's copy of the
+  file is exactly 0171's pre-image: `git hash-object` on it gives
+  05eca03d217970d2e67241f807a882e7adc627d2, the `index 05eca03..a7dbf45` old
+  side of 0171's SweetFramebuffer.cpp section, and reverse-applying 0150's
+  section to it reproduces `git show HEAD:iokit/Kernel/arm/SweetFramebuffer.cpp`
+  byte for byte (`patch -R --fuzz=0` rc=0, `cmp` rc=0). Applying 0171's section
+  to it with `patch -p1 --fuzz=0` (rc=0) yields
+  a7dbf45866e90089943bf59596d7aeb792963cd4 = 0171's declared post-image, which
+  is therefore the post-0200 file; it is stored as
+  work/0201/SweetFramebuffer-pre0201.cpp for the next patch.
+
+MEASURE / DROP: item 3 logs at most one line per presented layer while
+fUserlandOff; item 1 logs on every request (backboardd asks 1-2 times per boot);
+items 5-6 log only where backboardd already exercises the interface. No
+existing format string is changed, and the `A5XELTE FB: display-off request
+ignored (keep_on)` line that ring parsers and work/claim-0198.md key on is
+untouched.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -135,6 +135,8 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	uint32_t      fPowerReq;      /* 0201: RequestPowerChange calls seen */
++	bool          fUserlandOff;   /* 0201: what userland last asked for */
+ 	IOLock       *fPresentLock;   /* one panel copy at a time */
+ 	uint64_t      fLastPresent;   /* mach_absolute_time of the last copy */
+ 	uint64_t      fMinGap;        /* 1/hz in timebase ticks */
+@@ -250,6 +252,11 @@
+ 	if (fPresentLock == NULL) {
+ 		return false;
+ 	}
++	/* 0201: fPowerOff/fFadeStep still rely on the zeroed allocation (as
++	 * they always did); the request counter and the last userland request
++	 * are set here because present() reads them. */
++	fPowerReq = 0;
++	fUserlandOff = false;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -450,6 +457,12 @@
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
++		/* 0201: frames still reach the panel while userland believes the
++		 * display is off (keep_on swallowed its request): the state split
++		 * E3 describes, one line per presented layer. */
++		if (fUserlandOff) {
++			IOLog("SWEET FB: swap %u while userland-display-off\n", get32(rec, 0x50));
++		}
+ 		if (s == NULL || s == fSurface) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+@@ -640,6 +653,12 @@
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBNotifications:
++		/* 0201: log EVERY registration call, ahead of the range guard and
++		 * outside the once-per-selector log, as 0/0 when the call is short
++		 * so a caller with the wrong argument count is visible too. */
++		IOLog("SWEET FB: notifyreg type %u func 0x%llx\n",
++		    (unsigned)(args->scalarInputCount >= 3 ? args->scalarInput[2] : 0),
++		    (unsigned long long)(args->scalarInputCount >= 1 ? args->scalarInput[0] : 0));
+ 		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];
+ 			IOLockLock(fFB->fLock);
+@@ -661,6 +680,18 @@
+ 			if (!have_keep) {
+ 				have_keep = PE_parse_boot_argn("sweetfb_keep_on", &keep_on, sizeof(keep_on));
+ 			}
++			/*
++			 * 0201: every request is logged, refused or not, because
++			 * backboardd asks for display-off on every boot and keep_on
++			 * swallowed it silently. keep= tells whether keep_on took the
++			 * request away before it was acted on; applied= tells whether
++			 * it differed from the current state (it is NOT "was
++			 * applied": keep=1 applied=1 is a refused request).
++			 */
++			IOLog("SWEET FB: powerreq n=%u arg=%llu off=%d keep=%d applied=%d\n",
++			    (unsigned)++fFB->fPowerReq, (unsigned long long)args->scalarInput[0],
++			    (int)off, (int)(have_keep && keep_on), (int)(off != fFB->fPowerOff));
++			fFB->fUserlandOff = off;
+ 			if (off && have_keep && keep_on) {
+ 				IOLog("A5XELTE FB: display-off request ignored (keep_on)\n");
+ 				break;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -20,6 +20,7 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+ 
+ #include "IOHIDEventService.h"
+@@ -242,8 +243,18 @@
+ }
+ 
+ IOReturn
+-IOHIDEventService::setElementValue(UInt32 usagePage __unused, UInt32 usage __unused, UInt32 value __unused)
++IOHIDEventService::setElementValue(UInt32 usagePage, UInt32 usage, UInt32 value)
+ {
++	/*
++	 * 0201: backboardd's host-state machinery
++	 * (BKHIDUIHostStateDigitizerServiceWrapper) configures the digitizer
++	 * through setElementValue:forUsagePage:usage:. It is refused here, but
++	 * a silent refusal cannot be told from "never asked", so the request is
++	 * logged (and the refusal kept) - that single line decides whether
++	 * 0202's host-state contract is the right lever at all.
++	 */
++	IOLog("SWEET HID: %s setElementValue page 0x%x usage 0x%x value 0x%x -> unsupported\n",
++	    getName(), (unsigned)usagePage, (unsigned)usage, (unsigned)value);
+ 	return kIOReturnUnsupported;
+ }
+ 
+@@ -251,7 +262,30 @@
+ IOHIDEventService::setProperties(OSObject *properties)
+ {
+ 	/* The event system pushes its settings here; nothing to configure. */
+-	return OSDynamicCast(OSDictionary, properties) ? kIOReturnSuccess : kIOReturnBadArgument;
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict != NULL) {
++		/*
++		 * 0201: the pushed keys are otherwise invisible (this succeeds and
++		 * does nothing), so the update can be dated from a ring instead of
++		 * guessed. Capped at 8 keys per call - a property push is a few keys
++		 * once per boot, not a hot path.
++		 */
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++		if (it != NULL) {
++			unsigned int n = 0;
++			OSObject *object;
++			while (n < 8 && (object = it->getNextObject()) != NULL) {
++				const OSSymbol *key = OSDynamicCast(OSSymbol, object);
++				if (key != NULL) {
++					IOLog("SWEET HID: %s setProperties key %s\n", getName(),
++					    key->getCStringNoCopy());
++					n++;
++				}
++			}
++			it->release();
++		}
++	}
++	return dict ? kIOReturnSuccess : kIOReturnBadArgument;
+ }
+ 
+ UInt32
+@@ -683,6 +717,19 @@
+ 		return;
+ 	}
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerCollection, TRUE);
++	/*
++	 * 0201 (7): a real display-integrated digitizer marks the collection and
++	 * every finger child with kIOHIDEventFieldDigitizerIsDisplayIntegrated.
++	 * This port only ever set the service *property* DisplayIntegrated and
++	 * never the event field, and backboardd's routing keys on the field.
++	 * Logged once per boot (a static flag), not per event.
++	 */
++	collection->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, TRUE);
++	static bool dispIntegLogged;
++	if (!dispIntegLogged) {
++		dispIntegLogged = true;
++		IOLog("SWEET HID: digitizer events marked display-integrated\n");
++	}
+ 
+ 	UInt32 cmask = 0;
+ 	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
+@@ -713,6 +760,7 @@
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerIdentity, i + 2);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerTouch, d);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, mask);
++		child->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, TRUE);
+ 		collection->appendChild(child);
+ 		child->release();
+ 		cmask |= mask;
