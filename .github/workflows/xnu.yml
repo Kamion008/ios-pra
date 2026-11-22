@@ -143,9 +143,11 @@ jobs:
             || { echo "0194 never entered the apply phase"; exit 1; }
           grep -F "patches/0195-pra-touch-selftest.patch" build.log \
             || { echo "0195 never entered the apply phase"; exit 1; }
+          grep -F "patches/0196-pra-touch-swipe.patch" build.log \
+            || { echo "0196 never entered the apply phase"; exit 1; }
           # entry in the apply list is not success: build.sh skips with a
           # warning naming the patch - fail on any skip of OUR patches.
-          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch|0179-pra-aks|0180-pra-touch|0181-pra-i2c|0182-pra-i2c|0183-pra-i2c|0184-pra-bringup|0185-pra-i2c|0186-pra-i2c|0187-pra-async|0188-pra-touch|0189-pra-touch|0190-pra-touch|0191-pra-hid|0192-pra-hid|0193-pra-touch|0194-pra-touch|0195-pra-touch)" build.log \
+          ! grep -E "Skipping patch .*(0176-pra-emmc|0177-pra-touch|0178-pra-touch|0179-pra-aks|0180-pra-touch|0181-pra-i2c|0182-pra-i2c|0183-pra-i2c|0184-pra-bringup|0185-pra-i2c|0186-pra-i2c|0187-pra-async|0188-pra-touch|0189-pra-touch|0190-pra-touch|0191-pra-hid|0192-pra-hid|0193-pra-touch|0194-pra-touch|0195-pra-touch|0196-pra-touch)" build.log \
             || { echo "one of our patches was SKIPPED"; exit 1; }
 
       - name: Package build tree for local compiles
@@ -315,6 +317,10 @@ jobs:
           # debug heartbeat with reads/last_len.
           strings -a "$kernel" | grep -F 'SWEET HID: selftest' >/dev/null
           strings -a "$kernel" | grep -F 'last_len=' >/dev/null
+          # 0196 unlock-swipe guard: the bottom-edge gesture timer (no finger,
+          # same touch() path; the lock screen is the only surface that must
+          # answer it visibly).
+          strings -a "$kernel" | grep -F 'SWEET HID: swipe' >/dev/null
           # 0184 bring-up guard: the IOMCU pulse + the vendor-polarity
           # reset + the LDO VSET writes (the stock-delta replication).
           strings -a "$kernel" | grep -F 'PRA touch: iomcu reset pulsed' >/dev/null

@@ -1,0 +1,142 @@
+pra: 0196 - the synthetic unlock swipe (the lock screen gesture, no finger)
+
+T19 (ring61) proved the kernel half: IC -> parse -> SweetHIDTouch -> the
+per-client queue -> backboardd drain is intact (514 events x 236 B = 118.5
+KiB through the 16 KiB queue, 7.4x, drop=0, head==tail at every sample),
+and the 0194 clamp is effective at runtime (selftest 2000,3000 ->
+1079,1919). The UI still ignored every touch. Every PRA touch test so far
+(T13-T19) was on the LOCK SCREEN, where a tap on an already-lit screen
+leaves no lasting visible change; the decisive gesture is the bottom-edge
+swipe up (unlock), and the sweethidtest path only presses Home, which an
+iPhone X lock screen does not use.
+
+THIS PATCH injects that exact gesture from the kernel, through touch() -
+the same path pra_touch's finger uses, clamp and edge flag included:
+`pratouchswipe=N` arms a timer N seconds after the touch service starts;
+three runs at 120 s intervals each send a down 5 px above the last panel
+row (inside the 48 px edge band, so the contact carries
+kIOHIDDigitizerEventFromEdgeTip the whole way), eight 150 px moves every
+20 ms, then the release (10 contacts, 9 x 20 ms = 180 ms). No finger, no
+userland change. No "armed" line: start() runs before the pralog ring
+exists, so the first swipe line carries the interval instead.
+
+FALSIFIER: `SWEET HID: swipe 1 start (interval 420 s) at 540,1914`, all
+eight move lines, then `swipe 1 release at 540,714`, followed by a burst
+of new `SWEET FB: swap` lines and/or SpringBoard AKS sel 9/12 = the UI
+processed the drained gesture (positive signal only; a negative does not
+by itself separate a rejected gesture from a backboardd dispatch drop).
+
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -363,6 +363,21 @@
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++/*
++ * 0196: pratouchswipe=N injects the unlock gesture itself - a one-finger
++ * flick up from the bottom edge - N seconds after the touch service starts,
++ * then twice more 120 s apart. The down point is 6 px above the panel
++ * bottom, inside the 48 px edge band, so the whole contact carries
++ * kIOHIDDigitizerEventFromEdgeTip; eight 150 px moves follow every 20 ms.
++ * It calls touch(), the same path pra_touch's finger uses, so the kernel
++ * half ring61 proved is not bypassed: what it adds is a gesture the lock
++ * screen must answer visibly (unlock) with no finger on the panel.
++ */
++#define SWEET_SWIPE_X     540
++#define SWEET_SWIPE_Y0    1914
++#define SWEET_SWIPE_DY    150
++#define SWEET_SWIPE_MOVES 8
++#define SWEET_SWIPE_RUNS  3
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -379,6 +394,11 @@
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+ 	IOFixed fY[SWEET_TOUCH_FINGERS];
++	static void swipeFired(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fSwipe;
++	UInt32 fSwipeSecs;
++	UInt32 fSwipeRuns;
++	UInt32 fSwipeStep;
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
+@@ -485,6 +505,25 @@
+ 	setProperty("SurfaceHeight", (unsigned long long)((unsigned)surfaceHmm << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
++	/*
++	 * 0196: arm the synthetic unlock gesture. The timer runs on the HID
++	 * work loop; each step is one touch() call, so the event a finger
++	 * would produce is the event this injects. (No "armed" line: start()
++	 * runs before the pralog ring exists - ring61 has zero start()
++	 * markers. The first swipe logs the interval instead.)
++	 */
++	fSwipe = NULL;
++	fSwipeRuns = 0;
++	fSwipeStep = 0;
++	fSwipeSecs = 0;
++	if (PE_parse_boot_argn("pratouchswipe", &fSwipeSecs, sizeof(fSwipeSecs)) &&
++	    fSwipeSecs) {
++		fSwipe = IOTimerEventSource::timerEventSource(this,
++		    &SweetHIDTouch::swipeFired);
++		if (fSwipe && _hidWorkLoop->addEventSource(fSwipe) == kIOReturnSuccess) {
++			fSwipe->setTimeoutMS(fSwipeSecs * 1000);
++		}
++	}
+ 	IOLog("SWEET HID: surface %ux%u mm panel %ux%u\n",
+ 	    surfaceWmm, surfaceHmm, fPanelW, fPanelH);
+ 	IOLog("SWEET HID: touch registered\n");
+@@ -581,6 +620,51 @@
+ 	collection->release();
+ }
+ 
++/*
++ * 0196: one synthetic unlock gesture: down at the bottom edge, eight
++ * 150 px steps up every 20 ms, release. Repeated twice at 120 s intervals
++ * so a slow SpringBoard launch cannot miss the only window. Every step
++ * calls touch(), so the clamp and the edge flag apply exactly as they do
++ * for a real finger.
++ */
++void
++SweetHIDTouch::swipeFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDTouch *self = (SweetHIDTouch *)owner;
++	int y;
++
++	if (self->fSwipeStep == 0) {
++		self->fSwipeRuns++;
++		self->fSwipeStep = 1;
++		IOLog("SWEET HID: swipe %u start (interval %u s) at %d,%d\n",
++		    self->fSwipeRuns, self->fSwipeSecs,
++		    SWEET_SWIPE_X, SWEET_SWIPE_Y0);
++		self->touch(0, true, SWEET_SWIPE_X, SWEET_SWIPE_Y0);
++		sender->setTimeoutMS(20);
++		return;
++	}
++	if (self->fSwipeStep <= SWEET_SWIPE_MOVES) {
++		y = SWEET_SWIPE_Y0 - (int)self->fSwipeStep * SWEET_SWIPE_DY;
++		IOLog("SWEET HID: swipe %u move %u/%u at %d,%d\n",
++		    self->fSwipeRuns, self->fSwipeStep,
++		    (UInt32)(SWEET_SWIPE_MOVES), SWEET_SWIPE_X, y);
++		self->touch(0, true, SWEET_SWIPE_X, y);
++		self->fSwipeStep++;
++		sender->setTimeoutMS(20);
++		return;
++	}
++	y = SWEET_SWIPE_Y0 - SWEET_SWIPE_MOVES * SWEET_SWIPE_DY;
++	self->touch(0, false, SWEET_SWIPE_X, y);
++	self->fSwipeStep = 0;
++	IOLog("SWEET HID: swipe %u release at %d,%d\n", self->fSwipeRuns,
++	    SWEET_SWIPE_X, y);
++	if (self->fSwipeRuns >= SWEET_SWIPE_RUNS) {
++		IOLog("SWEET HID: swipe selftest done\n");
++		return;
++	}
++	sender->setTimeoutMS(120 * 1000);
++}
++
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+ extern "C" void
+ sweet_hid_key(int key, int down)

@@ -1,0 +1,405 @@
+[0m
+> plan · deepseek-v4.1-flash-free
+I'll read the three attached files.
+[0m→ [0mRead claim.md 
+[0m→ [0mRead /home/kamion008/Ai/ios/ios-pra/work/evidence-0196.md 
+[0m→ [0mRead /home/kamion008/Ai/ios/ios-pra/xnu/patches/0196-pra-touch-swipe.patch 
+> plan · deepseek-v4.1-flash-free
+[0m$ [0mcd /home/kamion008/Ai/ios/ios-pra && python3 - <<'EOF'
+import re
+p='xnu/patches/0196-pra-touch-swipe.patch'
+lines=open(p).read().split('\n')
+if lines and lines[-1]=='': lines.pop()
+print("total lines:", len(lines))
+hunks=[]
+cur=None
+for i,l in enumerate(lines,1):
+    m=re.match(r'^@@ -(\d+),(\d+) \+(\d+),(\d+) @@', l)
+    if m:
+        cur={'hdr':i,'old':int(m.group(1)),'oldc':int(m.group(2)),'new':int(m.group(3)),'newc':int(m.group(4)),'add':0,'ctx':0,'del':0}
+        hunks.append(cur); continue
+    if cur is None: continue
+    if l.startswith('+++') or l.startswith('---'): continue
+    if l.startswith('+'): cur['add']+=1
+    elif l.startswith('-'): cur['del']+=1
+    elif l.startswith(' ') or l=='': cur['ctx']+=1
+tot=0
+for h in hunks:
+    print(h, "ctx+del==oldc:", h['ctx']+h['del']==h['oldc'], "ctx+add==newc:", h['ctx']+h['add']==h['newc'])
+    tot+=h['add']
+print("total added:", tot, "total deleted:", sum(h['del'] for h in hunks))
+print("starts:", [h['old'] for h in hunks], "->", [h['new'] for h in hunks])
+c=0
+for h in hunks:
+    print("pred new for", h['old'], "=", h['old']+c, "actual", h['new'], h['old']+c==h['new'])
+    c+=h['add']-h['del']
+print()
+print("1920-1-48 =", 1920-1-48, "| 1914 > that:", 1914 > 1920-1-48, "| 1919-1914 =", 1919-1914)
+print("[1914-150*k for k in range(9)] =", [1914-150*k for k in range(9)], "| release y =", 1914-8*150)
+print("(1+8)*20 =", (1+8)*20, "| starts:", [420+120*k for k in range(3)], "| 1080//2 =", 1080//2)
+print("420+0.18+120 =", 420+0.18+120, "| 540.18+0.18+120 =", round(540.18+0.18+120,2))
+print("514*236 =", 514*236, "B | /1024 =", round(514*236/1024,3), "KiB | /16384 =", round(514*236/16384,3))
+print("1618... check 150*8 =", 150*8)
+for lit in ["pratouchswipe","swipeFired","SWEET HID: swipe","fSwipe = NULL","interval %u s","180 ms","PE_parse_boot_argn","setTimeoutMS","10 contacts"]:
+    print(repr(lit), open(p).read().count(lit))
+EOF
+total lines: 144
+{'hdr': 31, 'old': 363, 'oldc': 6, 'new': 363, 'newc': 21, 'add': 15, 'ctx': 6, 'del': 0} ctx+del==oldc: True ctx+add==newc: True
+{'hdr': 53, 'old': 379, 'oldc': 6, 'new': 394, 'newc': 11, 'add': 5, 'ctx': 6, 'del': 0} ctx+del==oldc: True ctx+add==newc: True
+{'hdr': 65, 'old': 485, 'oldc': 6, 'new': 505, 'newc': 25, 'add': 19, 'ctx': 6, 'del': 0} ctx+del==oldc: True ctx+add==newc: True
+{'hdr': 91, 'old': 581, 'oldc': 6, 'new': 620, 'newc': 53, 'add': 47, 'ctx': 6, 'del': 0} ctx+del==oldc: True ctx+add==newc: True
+total added: 86 total deleted: 0
+starts: [363, 379, 485, 581] -> [363, 394, 505, 620]
+pred new for 363 = 363 actual 363 True
+pred new for 379 = 394 actual 394 True
+pred new for 485 = 505 actual 505 True
+pred new for 581 = 620 actual 620 True
+
+1920-1-48 = 1871 | 1914 > that: True | 1919-1914 = 5
+[1914-150*k for k in range(9)] = [1914, 1764, 1614, 1464, 1314, 1164, 1014, 864, 714] | release y = 714
+(1+8)*20 = 180 | starts: [420, 540, 660] | 1080//2 = 540
+420+0.18+120 = 540.1800000000001 | 540.18+0.18+120 = 660.36
+514*236 = 121304 B | /1024 = 118.461 KiB | /16384 = 7.404
+1618... check 150*8 = 1200
+'pratouchswipe' 3
+'swipeFired' 3
+'SWEET HID: swipe' 5
+'fSwipe = NULL' 1
+'interval %u s' 1
+'180 ms' 1
+'PE_parse_boot_argn' 1
+'setTimeoutMS' 4
+'10 contacts' 1
+> plan · deepseek-v4.1-flash-free
+[0m$ [0mcd /home/kamion008/Ai/ios/ios-pra && python3 - <<'EOF'
+import re
+lines=open('xnu/patches/0196-pra-touch-swipe.patch').read().split('\n')
+if lines and lines[-1]=='': lines.pop()
+old=None; new=None
+for i,l in enumerate(lines,1):
+    m=re.match(r'^@@ -(\d+),(\d+) \+(\d+),(\d+) @@', l)
+    if m:
+        old=int(m.group(1)); new=int(m.group(3))
+        print(f"--- hunk at file line {i}: old {old} new {new}")
+        continue
+    if old is None: continue
+    if l.startswith('+'):
+        print(f"   new {new:4d} ADD  {l[1:][:60]}"); new+=1
+    elif l.startswith('-'):
+        print(f"   old {old:4d} DEL  {l[1:][:60]}"); old+=1
+    elif l.startswith(' '):
+        print(f"   old {old:4d}/new {new:4d} ctx  {l[1:][:55]}"); old+=1; new+=1
+    else:
+        print("   (non-diff line, hunk ended?)", repr(l[:40]))
+        old=None
+EOF
+--- hunk at file line 31: old 363 new 363
+   old  363/new  363 ctx   * app-switcher gesture.
+   old  364/new  364 ctx   */
+   old  365/new  365 ctx  #define SWEET_TOUCH_EDGE_PX 48
+   new  366 ADD  /*
+   new  367 ADD   * 0196: pratouchswipe=N injects the unlock gesture itself -
+   new  368 ADD   * flick up from the bottom edge - N seconds after the touch
+   new  369 ADD   * then twice more 120 s apart. The down point is 6 px above
+   new  370 ADD   * bottom, inside the 48 px edge band, so the whole contact 
+   new  371 ADD   * kIOHIDDigitizerEventFromEdgeTip; eight 150 px moves follo
+   new  372 ADD   * It calls touch(), the same path pra_touch's finger uses, 
+   new  373 ADD   * half ring61 proved is not bypassed: what it adds is a ges
+   new  374 ADD   * screen must answer visibly (unlock) with no finger on the
+   new  375 ADD   */
+   new  376 ADD  #define SWEET_SWIPE_X     540
+   new  377 ADD  #define SWEET_SWIPE_Y0    1914
+   new  378 ADD  #define SWEET_SWIPE_DY    150
+   new  379 ADD  #define SWEET_SWIPE_MOVES 8
+   new  380 ADD  #define SWEET_SWIPE_RUNS  3
+   old  366/new  381 ctx  class SweetHIDTouch : public IOHIDEventService {
+   old  367/new  382 ctx  	OSDeclareDefaultStructors(SweetHIDTouch);
+   old  368/new  383 ctx  public:
+--- hunk at file line 53: old 379 new 394
+   old  379/new  394 ctx  	bool fEdge[SWEET_TOUCH_FINGERS];
+   old  380/new  395 ctx  	IOFixed fX[SWEET_TOUCH_FINGERS];
+   old  381/new  396 ctx  	IOFixed fY[SWEET_TOUCH_FINGERS];
+   new  397 ADD  	static void swipeFired(OSObject *owner, IOTimerEventSource 
+   new  398 ADD  	IOTimerEventSource *fSwipe;
+   new  399 ADD  	UInt32 fSwipeSecs;
+   new  400 ADD  	UInt32 fSwipeRuns;
+   new  401 ADD  	UInt32 fSwipeStep;
+   old  382/new  402 ctx  };
+   old  383/new  403 ctx  OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEvent
+   old  384/new  404 ctx  
+--- hunk at file line 65: old 485 new 505
+   old  485/new  505 ctx  	setProperty("SurfaceHeight", (unsigned long long)((uns
+   old  486/new  506 ctx  	gSweetTouch = this;
+   old  487/new  507 ctx  	registerService();
+   new  508 ADD  	/*
+   new  509 ADD  	 * 0196: arm the synthetic unlock gesture. The timer runs o
+   new  510 ADD  	 * work loop; each step is one touch() call, so the event a
+   new  511 ADD  	 * would produce is the event this injects. (No "armed" lin
+   new  512 ADD  	 * runs before the pralog ring exists - ring61 has zero sta
+   new  513 ADD  	 * markers. The first swipe logs the interval instead.)
+   new  514 ADD  	 */
+   new  515 ADD  	fSwipe = NULL;
+   new  516 ADD  	fSwipeRuns = 0;
+   new  517 ADD  	fSwipeStep = 0;
+   new  518 ADD  	fSwipeSecs = 0;
+   new  519 ADD  	if (PE_parse_boot_argn("pratouchswipe", &fSwipeSecs, sizeof
+   new  520 ADD  	    fSwipeSecs) {
+   new  521 ADD  		fSwipe = IOTimerEventSource::timerEventSource(this,
+   new  522 ADD  		    &SweetHIDTouch::swipeFired);
+   new  523 ADD  		if (fSwipe && _hidWorkLoop->addEventSource(fSwipe) == kIOR
+   new  524 ADD  			fSwipe->setTimeoutMS(fSwipeSecs * 1000);
+   new  525 ADD  		}
+   new  526 ADD  	}
+   old  488/new  527 ctx  	IOLog("SWEET HID: surface %ux%u mm panel %ux%u\n",
+   old  489/new  528 ctx  	    surfaceWmm, surfaceHmm, fPanelW, fPanelH);
+   old  490/new  529 ctx  	IOLog("SWEET HID: touch registered\n");
+--- hunk at file line 91: old 581 new 620
+   old  581/new  620 ctx  	collection->release();
+   old  582/new  621 ctx  }
+   old  583/new  622 ctx  
+   new  623 ADD  /*
+   new  624 ADD   * 0196: one synthetic unlock gesture: down at the bottom ed
+   new  625 ADD   * 150 px steps up every 20 ms, release. Repeated twice at 1
+   new  626 ADD   * so a slow SpringBoard launch cannot miss the only window.
+   new  627 ADD   * calls touch(), so the clamp and the edge flag apply exact
+   new  628 ADD   * for a real finger.
+   new  629 ADD   */
+   new  630 ADD  void
+   new  631 ADD  SweetHIDTouch::swipeFired(OSObject *owner, IOTimerEventSourc
+   new  632 ADD  {
+   new  633 ADD  	SweetHIDTouch *self = (SweetHIDTouch *)owner;
+   new  634 ADD  	int y;
+   new  635 ADD  
+   new  636 ADD  	if (self->fSwipeStep == 0) {
+   new  637 ADD  		self->fSwipeRuns++;
+   new  638 ADD  		self->fSwipeStep = 1;
+   new  639 ADD  		IOLog("SWEET HID: swipe %u start (interval %u s) at %d,%d\
+   new  640 ADD  		    self->fSwipeRuns, self->fSwipeSecs,
+   new  641 ADD  		    SWEET_SWIPE_X, SWEET_SWIPE_Y0);
+   new  642 ADD  		self->touch(0, true, SWEET_SWIPE_X, SWEET_SWIPE_Y0);
+   new  643 ADD  		sender->setTimeoutMS(20);
+   new  644 ADD  		return;
+   new  645 ADD  	}
+   new  646 ADD  	if (self->fSwipeStep <= SWEET_SWIPE_MOVES) {
+   new  647 ADD  		y = SWEET_SWIPE_Y0 - (int)self->fSwipeStep * SWEET_SWIPE_D
+   new  648 ADD  		if ((self->fSwipeStep % 4) == 0) {
+   new  649 ADD  			IOLog("SWEET HID: swipe %u at %d,%d (%u/%u)\n",
+   new  650 ADD  			    self->fSwipeRuns, SWEET_SWIPE_X, y, self->fSwipeStep,
+   new  651 ADD  			    (UInt32)(SWEET_SWIPE_MOVES));
+   new  652 ADD  		}
+   new  653 ADD  		self->touch(0, true, SWEET_SWIPE_X, y);
+   new  654 ADD  		self->fSwipeStep++;
+   new  655 ADD  		sender->setTimeoutMS(20);
+   new  656 ADD  		return;
+   new  657 ADD  	}
+   new  658 ADD  	y = SWEET_SWIPE_Y0 - SWEET_SWIPE_MOVES * SWEET_SWIPE_DY;
+   new  659 ADD  	self->touch(0, false, SWEET_SWIPE_X, y);
+   new  660 ADD  	self->fSwipeStep = 0;
+   new  661 ADD  	IOLog("SWEET HID: swipe %u end at %d,%d\n", self->fSwipeRun
+   new  662 ADD  	    SWEET_SWIPE_X, y);
+   new  663 ADD  	if (self->fSwipeRuns >= SWEET_SWIPE_RUNS) {
+   new  664 ADD  		IOLog("SWEET HID: swipe selftest done\n");
+   new  665 ADD  		return;
+   new  666 ADD  	}
+   new  667 ADD  	sender->setTimeoutMS(120 * 1000);
+   new  668 ADD  }
+   new  669 ADD  
+   old  584/new  670 ctx  /* key: 0 power (side button), 1 volume up, 2 volume do
+   old  585/new  671 ctx  extern "C" void
+   old  586/new  672 ctx  sweet_hid_key(int key, int down)
+> plan · deepseek-v4.1-flash-free
+Read all three. Arithmetic recomputed with python against the patch (allowed: it is one of the attachments); results quoted inline.
+
+---
+
+### K1 — lock-screen framing, "a tap proves nothing"
+**WEAK.** Both citations (claim-0195 K11, `HANDOFF_2026-11-21.md:171`) are unattached → INSUFFICIENT on the quote; cheapest check: open those two lines.
+Self-contradiction inside the claim: claim:21-22 "the only synthetic injection that has run on PRA is `sweethidtest`" vs claim:130-131 "the only prior synthetic touch is 0195's one-shot out-of-bounds clamp test" (and patch:6-7 says that selftest ran at runtime: `2000,3000 -> 1079,1919`).
+Claim:24's `sweet_keys_init` leg is at least internally consistent (patch:142-144 + evidence:108-109), but rests on unattached 0161.
+
+### K2 — proven path / real edge band
+**WEAK.** The child-mask pointers are refuted: `@@ -581,6 +620,53 @@` makes old 581 = `collection->release();` and the function ends at old 582 (patch:91-93), so a mask at "581, 596" and `cmask` at "599" cannot be those lines in the pre-0196 file the claim cites (evidence:56-58 is wrong too; round 2 "fixed the quote" but not the numbers).
+`fPanelH=1920` is real but the cited `ring61:1656` does not show it — that is an FB present, 1080x1920 (evidence:117); the actual runtime proof is patch:6-7 (3000→1919, 2000→1079). Clamp arithmetic does check: `1920-1-48=1871`, `1914>1871` True.
+COSMETIC: "6 px above the panel bottom" is 5 px above the last row (`1919-1914=5`); and the moves carry `down=true` for 8 steps, so the flag survives only because it is latched at down — evidence never shows whether `fEdge` is cleared on release.
+
+### K3 — shape, schedule, timer lifecycle
+**WEAK.** "Same lifecycle as fTest" is wrong in kind: fTest is armed once from `start()` (evidence:396-398); 0196 re-arms from *inside* the action (patch:643, 655, 667) with default `timerEventSource` options — unverified → INSUFFICIENT; cheapest check: `IOTimerEventSource.h` requeue semantics, or any in-tree re-arm-from-action. Failure mode is FAULT-level, not cosmetic: if the re-arm is dropped the down stays latched with no release (stuck finger at 540,1914).
+`PE_parse_boot_argn` occurs exactly once in the attachments (patch:519) — its declaration for this TU is unproven; cheapest check: `grep PE_parse_boot_argn work/0196/SweetHID-pre0196.cpp`.
+Init-before-arm is genuinely fixed (patch:515-518) and 180 ms/1200 px/420·540·660 all recompute correctly (`(1+8)*20=180`, `1914-8*150=714`); but 660.36 s needs ~11 min of uptime and nothing states T19's uptime, and 540.18/660.36 ignore per-step drift (9×≥20 ms + IOLog).
+
+### K4 — kernel-visible UI signal
+**WEAK.** The zero is regex-shaped, not measured: `sel (9|12) ` requires a trailing space (evidence:126); if the real format is `sel 9\n` the 0 is an artifact. Cheap check: print one of the 966 lines.
+The swap baseline is not a clean count: the listed sequence 1,2,3,6,7,9,11,12,13 skips 4,5,8,10 with no explanation (evidence:117-125) — the counter is either non-sequential or the listing is filtered.
+`3,703` lines is asserted (evidence:131), never shown as `wc -l`; "the 966 are other daemons' calls" (claim:83-84) is unattributed; mkiosroot.sh:225-230 unattached.
+
+### K5 — backboardd dispatch unknown
+**SURVIVES.** Properly hedged to UNKNOWN, and the only number it leans on recomputes: `514*236 = 121304 B = 118.46 KiB` (claimed 118.5) = `7.40x` a 16 KiB queue. Pointer is patch:5 prose rather than a ring dump, but the claim asserts nothing beyond drop=0/head==tail.
+
+### FALSIFIER
+**WEAK.** Only 2 of 8 moves log (`fSwipeStep % 4` → steps 4 and 8, patch:648), and the step-8 line `at 540,714` is byte-identical to `end at 540,714` (patch:658-661) — so "the moves" (claim:96, evidence:154) invites a false "gesture stalled" reading.
+"New swaps **or** sel 9/12 = the UI processed the gesture" is not specific: a swap is just a present (evidence:117); a rejected-swipe animation, a banner or a clock tick produces one.
+
+### DONOR COMPARISON
+**WEAK.** `cmp rc=0` is an author annotation, not captured output (`cmp` prints nothing on success; no `echo $?` anywhere in §1/§5). Identity of a patch file does not establish the compiled PRA path, and "0193/0194 changed only geometry, 0195 added one diagnostic" is unverifiable from the attachments.
+
+### PRIOR-ART CHECK
+**WEAK.** The 7 / 0 SMP counts are asserted, not quoted (evidence:103-105); "no PRA ring contains a `SWEET KEYS` line" is a universal claim from one ring; HANDOFF_2026-11-20 and 0161:14-15 unattached.
+
+### E1 — evidence §1 verify block (leaned on by claim:3-9)
+**REFUTED.** `+87/-0` is wrong: hunk adds are 15+5+19+47 = **86**, and each hunk's own `oldc/newc` agrees (`ctx+del==oldc`, `ctx+add==newc` all True). Starts do reconcile (363/394/505/620), but every `rc=` in §1 is annotation, not tool output.
+
+VERDICT: 1 refuted / 7 weak / 1 survive
+
+
+===== ROUND 4 =====
+[0m
+> plan · deepseek-v4.1-flash-free
+I'll start by reading the three attached files.
+[0m→ [0mRead claim.md 
+[0m→ [0mRead work/evidence-0196.md 
+> plan · deepseek-v4.1-flash-free
+[0m→ [0mRead xnu/patches/0196-pra-touch-swipe.patch 
+> plan · deepseek-v4.1-flash-free
+I have all three attachments. Let me verify the hunk arithmetic directly against the patch bytes (read-only).
+[0m$ [0mawk '
+/^@@/ {
+  if (h!="") printf "%s  add=%d del=%d ctx=%d  (ctx+del=%d ctx+add=%d)\n", h, a, d, c, c+d, c+a;
+  h=$0; a=0; d=0; c=0; next
+}
+h!="" {
+  p=substr($0,1,1);
+  if (p=="+") a++; else if (p=="-") d++; else if (p==" ") c++; else if ($0=="") c++;
+}
+END { printf "%s  add=%d del=%d ctx=%d  (ctx+del=%d ctx+add=%d)\n", h, a, d, c, c+d, c+a }
+' xnu/patches/0196-pra-touch-swipe.patch
+echo "---- total lines / add / del ----"
+awk 'BEGIN{a=0;d=0} /^\+[^+]/{a++} /^-[^-]/{d++} END{print "adds",a,"dels",d}' xnu/patches/0196-pra-touch-swipe.patch
+wc -l xnu/patches/0196-pra-touch-swipe.patch
+@@ -363,6 +363,21 @@  add=15 del=0 ctx=6  (ctx+del=6 ctx+add=21)
+@@ -379,6 +394,11 @@  add=5 del=0 ctx=6  (ctx+del=6 ctx+add=11)
+@@ -485,6 +505,25 @@  add=19 del=0 ctx=6  (ctx+del=6 ctx+add=25)
+@@ -581,6 +620,51 @@  add=45 del=0 ctx=6  (ctx+del=6 ctx+add=51)
+---- total lines / add / del ----
+adds 82 dels 0
+142 xnu/patches/0196-pra-touch-swipe.patch
+> plan · deepseek-v4.1-flash-free
+[0m$ [0mawk 'NR>=88 && NR<=142 {printf "%3d|%s\n", NR, $0}' xnu/patches/0196-pra-touch-swipe.patch | cat -A | sed -n '1,60p'
+88| ^IIOLog("SWEET HID: surface %ux%u mm panel %ux%u\n",$
+ 89| ^I    surfaceWmm, surfaceHmm, fPanelW, fPanelH);$
+ 90| ^IIOLog("SWEET HID: touch registered\n");$
+ 91|@@ -581,6 +620,51 @@$
+ 92| ^Icollection->release();$
+ 93| }$
+ 94| $
+ 95|+/*$
+ 96|+ * 0196: one synthetic unlock gesture: down at the bottom edge, eight$
+ 97|+ * 150 px steps up every 20 ms, release. Repeated twice at 120 s intervals$
+ 98|+ * so a slow SpringBoard launch cannot miss the only window. Every step$
+ 99|+ * calls touch(), so the clamp and the edge flag apply exactly as they do$
+100|+ * for a real finger.$
+101|+ */$
+102|+void$
+103|+SweetHIDTouch::swipeFired(OSObject *owner, IOTimerEventSource *sender)$
+104|+{$
+105|+^ISweetHIDTouch *self = (SweetHIDTouch *)owner;$
+106|+^Iint y;$
+107|+$
+108|+^Iif (self->fSwipeStep == 0) {$
+109|+^I^Iself->fSwipeRuns++;$
+110|+^I^Iself->fSwipeStep = 1;$
+111|+^I^IIOLog("SWEET HID: swipe %u start (interval %u s) at %d,%d\n",$
+112|+^I^I    self->fSwipeRuns, self->fSwipeSecs,$
+113|+^I^I    SWEET_SWIPE_X, SWEET_SWIPE_Y0);$
+114|+^I^Iself->touch(0, true, SWEET_SWIPE_X, SWEET_SWIPE_Y0);$
+115|+^I^Isender->setTimeoutMS(20);$
+116|+^I^Ireturn;$
+117|+^I}$
+118|+^Iif (self->fSwipeStep <= SWEET_SWIPE_MOVES) {$
+119|+^I^Iy = SWEET_SWIPE_Y0 - (int)self->fSwipeStep * SWEET_SWIPE_DY;$
+120|+^I^IIOLog("SWEET HID: swipe %u move %u/%u at %d,%d\n",$
+121|+^I^I    self->fSwipeRuns, self->fSwipeStep,$
+122|+^I^I    (UInt32)(SWEET_SWIPE_MOVES), SWEET_SWIPE_X, y);$
+123|+^I^Iself->touch(0, true, SWEET_SWIPE_X, y);$
+124|+^I^Iself->fSwipeStep++;$
+125|+^I^Isender->setTimeoutMS(20);$
+126|+^I^Ireturn;$
+127|+^I}$
+128|+^Iy = SWEET_SWIPE_Y0 - SWEET_SWIPE_MOVES * SWEET_SWIPE_DY;$
+129|+^Iself->touch(0, false, SWEET_SWIPE_X, y);$
+130|+^Iself->fSwipeStep = 0;$
+131|+^IIOLog("SWEET HID: swipe %u release at %d,%d\n", self->fSwipeRuns,$
+132|+^I    SWEET_SWIPE_X, y);$
+133|+^Iif (self->fSwipeRuns >= SWEET_SWIPE_RUNS) {$
+134|+^I^IIOLog("SWEET HID: swipe selftest done\n");$
+135|+^I^Ireturn;$
+136|+^I}$
+137|+^Isender->setTimeoutMS(120 * 1000);$
+138|+}$
+139|+$
+140| /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */$
+141| extern "C" void$
+142| sweet_hid_key(int key, int down)$
+> plan · deepseek-v4.1-flash-free
+[0m$ [0mf=xnu/patches/0196-pra-touch-swipe.patch
+for s in pratouchswipe swipeFired 'SWEET HID: swipe' 'fSwipe = NULL' 'interval %u s' '180 ms' 'fSwipeStep = 0' 'setTimeoutMS(20)'; do
+  printf '%-22s %s\n' "$s" "$(grep -Fc -- "$s" "$f")"
+done
+echo "--- touch( call sites in the patch ---"
+grep -n 'touch(' "$f"
+echo "--- 514*236 / 16384 ---"
+python3 -c 'b=514*236; print(b, b/1024, b/16384)'
+pratouchswipe          3
+swipeFired             3
+SWEET HID: swipe       5
+fSwipe = NULL          1
+interval %u s          1
+180 ms                 1
+fSwipeStep = 0         2
+setTimeoutMS(20)       2
+--- touch( call sites in the patch ---
+13:THIS PATCH injects that exact gesture from the kernel, through touch() -
+41:+ * It calls touch(), the same path pra_touch's finger uses, so the kernel
+71:+	 * work loop; each step is one touch() call, so the event a finger
+99:+ * calls touch(), so the clamp and the edge flag apply exactly as they do
+114:+		self->touch(0, true, SWEET_SWIPE_X, SWEET_SWIPE_Y0);
+123:+		self->touch(0, true, SWEET_SWIPE_X, y);
+129:+	self->touch(0, false, SWEET_SWIPE_X, y);
+--- 514*236 / 16384 ---
+121304 118.4609375 7.40380859375
+> plan · deepseek-v4.1-flash-free
+## 1. Header accounting ("adds 86 lines in 4 hunks, deletes 0; 15+5+19+47=86")
+**REFUTED (LOGIC).** Hunk 4 is `@@ -581,6 +620,51 @@` with 6 context + **45** added (`xnu/patches/0196-pra-touch-swipe.patch:95-139`), not 47; real total is 15+5+19+45 = **84**, and `awk` over the file gives 84 `+` lines, 0 `-`.
+The sum in the claim is internally consistent but the fourth addend is a miscount, so the "round-3 fixed +87→86" fix is still wrong (`work/evidence-0196.md:24`).
+
+## 2. K1 — "recorded touch tests were on the lock screen, a tap proves nothing"
+**WEAK.** Both quoted sources (`claim-0195.md:124-126`, `HANDOFF_2026-11-21.md:171`) are not attached; the only attached support is the patch's own header (`0196...patch:7-11`), i.e. the author corroborating himself.
+Also "`sweethidtest` (Home/Menu)" is not in the evidence: `evidence-0196.md:71-75` shows only that a timer arms, never which key; cheapest fix: the `sweet_hid_key(3, …)` call site in `SweetHID-pre0196.cpp`.
+
+## 3. K2 — "proven path and the real edge band"
+**WEAK (FAULT risk on the latch).** The quoted edge test is a plain assignment `fEdge[finger] = …` with no visible `if (down)` guard (`evidence-0196.md:49-50`), while the swipe re-enters `touch()` with y=1764…714 (`0196...patch:123`) — all < 1871, so on any unguarded evaluation the flag is **cleared at move 1**, contradicting "the whole contact carries FromEdgeTip" (`claim.md:43-44`).
+`fPanelH=1920` rests on `0194:48-49`, not attached → INSUFFICIENT; and `touch()`'s parameter types are never shown anywhere in the three files.
+
+## 4. K3 — "gesture shape, schedule and timer"
+**WEAK.** All the arithmetic checks out (1914−150k ends at 714, 9×20 = 180 ms, 10 `touch()` calls, 420/540.18/660.36) and the four initializers are present (`patch:76-79`).
+But "T19's ring covers samples 0-6 (720+ s), so all three fit" assumes a **120 s** sample spacing that no attached file states — 7 markers only give 7 markers (`evidence-0196.md:97-98`); at 60 s spacing only run 1 fits.
+Cheapest observation: `grep -n "SMP --- sample" ring61` to read the timestamps.
+
+## 5. K4 — "the UI-reaction signal"
+**REFUTED (LOGIC).** The claim's own evidence says the printed counter *skips* — (1,2,3,6,7,9,11,12,13) (`evidence-0196.md:139`) — which proves the counter increments on draws that were not printed; it is at **13 of 16**, so at most **3** more swap lines remain, not "at most 7" (`claim.md:82-83`); 16−9 = 7 uses the printed-line count, not the cap counter.
+Secondary: "contextstored 186" has no grep in the attachments, and 124+186 ≠ 966, so the census is incomplete → INSUFFICIENT.
+
+## 6. K5 — "whether backboardd dispatches at all"
+**SURVIVES**, but only as an honest UNKNOWN: nothing in the three files contradicts it, and the 16 KiB/drop=0 premise is sourced solely to the patch's own header (`patch:4-6`); the 514×236 = 121,304 B = 118.46 KiB = 7.40× recomputes correctly.
+Note the negative-branch list omits one live case: `addEventSource` failing leaves no diagnostic at all (`patch:84-86`).
+
+## 7. FALSIFIER
+**WEAK.** "No `SWEET HID: swipe` line at all = the timer never fired" is over-broad: a failed `addEventSource` or a zero/unparsed `pratouchswipe` also produce silence and are indistinguishable, because the arming block logs nothing on failure.
+And "a burst of new `SWEET FB: swap` lines" is bounded by the counter at 13/16 (see K4), with null-surface draws spending budget without printing.
+
+## 8. Donor comparison
+**WEAK.** `cmp rc=0` on the two 0058 patch files is properly captured (`evidence-0196.md:87-91`), but the inference "the code that delivers working touch on the A5 board" is not in the attachments, and the same paragraph admits 0193/0194 changed geometry constants *in that file* — byte-identical patches do not make the two post-0195 sources identical.
+
+## 9. Prior-art check
+**WEAK.** The four ring61 counts are verified (7/0/0/0, `evidence-0196.md:97-104`), but every other leg — `0049:9`, `0060`, the `0161` quote, `HANDOFF_2026-11-20`, `mkiosroot.sh:225` — lives outside the attachments → INSUFFICIENT for each; "samples 0 through 6" is also an inference from a count of 7.
+
+VERDICT: 2 refuted / 6 weak / 1 survive
