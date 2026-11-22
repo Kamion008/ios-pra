@@ -198,8 +198,14 @@ decisive signals are the screen on return and AKS sel 9/12, not swaps.
   re-arm-from-action precedent (432), `PE_parse_boot_argn` precedent,
   all eight moves logged with a distinct `release` line, swap-log cap and
   AKS format/census, "5 px above the last row".
-- Round 4: run on this text and the final patch; verdict in
-  `work/0196-review.txt` (appended).
+- Round 4 (`work/0196-review.txt`, appended): 2 refuted / 6 weak / 1
+  survive. Refuted: the header still said 86 added lines (hunk 4 is
+  +45, total 84; corrected in the claim and section 1 here) and the K4
+  swap-signal framing (the printed counter is at 13/16, so at most 3
+  more lines; swaps are a bonus, their absence is not failure). Weak
+  items fixed: the latch guard is now quoted in section 3, the
+  sampler-spacing assumption is gone, and the silent addEventSource
+  failure is called out in K5/falsifier.
 
 ## 9. What T20 must show
 

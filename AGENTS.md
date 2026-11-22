@@ -4,7 +4,7 @@
 Goal: boot the iPhone X iOS 16.7.16 userland on a Huawei PRA-LX1 (Kirin 655 /
 hi6250) via the Android boot image → EL1 loader (`shim/pra`) → a ported XNU
 (xnu-8796.141.3). Donor tree: `ios-galaxy-s8` (SWEET/A5XELTE).
-READ FIRST: the latest `HANDOFF_*.md` (currently `HANDOFF_2026-11-18.md`) — the
+READ FIRST: the latest `HANDOFF_*.md` (currently `HANDOFF_2026-11-22.md`) — the
 single source of truth for status, verified facts, refuted theories and the
 do-not-do list. This file holds stable mechanics only.
 
