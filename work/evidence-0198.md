@@ -21,10 +21,33 @@ check rc=0
 apply rc=0
 cmp rc=0
 ```
-`git apply --check` is recorded but is NOT proof — AGENTS.md:44-49: local git
-2.56 skip-detects an already-applied patch at rc=0. The GNU dry run, the real
-apply and the byte compare are the three real legs; both `cmp`s compare against
-the same durable post file, which is what makes the legs byte-level.
+`git apply --check` is recorded, and for THIS patch it is a discriminating pass,
+not a skip: on a tree where 0198 is already applied, the same command fails
+loudly. Re-run 2026-11-22 in `/tmp/v0198rev` (a `git init` tree whose one commit
+seeds `work/0198/SweetHID-pre0198.cpp`), after the clean-tree pass above:
+```
+$ git --version; patch --version | head -1
+git version 2.56.1
+GNU patch 2.8.1
+$ cd /tmp/v0198rev && git apply --check -p1 /home/kamion008/Ai/ios/ios-pra/xnu/patches/0198-pra-power-key-control.patch; echo "git check already-applied rc=$?"
+error: patch failed: iokit/Kernel/arm/hid/SweetHID.cpp:343
+error: iokit/Kernel/arm/hid/SweetHID.cpp: patch does not apply
+git check already-applied rc=1
+$ patch -p1 --fuzz=0 --dry-run < /home/kamion008/Ai/ios/ios-pra/xnu/patches/0198-pra-power-key-control.patch; echo "gnu dry-run already-applied rc=$?"
+checking file iokit/Kernel/arm/hid/SweetHID.cpp
+Reversed (or previously applied) patch detected!  Assume -R? [n] 
+Apply anyway? [n] 
+Skipping patch.
+4 out of 4 hunks ignored
+gnu dry-run already-applied rc=1
+```
+So AGENTS.md:44-49's skip-detect warning (`git apply --check` passing on an
+already-applied tree) is a REAL general rule that did NOT bite this diff: both
+legs return rc=1 with a diagnostic when the patch is already there, which means
+the rc=0 recorded above really did apply against a clean tree. Both versions of
+the GNU dry run, the real apply and the byte compare stay the primary legs; the
+`cmp`s compare against the same durable post file, which is what makes the legs
+byte-level.
 
 ## 2. Diff recount (awk over the patch)
 
@@ -50,13 +73,63 @@ $ sed -n '323,326p' .github/workflows/xnu.yml; grep -n "0198" .github/workflows/
 324:          # 0198 non-digitizer power-key control guard: the delayed consumer
 ```
 `SWEET HID: powerkey` occurs 4x in the post file (post:489, 509, 519, 521), so
-`strings -a` finds it in any kernel built with the patch; CI run 45055479729 on
-89d95c6 (`work/ci-0198.log`) shows the Build step completed without a failure
-tail, i.e. the assert ran and passed. Caveat, VERIFIED by the second grep:
-"0198" appears in the workflow ONLY at that comment — the apply-phase greps
-(xnu.yml:107-147) stop at 0196 and the skip regex (:150) names patches through
-0196, so a silently skipped 0198 would not trip the skip detector; it trips this
-marker assert instead (string absent).
+`strings -a` finds it in any kernel built with the patch.
+
+STEP ATTRIBUTION, CORRECTED: the marker asserts are NOT in the Build step. They
+run in the step named "Verify PRA preemption diagnostics are linked"
+(xnu.yml:188, body 188-343; the 0198 assert is `:326`, the 0199
+`powerkey arm secs=` assert `:329`), while "Build" is xnu.yml:91-151 and ends
+with the skip detector at `:150`. Evidence, the actual greps of the workflow:
+```
+$ grep -n "name: Build\|name: Verify PRA preemption diagnostics are linked\|name: Check for ARMv8.1" .github/workflows/xnu.yml
+91:      - name: Build
+188:      - name: Verify PRA preemption diagnostics are linked
+344:      - name: Check for ARMv8.1 LSE instructions (Cortex-A53 has none)
+$ grep -n "0198" .github/workflows/xnu.yml
+324:          # 0198 non-digitizer power-key control guard: the delayed consumer
+$ grep -n "0196 never entered\|Skipping patch" .github/workflows/xnu.yml | cut -c1-58
+147:            || { echo "0196 never entered the apply phase";
+150:          ! grep -E "Skipping patch .*(0176-pra-emmc|0
+```
+(both lines `cut` at 58 columns: :150's regex continues through
+`0196-pra-touch)` on the same line — no patch later than 0196 is named in it.)
+DIRECT PROOF that the format strings are in a built kernel (not an inference
+from a green step list), taken from the FLASHED T21a image: its payload is the
+CI kernel 82012c03, decompressed with `tools/pra_package.sh:79-84`'s own recipe
+(gzip at image offset 0x800):
+```
+$ python3 -c 'import gzip;d=open("out/pra-0198-t21.img","rb").read();open("/tmp/t21a_payload.bin","wb").write(gzip.decompress(d[0x800:]))' && strings -a /tmp/t21a_payload.bin | grep -F 'SWEET HID: powerkey'; echo "rc=$?"
+SWEET HID: powerkey arm secs=%u err=%u armed=%d clients=%u
+SWEET HID: powerkey %u down (interval %u s) usage 0x%x
+SWEET HID: powerkey %u up
+SWEET HID: powerkey done
+rc=0
+```
+Four format strings, and the arm one is the 0198 form (`secs=%u err=%u`, no
+0199 `every=%u`) — so this also proves the T21a kernel carries 0198 only. The
+same thing in its literally requested form,
+`strings -a out/ci/kernel.development.pra | grep -F 'SWEET HID: powerkey'`,
+was also run on the 2026-11-22 20:19 build of `out/ci` (sha256
+`4ebc18bb65528a4fd5b50ad0ee13d8711e99f3cd6ba94e4e72b39782bdd99c3f`, 17,224,552 B):
+```
+$ strings -a out/ci/kernel.development.pra | grep -F 'SWEET HID: powerkey'; echo "rc=$?"
+SWEET HID: powerkey arm secs=%u every=%u err=%u armed=%d clients=%u
+SWEET HID: powerkey %u down (interval %u s) usage 0x%x
+SWEET HID: powerkey %u up
+SWEET HID: powerkey done
+rc=0
+```
+that build is post-0199 (the `every=%u` field). That `out/ci` was rebuilt and
+emptied by a concurrent session at 20:27, so the file is no longer on disk —
+re-run this against a fresh artifact; the image proof above is the durable one.
+Caveat, VERIFIED by the second grep: "0198" appears in the workflow ONLY at that
+comment — the apply-phase greps (xnu.yml:107-147) stop at 0196 and the skip regex
+(:150) names patches through 0196, so a silently skipped 0198 would not trip the
+skip detector; it trips this marker assert instead (string absent). Note the 0198
+marker is a SUBSTRING of 0199's (`SWEET HID: powerkey` is contained in
+`SWEET HID: powerkey arm secs=`), so the 0198 assert stays green for every later
+build; 0200 adds no string and its only guard is the 0199 assert plus the
+apply-phase grep (xnu.yml:330-333).
 
 ## 4. Arithmetic (python3, quoted)
 
@@ -118,11 +191,107 @@ returns at :113-115 printing `A5XELTE KEYS: disabled` before mapping ALIVE, so
 no pin is polled and `sweet_hid_key()` (:94) is never reached here.
 `sweet_keys.c` is the PM6150L variant under `ARM64_BOARD_CONFIG_SWEET` (:7)
 with no call site on this board. That early print is lost
-(`grep -c "A5XELTE KEYS" work/ring62-full.txt` → `0`), the same class of loss as
-`start()`'s own lines — which is why 0198 reports its arm from a 30 s timer
-(post:457-460, 485-492). The service client is open and the queue mapped early
-(ring62:996-997), so `clients=1` is the expected steady state and `(0 clients)`
-on a key line means that press beat backboardd's map. The `a5fb_keep_on=1`
-default (tools/pra_package.sh, and T20's cmdline — one hit in ring62) sends the
-sleep request to `SweetFramebuffer.cpp:628-630`, i.e. `A5XELTE FB: display-off
-request ignored (keep_on)` instead of `SWEET FB: display off`.
+(`grep -c "A5XELTE KEYS" work/ring62-full.txt` → `0`), the same class of loss that
+swallowed 0198/0199's arm report (§7). The service client is open and the queue
+mapped early (ring62:996-997), so `clients=1` is the expected steady state and
+`(0 clients)` on a key line means that press beat backboardd's map.
+
+K7, CORRECTED — the `a5fb_keep_on=1` default (tools/pra_package.sh, and T20's
+cmdline, one hit in ring62) does route a sleep request to
+`SweetFramebuffer.cpp:628-630`, i.e. to `A5XELTE FB: display-off request ignored
+(keep_on)` instead of `SWEET FB: display off` — but that line is BASELINE NOISE,
+not a positive. It fires on boots with NO key event anywhere in them:
+```
+$ for f in ring34 ring52-fresh ring53-fresh ring54-fresh ring55-full ring56-full ring57-full ring58-full ring59-full ring61-true ring62-full ring63-full; do printf "%-14s %s\n" "$f" "$(grep -c 'display-off request ignored' work/$f.txt)"; done
+ring34         2
+ring52-fresh   2
+ring53-fresh   3
+ring54-fresh   2
+ring55-full    2
+ring56-full    1
+ring57-full    2
+ring58-full    2
+ring59-full    1
+ring61-true    2
+ring62-full    2
+ring63-full    2
+```
+(`work/ring61-full.txt` reads 0 only because it is the 515-line short pull, not
+because that boot was clean.) `work/ring34-notes.md:22` already named it:
+`"A5XELTE FB: display-off request ignored (keep_on)" x2 — the idle display-off IS
+ignored for the panel`, on the wedge boot that carried no key event at all. In
+ring63 the two hits are :1782 and :2634 — after the power pair and ~1000 lines
+after `powerkey done` (:1629) — so neither is adjacent to a press. Under the
+default `a5fb_keep_on=1` the ring therefore carries NO event-attributable display
+signal; the positive is the user's visual report, or a baseline-count INCREASE
+(3 where this boot showed 1-2) landing temporally adjacent to a press.
+
+## 7. ring63: the arm line never landed, and which queue is which
+
+(1) THE ARM REPORT IS ABSENT from the text dump AND from the raw image, so it was
+never emitted (not truncated):
+```
+$ grep -c "arm secs" work/ring63-full.txt; echo "grep rc=$?"; strings -a work/ring63.raw | grep -c "arm secs"; echo "strings|grep rc=$?"
+0
+grep rc=1
+0
+strings|grep rc=1
+```
+0198/0199 armed that report 30 s after `SweetHIDButtons::start()` and `start()`
+sits ~5 s into the boot (INFERRED — 0200's estimate; nothing in the ring dates
+it), so it fired at ~+35 s, before IOLog reaches the ring (`buttons registered`
+→ 0 hits in ring61/ring62/ring63). What the failure leaves open is `fKeyErr`
+2/3/4: unobservable, so a boot with no key lines stays as ambiguous as T20's.
+0200 (`xnu/patches/0200-pra-power-key-arm-report.patch`, commit aa18a99) re-times
+the report to `prapowerkey` seconds and redefines `armed=` as "allocated AND
+`err == 0`"; the arm line is expected in ring64, not ring63.
+
+(2) TWO SERVICES, TWO QUEUES. The `queue stats` line carries no service name, so
+attribution rests on the two `queue mapped by` lines plus the senderID stamped by
+`dispatchEvent` (`event->setSenderID(getRegistryEntryID())`, post:210):
+```
+$ grep -n "queue mapped by\|SweetHIDButtons open\|sender=" work/ring63-full.txt
+1017:SWEET HID: queue mapped by SweetHIDTouch
+1020:SWEET HID: event size=236 sender=0x100000128
+1030:SWEET HID: SweetHIDButtons open by IOHIDEventServiceUserClient -> 1
+1031:SWEET HID: queue mapped by SweetHIDButtons
+1123:SWEET HID: event size=60 sender=0x100000127
+1625:SWEET HID: event size=60 sender=0x100000127
+2537:SWEET HID: event size=236 sender=0x100000128
+2547:SWEET HID: event size=236 sender=0x100000128
+2551:SWEET HID: event size=236 sender=0x100000128
+```
+`0x100000127` rides every 60 B key event and `0x100000128` every 236 B digitizer
+event. Each service's user client owns its OWN queue and its OWN counters
+(`kQueueSizeMax` 16384, IOHIDEventServiceUserClient.cpp:38, :265; `_queue`/
+`_eventCount`/`_droppedEventCount` are that class's members, .h:59-67), so a key
+press is counted in SweetHIDButtons' 16 KiB queue — never in the digitizer's:
+
+```
+$ grep -n "queue stats" work/ring63-full.txt
+1021:SWEET HID: queue stats enq=0 drop=0 type=0 head=0 tail=0
+1124:SWEET HID: queue stats enq=0 drop=0 type=0 head=0 tail=0
+1626:SWEET HID: queue stats enq=2 drop=0 type=3 head=128 tail=128
+2538:SWEET HID: queue stats enq=2 drop=0 type=11 head=480 tail=480
+2548:SWEET HID: queue stats enq=26 drop=0 type=11 head=6240 tail=6240
+2552:SWEET HID: queue stats enq=94 drop=0 type=11 head=6240 tail=6240
+2864:SWEET HID: queue stats enq=110 drop=0 type=11 head=10080 tail=10080
+2879:SWEET HID: queue stats enq=113 drop=0 type=11 head=10800 tail=10800
+3195:SWEET HID: queue stats enq=115 drop=0 type=11 head=11280 tail=11280
+3200:SWEET HID: queue stats enq=166 drop=0 type=11 head=7200 tail=7200
+3213:SWEET HID: queue stats enq=231 drop=0 type=11 head=6480 tail=6480
+3219:SWEET HID: queue stats enq=272 drop=0 type=11 head=16320 tail=16320
+3222:SWEET HID: queue stats enq=280 drop=0 type=11 head=1920 tail=1920
+```
+The two button-queue lines are :1124 (all zeros: the first print for THAT queue,
+taken before the down event is counted) and :1626 (`enq=2` = the pair, `type=3` =
+keyboard, IOHIDEventTypes.h:94, `head=tail` = drained). The key-pair charge is
+`2*(60+4)` per pair = 128 B, i.e. 64 B per event, which is exactly `head=128`:
+```
+$ python3 -c 'print(2*(60+4), 128//64, 64*2)'
+128 2 128
+```
+Everything from :2538 on (`type=11`, `head` in 240 B strides) is the TOUCH queue
+and says nothing about the key pair — the earlier `enq=2 ... type=11 head=480`
+reading was the digitizer service's queue, which is also why "subtract the
+selftest's +2" was wrong: that +2 lands in a different queue's counters.
