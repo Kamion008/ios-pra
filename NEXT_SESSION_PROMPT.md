@@ -7,115 +7,149 @@ proven; the UI ignores every touch. You may change the kernel only -
 iPhone X userland stays unmodified.
 
 READ FIRST, IN THIS ORDER
-1. ios/ios-pra/HANDOFF_2026-11-22.md - the full state, the proven/refuted
-   list, the T20 design, the T20 OUTCOME section at the end and the T21
-   plan. It is the source of truth.
+1. ios/ios-pra/HANDOFF_2026-11-22b.md - THE source of truth and
+   self-contained: the proven/refuted lists, the T20 outcome, the T20
+   confound, the three-branch blocker, and the full T21 design with code
+   anchors. Read it before anything else; do not rely on older handoffs.
 2. ios/ios-pra/AGENTS.md - build/flash/log mechanics, patch hygiene, the
    arithmetic rule, safety rules.
-3. ios/ios-pra/work/claim-0197.md and work/evidence-0197.md - what T20
-   proved, what it refuted, and the confound that makes T20 swipe-only.
-   Background: work/claim-0196.md (the swipe patch), work/0196-review.txt.
+3. ios/ios-pra/work/claim-0197.md + work/evidence-0197.md - what the T20
+   ring proved, refuted and left open; work/ring62-decode.md is the raw
+   tabulation.
+4. Context only: work/claim-0196.md, work/evidence-0196.md,
+   work/0196-review.txt (the swipe patch; do NOT re-run it).
 
-WHERE THINGS STAND (T20 IS DECODED - BRANCH 2)
-T20 booted 0196, the synthetic bottom-edge unlock swipe, and ring62 was
-pulled from TWRP and decoded. All three gestures fired exactly as designed
-(540,1914 down -> 8 moves -> 540,714 up), the control fired first (raw
-2000,3000 -> 1079,1919 edge), the queue drained every event (head==tail
-4/4, drop=0, exactly one 236 B event per touch() call), and NOTHING
-accepted it: SpringBoard AKS sel 9 = 0 and sel 12 = 0, exactly the ring61
-baseline, and the user reports the lock screen unchanged. T20 is NOT a
-pass and NOT a fail - it is decode-ladder branch 2, "delivered, not
-visibly accepted".
+WHERE THINGS STAND
+T20 decoded to decode-ladder BRANCH 2: the synthetic bottom-edge swipe was
+DELIVERED and NOT VISIBLY ACCEPTED. Not a pass, not a fail, and touch does
+not work. The three swipes fired exactly as designed (start 540,1914, then
+move 1/8..8/8 with the 150 px ladder, release 540,714; 31 swipe lines) and
+the control fired first (`selftest raw 2000,3000` -> `touch 0 down/up at
+1079,1919 edge`). Delivery held: queue enq 0 -> 2 -> 12 -> 22, drop=0,
+head==tail, exactly one 236 B event per touch() call. Acceptance did not
+happen: SpringBoard AKS sel 9 = 0 and sel 12 = 0 (identical to the ring61
+baseline) and the user reports the lock screen unchanged. SpringBoard was
+alive throughout (it created five more surfaces after swipe 1).
 
 THE CONFOUND YOU MUST NOT REPEAT: T20's cmdline carried
 `pratouchswipe=420 pratouchselftest=1 pratouchdbg=1` but NOT `pratouch=1`
-and NOT `pratouchreset=1` (T19 had both). So the touch IC was never
-brought up this boot and the user's own taps during T20 were no-ops by
-construction. The swipe still fired because 0196 arms its timer
-unconditionally in SweetHIDTouch::start(), while `pratouch` is parsed only
-in the 0172 probe. Restore both args in every touch boot.
+and NOT `pratouchreset=1`. The touch IC was therefore never brought up
+(0 `PRA touch` lines vs 104 in ring61) and the user's own taps during T20
+were no-ops by construction - only the synthetic swipes count. The swipe
+still fired because 0196 arms its timer unconditionally in
+SweetHIDTouch::start(). Every touch boot must pass `pratouch=1
+pratouchreset=1`.
 
-THE OPEN QUESTION (unchanged, three branches)
-Where the digitizer stream dies downstream of a proven-good queue:
-(i) the gesture is rejected at the HID layer (event shape / flags),
-(ii) backboardd's HIDEventSystem drops it before dispatch,
-(iii) backboardd dispatches and SpringBoard never accepts it.
-A negative swipe does not separate these. T20 did not try to.
+THE ANSWERED SIDE QUESTION: the 236 B event vs 240 B queue stride is NOT a
+discrepancy - each queue entry is a 4 B header plus the event
+(`DATA_QUEUE_ENTRY_HEADER_SIZE` = sizeof(IODataQueueEntry) - 4 = 4). Do
+not re-open it.
 
-NEXT ACTION = T21, THE NON-DIGITIZER CONTROL (one kernel-side patch)
-Add a boot arg (suggested `pratouchbtn=N`) that fires ONE synthetic power
-(consumer page) key down+up N seconds after the touch service starts,
-through SweetHIDButtons' own enqueue path - the queue backboardd already
-maps and arms (`queue mapped` / `notify armed by SweetHIDButtons` x2 in
-every touch-era ring). This is the cheapest possible separator:
-- The display turns off / the lock state changes: HID -> backboardd ->
-  SpringBoard IPC WORKS. The defect is then the digitizer event shape or
-  the digitizer client's registration -> log the event fields backboardd
-  receives and compare them with the 0058 donor stream (byte-identical
-  code that drives SpringBoard on A5XELTE).
-- Nothing at all happens: the failure is generic to this port, not
-  touch-specific -> branch (iii), and the next probe is the mach IPC
-  boundary between backboardd and SpringBoard.
-Bundle in the same boot, at no extra cost: `pratouch=1 pratouchreset=1`
-(finger path live, confound gone) and `sweetsample` aimed at SpringBoard
-(or backboardd) instead of Setup - the sampler has NEVER been aimed at
-either process on this phone, and that is still UNTRIED.
-Do NOT re-run the T20 swipe as-is. If a digitizer retry is wanted, change
-the shape or the timing deliberately and say why in the claim.
+THE OPEN QUESTION: three branches, unseparated - (a) the gesture is
+rejected at the HID layer, (b) backboardd's HIDEventSystem drops it before
+dispatch, (c) backboardd dispatches and SpringBoard never accepts it. A
+negative swipe cannot tell them apart, which is why T20 is branch 2 and not
+a verdict.
 
-FACTS YOU CAN RELY ON (do not re-derive)
-- T21 MECHANICS ARE ALREADY SOURCE-READ (claim-0197 K11/K12), do not spend
-a session rediscovering them: `SweetHIDButtons::key()` takes
-`(usage, down)`, builds `IOHIDEvent::keyboardEvent(..., kHIDPage_Consumer,
-usage, down)` and calls `dispatchEvent`; there is no finger slot, no latch
-and no PMIC/key-driver dependency, and the registered instance is reachable
-as `gSweetButtons` (`sweet_hid_key()` already maps index 0 to
-`kHIDUsage_Csmr_Power` = 0x30). A press should log `SWEET HID: key 0x30
-down (1 clients)` and `SWEET HID: event size=60`; a down+up pair costs
-128 B of the 16,384 B queue (60 + 4 B entry header = 64 per entry).
-- The sampler needs NO patch: it takes a COMMA LIST and its built-in
-default is already "SpringBoard,backboardd"; the PRA cmdline simply
-overrides it with `sweetsample=Setup`, which never runs. Drop that arg (or
-set it explicitly) and the target becomes SpringBoard/backboardd. Match is
-exact case-sensitive `p_comm` equality truncated at 16 chars (both names
-fit); first sample at 90 s, then every 120 s, up to 90 samples. A missing
-`SMP SpringBoard[` line then means the process was not alive at a sample
-instant, not that the sampler failed.
-- The 236 B vs 240 B queue stride is NOT a mystery: each entry is a 4 B
-header plus the event (`DATA_QUEUE_ENTRY_HEADER_SIZE` =
-`sizeof(IODataQueueEntry) - 4` = 4, IODataQueueShared.h:79).
-- 0195/T19 proved the clamp at runtime: `selftest raw 2000,3000` ->
-  `touch 0 down/up at 1079,1919 edge`; 579 reports, 2.8% read errors,
-  36 in-bounds transitions over 840 s. T20 reproduced the clamp on a
-  second boot (ring62:980-983).
-- 0192/T16 proved delivery: 236 B events, senderID nonzero, head==tail at
-  22/22 samples, 641 events = 151,276 B through a 16,384 B queue (9.2x),
-  drop=0. T20 re-proved it with a synthetic source (enq 0/2/12/22,
-  head==tail 4/4).
-- One touch() call = one event, no coalescing (ring62 enq deltas +10 per
-  swipe run of 10 calls).
-- The senderID is per-boot registration order, NOT a signal: ring61 and
-  ring62 both log 0x100000131; T16 logged 0x100000126 (delta 11).
-- SpringBoard was alive across the T20 swipe window: the lock screen was
-  presented at line 1135 and SpringBoard created five more surfaces after
-  swipe 1 (ids 4-6 @2291-2294, ids 7-9 @2431-2433).
-- AKS sel 9/12 are absent from BOTH rings, so they are not an acceptance
-  signal: with a working port they may never be the right observable.
-- Swap lines cannot count frames: the 0046 log caps at 16
-  (`if (sweet_fb_swaps_logged < 16)`) and skips masked/null-surface draws;
-  ring62 printed 8 lines with counters reaching 15. Absent swaps after a
-  static-frame gesture is NOT failure.
-- AKS sel-8 was exonerated in T16. sweetiolog is compiled only for SWEET
-  and sweet_keys_init only runs from 0060's sweet_ufs probe, which never
-  attaches on this eMMC phone - both still produce zero lines.
+FIRST ACTION
+Run `adb devices`. If the PRA-LX1 is in TWRP, it is where it should be -
+ring62 is already banked, so nothing is at risk, but pull any newer ring
+before booting (every XNU boot overwrites the ring). If it is not in TWRP,
+ask the user (1) what the screen shows and (2) to return it to TWRP
+without booting XNU. Do not flash or boot before T21's image exists.
+
+T21 = THE NON-DIGITIZER CONTROL (the next boot, patch 0198)
+Add ONE boot arg that fires one synthetic POWER (consumer page) key
+down+up through SweetHIDButtons' own service - the queue backboardd
+already maps and arms. `SweetHIDButtons::key(usage, down)` builds
+`IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer,
+usage, down)` and dispatches it; there is no latch, no finger slot and no
+PMIC dependency, and the registered instance is reachable as
+`gSweetButtons` (`sweet_hid_key()` already maps index 0 to
+kHIDUsage_Csmr_Power = 0x30). Copy 0196's timer pattern exactly: arm an
+IOTimerEventSource in start() behind the arg, log the interval at the
+first fire, run the callback on _hidWorkLoop, initialise the timer state
+explicitly, and make the arming block FAIL LOUDLY on parse/addEventSource
+failure (0196's silence is why "no line" was ambiguous in T20).
+
+THE LADDER (state it as a branch, never as a pass/fail):
+- Key enqueued + drained AND a visible display change: a non-digitizer HID
+  event IS accepted end to end -> the defect is digitizer-specific, and
+  the live branches become (a)/(b)-narrow for the digitizer.
+- Key enqueued + drained and nothing visible: branch 2 again, now proven
+  NON-digitizer-specific - the drop is at the queue -> dispatch boundary
+  for every event type.
+- Key never enqueued: a patch bug, not a finding - fix and reflash.
+- `pratouch=1` present but 0 `PRA touch` lines: the IC path regressed;
+  report it as a separate finding.
+A positive is decisive; a negative is weaker (iOS may not map our usage
+value to sleep/wake), so record it that way and consider adding a
+volume-key press (visible HUD) as a hedge in the same boot.
+
+BUNDLE IN THE SAME BOOT (no extra cost)
+- `pratouch=1 pratouchreset=1 pratouchdbg=1` restored (IC live, confound
+  gone), `pratouchselftest=1` kept as the queue-alive control, and NO
+  `pratouchswipe`.
+- The sampler aimed at SpringBoard/backboardd - this needs NO patch: the
+  arg already takes a comma list and its built-in default is
+  "SpringBoard,backboardd"; the PRA cmdline overrides it with
+  `sweetsample=Setup`, a process that never runs, which is why no ring has
+  ever carried an `SMP <name>[pid]` line. Drop or change that arg.
+- Expected positive markers: `SWEET HID: key 0x30 down/up (1 clients)` and
+  `SWEET HID: event size=60`; a press+release pair costs 128 B of the
+  16,384 B queue. A press before the queue is mapped still logs
+  `(0 clients)` - use it as the arming health check.
+
+DECODE (greps; the ring procedure is in the handoff)
+Pull the new ring from TWRP BEFORE any boot, then
+`cmp work/ring62.raw work/ring63.raw` (must differ = a real new boot), and
+look for the key lines above, a display off/on transition, new surface or
+swap activity, `^SMP ` samples, AKS sel 9/12, and `PRA touch` (the IC path
+must be back - 0 lines means the cmdline regressed again).
+The ring header is sometimes stale: trust the decoded text and the NUL
+end, not the header total. The swap log is capped at 16 entries and skips
+masked surfaces - it is never a frame count and its absence is never a
+failure signal.
+
+DO NOT REDO
+- Do not re-run the bottom-edge swipe (0196/T20): delivered, not accepted,
+  a repeat adds nothing.
+- Do not treat the senderID as a signal (ring61 and ring62 both log
+  0x100000131) or read frames from swap lines.
+- Do not boot without `pratouch=1 pratouchreset=1` and then claim anything
+  about touch or tap.
+- Do not count `SWEET HID: touch` lines as contacts (only transitions log;
+  the queue counter is the volume) and do not claim swipe lines prove
+  backboardd dispatched - drain proves userland READ the queue.
+- Do not re-open the 4 B/queue-stride question; it is the entry header.
+- "-1,-1 was a linkage bug": no, it was the uninitialized panel clamp
+  (T17), fixed by 0194, proven by 0195 and reproduced in ring62.
+- "AKS sel-8 is the blocker": exonerated in T16, still background churn.
+- "sweetiolog / sweet_keys_init will trace it": both dead on this eMMC
+  phone (0049 board gate; 0161's sweet_ufs probe never attaches).
+- "Boot a setup-complete root to bypass the lock screen": not a
+  discriminator - such a phone still boots to the lock screen.
+- "The display woke after swipe 2": no, the touch-free ring61 has the same
+  `display on` / `sel 79` / `swap 6` triple.
+
+FACTS YOU CAN RELY ON
+- The IC is in app mode (32 B descriptor hdr=0x20 bcd=0x100, input reg 0x3)
+  and 0194's clamp is effective at runtime (2000,3000 -> 1079,1919).
+- backboardd maps both queues, arms both wake-ups, drains them (T16:
+  641 events = 151,276 B through 16,384 B, drop=0; T20: head==tail).
+- One touch() call = one 236 B event, no coalescing.
+- The donor's `0058-sweet-hid-event-services.patch` is byte-identical to
+  the PRA's, so the event-construction code is the code that drives
+  SpringBoard on the A5 board.
+- Git head at handoff 927c84e; CI 45050754773 SUCCESS on ad66e4c with 0
+  patch skips and the `SWEET HID: swipe` strings assert passing.
 
 RULES
 - Flash only p27 via tools/pra_flash_skip.sh, readback-verified; blanket
   approval exists for that exact command. Never boot without
   pralog=1 praloglba=794623.
-- Serials via the PRA_SERIAL env only; never write a serial into git.
-- Never commit raw rings (work/ringNNN.raw, *-full.txt) - the decode and
-  the claim/evidence are the durable artifacts.
+- Serials via the PRA_SERIAL env only; never write a serial into git; never
+  commit raw rings (work/ringNNN.raw, *-full.txt).
 - Every durable calculation via python3/bc with the output quoted; label
   claims VERIFIED / INFERRED / UNKNOWN.
 - Three-way patch verify (GNU patch --fuzz=0, git apply, byte cmp), one
@@ -123,17 +157,18 @@ RULES
 - Review new patches with
   MODEL='opencode/deepseek-v4.1-flash-free#high' PROMPT=work/validator-prompt.md \
   bash /home/kamion008/Ai/review.sh <claim> <evidence> <patch>
-  and fix every refuted finding. For anything touching the latch/state
-  machine or Apple-private routing, escalate rather than guess.
+  and fix every refuted finding; escalate anything touching the latch/state
+  machine or Apple-private routing rather than guessing.
 - Commit subject `pra: ...`, no AI footer; push master and trigger CI.
 - Do not commit work/ci*/ , work/pkt-* or shim/pra/out* artifacts.
 
 DELIVERABLE
-Build and land 0197 (the non-digitizer control) with three-way verify, a
-yml marker assert and a review round; package and flash p27; boot with
-`pratouch=1 pratouchreset=1 pratouchdbg=1 pratouchselftest=1 pratouchbtn=N`
-plus the sampler aimed at SpringBoard; pull the ring from TWRP BEFORE any
-next boot; decode whether the power key produced a visible reaction; then
-update work/boots.md (T21 row), the handoff, claim/evidence-0198, rewrite
-this prompt for the next session, commit, push, trigger CI, and report
-exactly what the ring showed and what remains unproven.
+Land 0198 with three-way verify, one yml marker assert and a review round;
+package and flash p27; boot with `pratouch=1 pratouchreset=1 pratouchdbg=1
+pratouchselftest=1` plus the new power-key arg and the sampler aimed at
+SpringBoard/backboardd; pull the ring from TWRP BEFORE any next boot;
+decode whether the non-digitizer event was accepted; then update
+work/boots.md (T21 row), write the next handoff, update claim/evidence,
+rewrite this prompt, commit, push, trigger CI, and report exactly what the
+ring showed and what remains unproven - as a branch, never as a pass or a
+fail unless the display demonstrably changed.
