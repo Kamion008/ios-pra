@@ -1,0 +1,121 @@
+pra: 0199 - repeat the power-key control every prakeyevery=M seconds
+
+0198's single-shot consumer-control pair could not be observed on the device.
+Boot ring63 shows the N=300 press landing roughly five minutes after
+power-on, while this port needs >=10 minutes before the lock screen exists,
+so both presses were spent on a screen with nothing to answer them.
+`prakeyevery=M` switches the same timer into repeat mode: after the first
+pair at `prapowerkey=N`, it fires one pair every M seconds, alternating the
+usage every run (0x30 power, 0xe9 volume-up, 0x30, ...), up to
+SWEET_KEY_MAX_PAIRS=240 pairs. At M=30 that is `python3 -c 'print(240*30)'`
+= 7200 s = `python3 -c 'print(240*30/3600)'` = 2.0 hours of coverage, and 240
+pairs of ~8 log lines = `python3 -c 'print(240*8)'` = 1920 lines, which the
+4 MiB pralog ring keeps with room to spare. Without prakeyevery the
+behaviour is 0198's exactly: two pairs, 120 s apart, then done. The arm line
+now carries `every=%u` so the mode is readable before the first press.
+
+FALSIFIER: expect `SWEET HID: powerkey arm secs=900 every=30 err=0 armed=1
+clients=1`, then the 0198 group - `SWEET HID: powerkey N down (interval 900
+s) usage 0x30`, `SWEET HID: key 0x30 down (N clients)`, `SWEET HID: event
+size=60`, `SWEET HID: key 0x30 up` - and 30 s later the same group with
+`usage 0xe9`, then `usage 0x30` again, repeating every 30 s until run 240.
+Alternating usages are the point: a power press must show as a display-off
+attempt and volume-up as a HUD, so one look at the screen has two chances per
+minute. The absence of the `powerkey %u down` group after the first pair, or
+a constant usage value, falsifies repeat mode; a negative visible response is
+still weaker than a positive because iOS may not map our usage values.
+
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -351,6 +351,7 @@
+ 	UInt32 fTestSecs;
+ 	UInt32 fTestCount;
+ 	UInt32 fKeySecs;
++	UInt32 fKeyEvery;
+ 	UInt32 fKeyRuns;
+ 	UInt32 fKeyStep;
+ 	UInt32 fKeyErr;
+@@ -384,6 +385,14 @@
+ #define SWEET_KEY_GAP_S 120
+ #define SWEET_KEY_REPORT_S 30
+ /*
++ * 0199: prakeyevery=M switches the control into repeat mode - one pair
++ * every M seconds instead of the single shot above, up to
++ * SWEET_KEY_MAX_PAIRS pairs (python3 'print(240*30)' = 7200 s = 2 h). The
++ * pralog ring is 4 MiB, so 240 pairs of ~8 log lines is ~1920 lines, which
++ * the ring keeps with room to spare.
++ */
++#define SWEET_KEY_MAX_PAIRS 240
++/*
+  * 0196: pratouchswipe=N injects the unlock gesture itself - a one-finger
+  * flick up from the bottom edge - N seconds after the touch service starts,
+  * then twice more 120 s apart. The down point is 6 px above the panel
+@@ -441,9 +450,15 @@
+ 	fKey = NULL;
+ 	fArm = NULL;
+ 	fKeySecs = 0;
++	fKeyEvery = 0;
+ 	fKeyRuns = 0;
+ 	fKeyStep = 0;
+ 	fKeyErr = 0;
++	/*
++	 * 0199: repeat mode is parsed unconditionally - it does not require
++	 * prapowerkey, so the interval is known even without a first press.
++	 */
++	PE_parse_boot_argn("prakeyevery", &fKeyEvery, sizeof(fKeyEvery));
+ 	if (PE_parse_boot_argn("prapowerkey", &fKeySecs, sizeof(fKeySecs)) && fKeySecs) {
+ 		fKey = IOTimerEventSource::timerEventSource(this, &SweetHIDButtons::keyFired);
+ 		if (!fKey) {
+@@ -486,14 +501,21 @@
+ {
+ 	SweetHIDButtons *self = (SweetHIDButtons *)owner;
+ 
+-	IOLog("SWEET HID: powerkey arm secs=%u err=%u armed=%d clients=%u\n",
+-	    self->fKeySecs, self->fKeyErr, self->fKey != NULL ? 1 : 0,
++	IOLog("SWEET HID: powerkey arm secs=%u every=%u err=%u armed=%d clients=%u\n",
++	    self->fKeySecs, self->fKeyEvery, self->fKeyErr,
++	    self->fKey != NULL ? 1 : 0,
+ 	    self->_clients ? self->_clients->getCount() : 0);
+ }
+ 
+ /*
+  * 0198: press once per firing, release 100 ms later, then repeat with
+  * volume-up after 120 s so the two consumer usages have visible controls.
++ * 0199: with prakeyevery=M the pair repeats every M s instead of stopping
++ * after two runs, and the usage alternates every run (power, volume, power,
++ * ...). Alternating matters because the usages are observed differently: a
++ * power request shows as a display-off attempt, volume-up as a HUD, so a
++ * 30 s interval gives the user two observable chances per minute at any
++ * moment they look at the screen.
+  */
+ void
+ SweetHIDButtons::keyFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -504,7 +526,7 @@
+ 	if (self->fKeyStep == 0) {
+ 		self->fKeyRuns++;
+ 		self->fKeyStep = 1;
+-		usage = self->fKeyRuns == 1 ? kHIDUsage_Csmr_Power :
++		usage = (self->fKeyRuns & 1) ? kHIDUsage_Csmr_Power :
+ 		    kHIDUsage_Csmr_VolumeIncrement;
+ 		IOLog("SWEET HID: powerkey %u down (interval %u s) usage 0x%x\n",
+ 		    self->fKeyRuns, self->fKeySecs, usage);
+@@ -512,16 +534,16 @@
+ 		sender->setTimeoutMS(SWEET_KEY_HOLD_MS);
+ 		return;
+ 	}
+-	usage = self->fKeyRuns == 1 ? kHIDUsage_Csmr_Power :
++	usage = (self->fKeyRuns & 1) ? kHIDUsage_Csmr_Power :
+ 	    kHIDUsage_Csmr_VolumeIncrement;
+ 	self->fKeyStep = 0;
+ 	self->key(usage, false);
+ 	IOLog("SWEET HID: powerkey %u up\n", self->fKeyRuns);
+-	if (self->fKeyRuns >= SWEET_KEY_PAIRS) {
++	if (self->fKeyRuns >= (self->fKeyEvery ? SWEET_KEY_MAX_PAIRS : SWEET_KEY_PAIRS)) {
+ 		IOLog("SWEET HID: powerkey done\n");
+ 		return;
+ 	}
+-	sender->setTimeoutMS(SWEET_KEY_GAP_S * 1000);
++	sender->setTimeoutMS(self->fKeyEvery ? self->fKeyEvery * 1000 : SWEET_KEY_GAP_S * 1000);
+ }
+ 
+ void
