@@ -321,6 +321,9 @@ jobs:
           # same touch() path; the lock screen is the only surface that must
           # answer it visibly).
           strings -a "$kernel" | grep -F 'SWEET HID: swipe' >/dev/null
+          # 0198 non-digitizer power-key control guard: the delayed consumer
+          # key pair and its arm report are present in the kernel.
+          strings -a "$kernel" | grep -F 'SWEET HID: powerkey' >/dev/null
           # 0184 bring-up guard: the IOMCU pulse + the vendor-polarity
           # reset + the LDO VSET writes (the stock-delta replication).
           strings -a "$kernel" | grep -F 'PRA touch: iomcu reset pulsed' >/dev/null

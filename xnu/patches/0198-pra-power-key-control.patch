@@ -1,0 +1,136 @@
+pra: 0198 - the power-key control (a non-digitizer HID event, no finger, no panel)
+
+T21 adds a non-digitizer control through SweetHIDButtons' consumer-control
+queue, which backboardd already maps and arms. `prapowerkey=N` schedules a
+POWER down/up pair after N seconds, then a volume-up pair 120 seconds later.
+Each press is held for 100 ms; the timer then stops after the second release.
+The pair costs 2*(60+4)=128 B of queue space (`python3 -c 'print(2*(60+4))'`
+outputs `128`).
+
+FALSIFIER: expect `SWEET HID: powerkey arm secs=N err=0 armed=1 clients=N`,
+`SWEET HID: powerkey 1 down (interval N s) usage 0x30`,
+`SWEET HID: key 0x30 down (N clients)`, `SWEET HID: event size=60`, and
+`SWEET HID: key 0x30 up`, then the volume pair 120 seconds later. A positive
+visible response decisively confirms the non-digitizer path; a negative is
+weaker because iOS may not map our usage value.
+
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -343,9 +343,17 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 1; }
+ private:
+ 	static void testFired(OSObject *owner, IOTimerEventSource *sender);
++	static void keyFired(OSObject *owner, IOTimerEventSource *sender);
++	static void armReport(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fTest;
++	IOTimerEventSource *fKey;
++	IOTimerEventSource *fArm;
+ 	UInt32 fTestSecs;
+ 	UInt32 fTestCount;
++	UInt32 fKeySecs;
++	UInt32 fKeyRuns;
++	UInt32 fKeyStep;
++	UInt32 fKeyErr;
+ };
+ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+ 
+@@ -364,6 +372,18 @@
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
+ /*
++ * 0198: prapowerkey=N injects a consumer-control POWER pair N seconds
++ * after the buttons service starts, then a volume-up pair 120 s later.
++ * This is the NON-digitizer control (T21): it uses the queue backboardd
++ * already maps and arms. key() has no finger slot, press latch, or PMIC
++ * dependency. A positive is decisive; a negative is weaker because iOS
++ * may not map our usage value.
++ */
++#define SWEET_KEY_HOLD_MS 100
++#define SWEET_KEY_PAIRS 2
++#define SWEET_KEY_GAP_S 120
++#define SWEET_KEY_REPORT_S 30
++/*
+  * 0196: pratouchswipe=N injects the unlock gesture itself - a one-finger
+  * flick up from the bottom edge - N seconds after the touch service starts,
+  * then twice more 120 s apart. The down point is 6 px above the panel
+@@ -418,6 +438,26 @@
+ 			fTest->setTimeoutMS(fTestSecs * 1000);
+ 		}
+ 	}
++	fKey = NULL;
++	fArm = NULL;
++	fKeySecs = 0;
++	fKeyRuns = 0;
++	fKeyStep = 0;
++	fKeyErr = 0;
++	if (PE_parse_boot_argn("prapowerkey", &fKeySecs, sizeof(fKeySecs)) && fKeySecs) {
++		fKey = IOTimerEventSource::timerEventSource(this, &SweetHIDButtons::keyFired);
++		if (!fKey) {
++			fKeyErr = 2;
++		} else if (_hidWorkLoop->addEventSource(fKey) != kIOReturnSuccess) {
++			fKeyErr = 3;
++		} else if (fKey->setTimeoutMS(fKeySecs * 1000) != kIOReturnSuccess) {
++			fKeyErr = 4;
++		}
++	}
++	fArm = IOTimerEventSource::timerEventSource(this, &SweetHIDButtons::armReport);
++	if (fArm && _hidWorkLoop->addEventSource(fArm) == kIOReturnSuccess) {
++		fArm->setTimeoutMS(SWEET_KEY_REPORT_S * 1000);
++	}
+ 	gSweetButtons = this;
+ 	registerService();
+ 	IOLog("SWEET HID: buttons registered (test every %u s)\n", fTestSecs);
+@@ -437,6 +477,53 @@
+ 	}
+ }
+ 
++/*
++ * 0198: report the boot-argument arm result after the pralog ring is alive.
++ * 0 err + armed=1 is the healthy arm; err 2/3/4 names which step failed.
++ */
++void
++SweetHIDButtons::armReport(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDButtons *self = (SweetHIDButtons *)owner;
++
++	IOLog("SWEET HID: powerkey arm secs=%u err=%u armed=%d clients=%u\n",
++	    self->fKeySecs, self->fKeyErr, self->fKey != NULL ? 1 : 0,
++	    self->_clients ? self->_clients->getCount() : 0);
++}
++
++/*
++ * 0198: press once per firing, release 100 ms later, then repeat with
++ * volume-up after 120 s so the two consumer usages have visible controls.
++ */
++void
++SweetHIDButtons::keyFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDButtons *self = (SweetHIDButtons *)owner;
++	UInt32 usage;
++
++	if (self->fKeyStep == 0) {
++		self->fKeyRuns++;
++		self->fKeyStep = 1;
++		usage = self->fKeyRuns == 1 ? kHIDUsage_Csmr_Power :
++		    kHIDUsage_Csmr_VolumeIncrement;
++		IOLog("SWEET HID: powerkey %u down (interval %u s) usage 0x%x\n",
++		    self->fKeyRuns, self->fKeySecs, usage);
++		self->key(usage, true);
++		sender->setTimeoutMS(SWEET_KEY_HOLD_MS);
++		return;
++	}
++	usage = self->fKeyRuns == 1 ? kHIDUsage_Csmr_Power :
++	    kHIDUsage_Csmr_VolumeIncrement;
++	self->fKeyStep = 0;
++	self->key(usage, false);
++	IOLog("SWEET HID: powerkey %u up\n", self->fKeyRuns);
++	if (self->fKeyRuns >= SWEET_KEY_PAIRS) {
++		IOLog("SWEET HID: powerkey done\n");
++		return;
++	}
++	sender->setTimeoutMS(SWEET_KEY_GAP_S * 1000);
++}
++
+ void
+ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
+ {
