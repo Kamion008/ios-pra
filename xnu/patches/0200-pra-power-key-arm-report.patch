@@ -1,0 +1,55 @@
+pra: 0200 - land the arm report where the ring can actually see it
+
+ring63 (T21a) has ZERO `SWEET HID: powerkey arm` lines: 0199 arms the report
+timer 30 s after `SweetHIDButtons::start()`, but start() runs about 5 s into
+the boot and IOLog lines only reach the pralog ring once pralog is up - the
+same window that made 0196's missing "armed" line ambiguous in T20. A report
+timer that never lands repeats the very bug it was added to fix, and it also
+leaves `fKeyErr` 2/3/4 (timerEventSource / addEventSource / setTimeoutMS
+failures) unobservable, so a boot with no key lines stays ambiguous.
+
+This patch fires the report at `prapowerkey` seconds instead - microseconds
+ahead of the first press, because the report timer is armed first and both
+run on the same work loop - so the arm state is always adjacent to the first
+`powerkey 1 down` line and no longer depends on a guess about how early
+pralog comes up. Without `prapowerkey` it keeps the short probe.
+`armed=` now means "allocated AND no arming error" instead of just
+"allocated", so `err=3 armed=1` can no longer be misread as healthy.
+
+FALSIFIER: expect `SWEET HID: powerkey arm secs=900 every=30 err=0 armed=1
+clients=1` immediately before `SWEET HID: powerkey 1 down (interval 900 s)
+usage 0x30`. If the arm line is still absent the timer mechanism cannot log
+from that work loop at all and the whole power-key control needs a different
+observer.
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -469,9 +469,19 @@
+ 			fKeyErr = 4;
+ 		}
+ 	}
++	/*
++	 * 0200: the arm report must land AFTER the pralog ring is alive. 0199
++	 * fired it 30 s after start(), and ring63 proves that never reaches the
++	 * ring: start() runs about 5 s into the boot and IOLog only lands once
++	 * pralog is up - exactly the trap this timer exists to dodge, and the
++	 * reason T20's missing line was ambiguous. With prapowerkey=N the report
++	 * now fires at N seconds, just ahead of the first press (this timer is
++	 * armed first, so it fires first); without the key arg it keeps the
++	 * short probe.
++	 */
+ 	fArm = IOTimerEventSource::timerEventSource(this, &SweetHIDButtons::armReport);
+ 	if (fArm && _hidWorkLoop->addEventSource(fArm) == kIOReturnSuccess) {
+-		fArm->setTimeoutMS(SWEET_KEY_REPORT_S * 1000);
++		fArm->setTimeoutMS((fKeySecs ? fKeySecs : SWEET_KEY_REPORT_S) * 1000);
+ 	}
+ 	gSweetButtons = this;
+ 	registerService();
+@@ -503,7 +513,7 @@
+ 
+ 	IOLog("SWEET HID: powerkey arm secs=%u every=%u err=%u armed=%d clients=%u\n",
+ 	    self->fKeySecs, self->fKeyEvery, self->fKeyErr,
+-	    self->fKey != NULL ? 1 : 0,
++	    (self->fKey != NULL && self->fKeyErr == 0) ? 1 : 0,
+ 	    self->_clients ? self->_clients->getCount() : 0);
+ }
+ 

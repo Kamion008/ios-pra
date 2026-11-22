@@ -327,6 +327,10 @@ jobs:
           # 0199 repeat-mode guard: prakeyevery=M repeats the pair every M
           # seconds, and the arm line now carries every=%u.
           strings -a "$kernel" | grep -F 'SWEET HID: powerkey arm secs=' >/dev/null
+          # NOTE: 0200 (the arm report re-timed to land after the ring is
+          # alive) adds no format string, so it has no marker of its own -
+          # its guard is the 0199 assert above plus the apply-phase grep and
+          # skip detector in the Build step (same situation as 0178).
           # 0184 bring-up guard: the IOMCU pulse + the vendor-polarity
           # reset + the LDO VSET writes (the stock-delta replication).
           strings -a "$kernel" | grep -F 'PRA touch: iomcu reset pulsed' >/dev/null
