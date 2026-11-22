@@ -105,7 +105,11 @@ selectors sel 9/12 (the class named in the T4 decode, work/boots.md:44:
 "the 0179 follow-up fix = narrow the gate to sel 9/12 (the real unlocks)").
 Ring61's AKS census (regex `sel (9|12)( |$)` over 966 `SWEET AKS:` lines,
 format `SWEET AKS: SpringBoard sel 0 arg0 ...`) is 0 for sel 9/12;
-SpringBoard itself made 124 calls, contextstored 186. This is a
+SpringBoard itself made 124 calls, contextstored 186. The USER reports (2026-11-22) that the lock screen has never drawn more
+than one frame: a static, non-animating lock screen is expected to add no
+swap lines at all, so swap-line absence is NOT evidence the swipe failed.
+The decisive signals are therefore AKS sel 9/12 and the screen visibly
+changing on return, with swap lines only a bonus. This is a
 no-passcode device (tools/mkiosroot.sh:225: "# System keybag for the
 built-in AppleKeyStore (no passcode)."), so a successful swipe cannot land
 on a passcode keypad: it is accepted (new swaps and/or AKS) or not.

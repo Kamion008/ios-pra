@@ -179,6 +179,11 @@ lines can appear and absence proves nothing. The T4 decode names sel 9/12 as the
   ring61 printed 9 of 16, the counter reached 13) and/or SpringBoard AKS
   sel 9/12 after a swipe = the UI processed the gesture (baseline: 0
   sel 9/12).
-- No such signal after the swipe lines = the gesture was not visibly
+- USER NOTE (2026-11-22): the lock screen has never been seen to draw more
+  than one frame. A static lock screen adds no swap lines, so an absence of
+  swaps after the swipe is expected and is NOT a failure signal; the
+  decisive read is the visible screen on return (home screen vs lock
+  screen) plus AKS sel 9/12, with swap lines only a bonus.
+- No AKS and an unchanged lock screen = the gesture was not visibly
   accepted; the follow-up probes must separate gesture-rejected,
   backboardd-dispatch and SpringBoard-routing.
