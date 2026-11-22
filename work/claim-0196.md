@@ -109,7 +109,37 @@ SpringBoard itself made 124 calls, contextstored 186. The USER reports (2026-11-
 than one frame: a static, non-animating lock screen is expected to add no
 swap lines at all, so swap-line absence is NOT evidence the swipe failed.
 The decisive signals are therefore AKS sel 9/12 and the screen visibly
-changing on return, with swap lines only a bonus. This is a
+changing on return, with swap lines only a bonus. Frame census from the past rings (python3 over work/ring*.txt; the 0046 swap
+log is capped at 16 lines and skips masked/null-surface draws, so the
+printed counter is a lower bound on presents):
+```
+ring  logged  max_counter  last_swap_line / total_lines
+28       6        7         1710 / 20122
+29       2        3          938 / 17514
+30       3        3         1027 / 16999
+31       4        4         1005 / 16898
+32       5        5         1621 / 17167
+33       5        5         1571 / 17117
+34      10       15         2046 / 15908
+52       6       12         2666 /  5752
+53       6        8         2556 /  5741
+54      11       17         2827 /  3041
+55       8       12         2795 / 12002
+56       9       16         2847 / 12025
+57       9       18         2506 / 12014
+58       9       15         2814 / 12006
+59       4        4         1566 /  2349
+61       9       13         3169 /  3948
+```
+Every boot presented at least 3-18 frames (counter jumps prove unlogged
+presents), but in all 16 rings the last logged present is early and
+hundreds to thousands of lines of activity follow it (ring34: 13,862 lines
+after; ring61: 779). No present line appears late in any ring. INFERRED:
+the lock screen settles on one image and stops presenting; the log cannot
+count total frames, but it never records a late one - consistent with the
+user's "never seen more than one frame" memory. This is why T20's
+decisive signals are the screen on return and AKS sel 9/12, not swaps.
+This is a
 no-passcode device (tools/mkiosroot.sh:225: "# System keybag for the
 built-in AppleKeyStore (no passcode)."), so a successful swipe cannot land
 on a passcode keypad: it is accepted (new swaps and/or AKS) or not.

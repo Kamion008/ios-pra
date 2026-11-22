@@ -150,6 +150,37 @@ lines can appear and absence proves nothing. The T4 decode names sel 9/12 as the
 (work/boots.md:44). The keybag is a no-passcode stub
 (tools/mkiosroot.sh:225-230), so a successful unlock cannot show a keypad.
 
+Frame census from the past rings (python3 over work/ring*.txt; the 0046 swap
+log is capped at 16 lines and skips masked/null-surface draws, so the
+printed counter is a lower bound on presents):
+```
+ring  logged  max_counter  last_swap_line / total_lines
+28       6        7         1710 / 20122
+29       2        3          938 / 17514
+30       3        3         1027 / 16999
+31       4        4         1005 / 16898
+32       5        5         1621 / 17167
+33       5        5         1571 / 17117
+34      10       15         2046 / 15908
+52       6       12         2666 /  5752
+53       6        8         2556 /  5741
+54      11       17         2827 /  3041
+55       8       12         2795 / 12002
+56       9       16         2847 / 12025
+57       9       18         2506 / 12014
+58       9       15         2814 / 12006
+59       4        4         1566 /  2349
+61       9       13         3169 /  3948
+```
+Every boot presented at least 3-18 frames (counter jumps prove unlogged
+presents), but in all 16 rings the last logged present is early and
+hundreds to thousands of lines of activity follow it (ring34: 13,862 lines
+after; ring61: 779). No present line appears late in any ring. INFERRED:
+the lock screen settles on one image and stops presenting; the log cannot
+count total frames, but it never records a late one - consistent with the
+user's "never seen more than one frame" memory. This is why T20's
+decisive signals are the screen on return and AKS sel 9/12, not swaps.
+
 ## 8. Reviewer rounds (opencode/deepseek-v4.1-flash-free, plan agent)
 
 - Round 1 (`work/pkt-171401/report.md`): 2 refuted / 7 weak / 2 survive.
