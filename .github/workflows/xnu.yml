@@ -350,7 +350,9 @@ jobs:
           # 0201 lesson: the %s service name sits between prefix and verb, so
           # assert on the tail, never on 'SWEET HID: setElementValue').
           strings -a "$kernel" | grep -F 'hoststate keys published' >/dev/null
-          strings -a "$kernel" | grep -F '-> accepted (was %u set %d)' >/dev/null
+          # NOTE: this marker starts with '->', which grep parses as an option
+          # even after -F - the pattern must go through -e (CI 45220687750).
+          strings -a "$kernel" | grep -F -e '-> accepted (was %u set %d)' >/dev/null
           strings -a "$kernel" | grep -F 'keyvalue %s = %u' >/dev/null
           strings -a "$kernel" | grep -F 'SWEET HID: digitizer update masks set' >/dev/null
           # 0184 bring-up guard: the IOMCU pulse + the vendor-polarity
