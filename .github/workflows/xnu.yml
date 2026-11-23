@@ -360,6 +360,11 @@ jobs:
           # 0203 is skipped no notification ever fires even though powerreq
           # still logs - the assert is the discriminator.
           strings -a "$kernel" | grep -F 'SWEET FB: power change notified' >/dev/null
+          # 0204 ticket-lock instrument guard (8-core bring-up): the PRA LOCK
+          # console line names the recursive-acquire owner. If 0204 is skipped
+          # a cpus=8 panic would show only the stock "unexpectedly owned by"
+          # string and the owner would stay unknown.
+          strings -a "$kernel" | grep -F 'PRA LOCK: ticket' >/dev/null
           # 0184 bring-up guard: the IOMCU pulse + the vendor-polarity
           # reset + the LDO VSET writes (the stock-delta replication).
           strings -a "$kernel" | grep -F 'PRA touch: iomcu reset pulsed' >/dev/null

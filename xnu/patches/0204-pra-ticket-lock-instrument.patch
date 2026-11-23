@@ -1,0 +1,65 @@
+pra: 0204 - instrument the pset0 ticket-lock recursive panic (8-core bring-up)
+
+The cpus=8 trial on PRA dies at lock_ticket.c __lck_ticket_owned_panic
+(PRA-LX1-noted.md:769-795, reproduced from the Exynos donor): panic
+"Ticket lock 0xfffffff007b70880 is unexpectedly owned by thread 0x...". The
+address is pset0 + 0x100 = pset0.sched_lock (PRA-LX1-noted.md:780) and the
+panic fires when the SECOND physical cluster (MPIDR 0x100..0x103) registers
+through processor_up -> pset_lock while startAll's processor_start thread
+already holds it (work/hw-8core-design.md section 4b). The stock panic names
+only the RE-acquiring thread; the OWNER thread id is the missing half, so the
+failure site is guessed instead of known. This patch prints both ctids (the
+owner word lck_ticket_owner and self) to the console (the panic is early,
+before the +30 s pralog ring - console with wdt=-1 is the primary capture,
+hw-8core-design.md section 5) and extends the panic string with both.
+
+Provenance: this panic is scheduler-internal (xnu osfmk), untouched by every
+PRA patch so far - the hunk base is the post-0203 full-stack file (the
+function has been stable since xnu-8796). kprintf and panic are already
+available at this point (panic with context records __builtin_return_address).
+
+Ring/console lines that name the bug:
+    PRA LOCK: ticket 0xfffffff007b70880 owned by ctid 0x..., re-acquired by
+        ctid 0x...
+    and the panic string with both ctids.
+
+FALSIFIER (the discriminator): with 0204, the cpus=8 boot either shows the
+owner ctid = the startAll thread (ktrace/thread name in a later stage or the
+console) = the race is startAll's processor_start holding pset0 while the
+secondary's processor_up re-locks it - serializing/deferring cluster-1 start
+is the fix; or owner ctid = some OTHER thread (clutch rebalance, scheduler
+tick) = the recursive acquire is introduced elsewhere and the next
+instrumentation moves thereandarounds the pset0 lock. Either outcome names
+the fix for 0205; a boot that reaches 8/8 "SGI1 verified" falsifies the
+reproducer itself (the trial is command-line gated: cpus=8, PRA_ALLOW_ANY_
+CMDLINE=1).
+
+NOTE: this patch is DIAGNOSTIC ONLY and does not change scheduler behaviour.
+The cpus=8 flash that exercises it requires explicit user approval (the
+cluster-1 scheduler panic is the expected outcome; wdt=-1 keeps it on
+screen for capture).
+
+BASE: the post-0203 full-stack osfmk/kern/lock_ticket.c. Only this hunk;
+fuzz=0 applies clean and the full-stack git apply still reports zero skips.
+--- a/osfmk/kern/lock_ticket.c
++++ b/osfmk/kern/lock_ticket.c
+@@ -140,7 +140,18 @@
+ {
+ 	thread_t self = current_thread();
+ 
+-	panic("Ticket lock %p is unexpectedly owned by thread %p", lck, self);
++	/*
++	 * 0204 (8-core): the stock panic names only the re-acquiring thread, not
++	 * who holds the lock. On PRA the cpus=8 trial dies here on pset0.sched_lock
++	 * (PRA-LX1-noted.md:780) while registering cluster 1 - the owner ctid is
++	 * the missing half. ctid is a system-wide compact thread id (thread.h:778),
++	 * unique per thread; the kprintf lands in the pralog ring only after +30 s,
++	 * so the console (wdt=-1) is the primary capture for this early panic.
++	 */
++	kprintf("PRA LOCK: ticket %p owned by ctid 0x%x, re-acquired by ctid 0x%x\n",
++	    lck, (unsigned)tlock->lck_ticket_owner, (unsigned)self->ctid);
++	panic("Ticket lock %p is unexpectedly owned by thread %p (ctid 0x%x, owner 0x%x)",
++	    lck, self, (unsigned)self->ctid, (unsigned)tlock->lck_ticket_owner);
+ }
+ 
+ __abortlike
