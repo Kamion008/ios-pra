@@ -1,43 +1,86 @@
-NEXT SESSION PROMPT - PRA Touch, after HANDOFF_2026-11-23d (2026-11-23d)
+NEXT SESSION PROMPT - PRA Touch/RAM/8-core, after T24 early panic (2026-11-23e)
 
-You are continuing a 9-day bring-up: the unmodified iPhone X iOS 16.7.16 userland boots on a Huawei PRA-LX1 (Kirin 655) and TOUCH WORKED in T21c, but only via a synthetic wake key. Read HANDOFF_2026-11-23d.md first (supersedes 11-22c, self-contained), then AGENTS.md for mechanics.
+You are continuing the PRA bring-up. Read HANDOFF_2026-11-23e.md first (self-contained,
+supersedes 11-23d), then AGENTS.md for mechanics. The phone currently sits panicked in XNU
+(T24 image fb96faf3, flashed 19:38:07 UTC, readback verified); return it to TWRP before
+pulling rings.
 
-THE QUESTION IS NOW ANSWERED BY EVIDENCE: a wake event DOES re-enable the digitizer, and backboardd believes the panel is awake because SpringBoard publishes an asserted BKSHIDUISensorMode (score 4108 vs backboardd's baseline 1) carrying digitizerEnabled: YES, displayState: on, reason backlight-on/DeviceWake, changeSource LockButton, multitouchHostStateKeys including WakeOnTapEnabled — while the idle timer's backlight-off mode carries digitizerEnabled: NO; displayState: off. The synthetic 0x30 POWER key from 0198/0199 was acting as that wake (candidate cause (a) confirmed). The digitizer events were never rejected for shape — they arrived while administratively disabled.
+STATE RECAP (VERIFIED):
+- CI run 45244377368 (0203 patch 8c735fa) = SUCCESS. Full-stack verified: zero skips,
+  cmp rc=0 vs derived post files, already-applied discrimination rc=1 both tools.
+  Kernel sha b0d0b4783728698b... matches CI SHA256SUMS.
+- T24 image fb96faf38b4a47c7... (6041600 B) = 0203 honesty + RAM 1 GiB→1.375 GiB
+  (mem_size 0x58000000, end 0xe0000000), keys on (prapowerkey=900 prakeyevery=30),
+  cpus=4, NO a5fb_keep_on=1, all 11 critical args. Panicked ~2 s after power-on,
+  BEFORE pralog starts:
+    panic(cpu 0 caller 0xffffff007fab5ee4): kmem_range_init:
+    vm_map_locate_space failing for claim compressor @ vm_kern.c:3645
+- RAM-only variant packaged: out/pra-xnu-0202-1375mb.img (sha 0ba0c97b..., 6039552 B,
+  WITH keep_on, keys on, cpus=4, mem_size verified 1408 MiB). NOT flashed.
+- Ring67 pulled (work/ring67.raw + work/ring67-full.txt): differs from ring66 only in
+  the 98-byte panic-flush tail — boot died before +30 s, no pralog content.
+- Photo of panic screen: research/boot-photos/t24-panic-vm_map-20261123-194127.jpg.
+- Ring66 (T23) falsified 0202's host-state lever (ZERO host-state pushes despite
+  advertisement — claim-0202 K5 hit).
+- Battery 100%.
 
-REMAINING WORK: make touch work from boot with NO synthetic key, via 0202 (publish MultitouchHostStateKeys + accept host-state usages in setElementValue) then 0203 (display power honesty, LAST — can blank the panel). 0201 is already built and packaged locally but NOT flashed.
+NEXT SESSION, IN ORDER:
 
-FIRST ACTION (no boot required, do this before anything else — but it's done; verify state):
-- Ring64 pulled & decoded (work/ring64-*: 113 pairs, head==64*enq OK, arm line landed t=890.9s, selftest t=267s).
-- Tracev3 re-harvested (work/harvest-2026-11-23/: Persist-34..38, launchd.log.1=T21c).
-- Causality evidence extracted (extract-34-36-38.txt): LockButton→digitizerEnabled YES/on; idle timer→NO/off.
-- 0201 packaged locally: shim/pra/outxnu/pra-xnu.img (6039552 B), T21c cmdline 532 B, all 11 critical args present, CI 45075755692 SUCCESS (commit 7f20894).
-- CI build tree for three-way verify: /tmp/opencode/ci-tree-0201/src/.
+1. (no boot) Verify CI run 45244377368 conclusion = SUCCESS (gh run view), and that
+   out/pra-xnu-0202-1375mb.img sha = 0ba0c97b... (6039552 B).
 
-THEN, IN ORDER
-1. FLASH 0201 (requires user approval — show the exact command first). Package already done: shim/pra/outxnu/pra-xnu.img. Flash with tools/pra_flash_skip.sh (p27 only, readback-verified), T21c cmdline:
-   pratouch=1 pratouchreset=1 pratouchdbg=1 pratouchselftest=1 prapowerkey=900 prakeyevery=30 sweetsample=SpringBoard,backboardd
-   Mandatory until 0202 lands: every touch experiment carries those args plus pralog=1 praloglba=794623 and the 11 critical args. Without the power-key args the boot looks like every pre-T21 boot: nothing happens. Battery >= 25%.
-   After boot, pull the ring and grep for:
-   - `SWEET HID: SweetHIDTouch setElementValue page` / `setProperties key`  (backboardd pushing host state)
-   - `SWEET FB: powerreq n=` (display-off requests from userland)
-   - `SWEET FB: notifyreg type` (display notification subscribers)
-   - `SWEET FB: swap ... while userland-display-off` (state split)
-   - `SWEET HID: digitizer events marked display-integrated` (once per boot, before first touch)
-   If NO setElementValue/setProperties line ever appears → backboardd never configures through the event service → 0202 is the wrong lever, fall back to the tracev3 route log instead of writing 0202.
+2. ISOLATE THE T24 PANIC — flash out/pra-xnu-0202-1375mb.img (RAM-only, keep_on,
+   keys on, cpus=4) via tools/pra_flash_skip.sh (readback-verified), battery >= 25%:
+   PRA_SERIAL=57U7N17912003349 bash tools/pra_flash_skip.sh out/pra-xnu-0202-1375mb.img
+   - If it BOOTS (reaches lock screen): RAM change alone is fine; the T24 panic came
+     from the combination (unlikely — honesty is VM-free). Re-verify by re-flashing
+     T24 image and watching for the same early panic; then debug vm_kern.c claim
+     placement anyway.
+   - If it PANICS the same way (vm_map_locate_space failing for claim compressor
+     @ vm_kern.c:3645): the 1.375 GiB RAM change breaks early VM claim placement.
+     Fix vm_kern.c:3600-3690 (kmem_range_init: claims are shuffled then placed
+     contiguously `start = end`; the compressor claim can't find space under its
+     restrictions — likely kernel_map max offset / restriction ordering introduced
+     by the larger phys window). Fix in vm_kern.c / boot_args handoff.
+   - NEVER flash cpus=8 with this image until the RAM panic is resolved.
 
-2. WRITE 0202 (only if 0201 shows the push):
-   - SweetHIDTouch::start(): publish MultitouchHostStateKeys as OSArray of OSString with ScreenOn, DigitizerSurfaceCovered, PocketTouchesExpected (honourable from fPowerOff/board data). Add WakeOnTapEnabled only with item 3, never before.
-   - Publish SurfaceDimensions dict next to SurfaceWidth/SurfaceHeight/DisplayIntegrated.
-   - IOHIDEventService::setElementValue: accept the host-state usages, store them, log transitions, return kIOReturnSuccess; keep kIOReturnUnsupported for everything else.
-   - SweetHIDTouch::touch(): set kIOHIDEventFieldDigitizerIsDisplayIntegrated on collection and every child; set Will/DidUpdateMask so parent+children are non-zero (backboardd's `ignoring subevent with nonzero didUpdateMask` check).
-   - Marker assert: a contiguous substring that actually appears in the binary (the 0201 lesson).
-   - Three-way verify: stage scripts + git apply of full stack (zero skips), GNU patch --fuzz=0 --dry-run on index-stripped diffs, byte cmp against post file.
-3. WRITE 0203 LAST (can blank the panel): drop a5fb_keep_on=1 for the test so RequestPowerChange applies; send notify() on power transitions for registered types; publish DisplayPowerOff read-back. Do 0201/0202 first.
+3. ONLY IF isolation passes: KEITLESS BOOT TEST (the deliverable). Same 0203 image,
+   cmdline WITHOUT prapowerkey/prakeyevery AND without a5fb_keep_on=1. Touch must
+   work from boot with NO synthetic key. Record in boots.md, claim-XXXX.md, and a new
+   dated handoff.
 
-BOOT ARGS - MANDATORY UNTIL 0202 LANDS
-Any touch experiment: pratouch=1 pratouchreset=1 pratouchdbg=1 pratouchselftest=1 prapowerkey=900 prakeyevery=30 sweetsample=SpringBoard,backboardd plus pralog=1 praloglba=794623 and the 11 critical args. The T21c cmdline is work/0198/cmdline.txt (532 B base) + prakeyevery=30; the packaged gate checks the 11 critical args. Never boot without pralog=1 praloglba=794623.
+BOOT ARGS - MANDATORY UNTIL THE RAM PANIC IS RESOLVED
+Any touch experiment: pratouch=1 pratouchreset=1 pratouchdbg=1 pratouchselftest=1
+prapowerkey=900 prakeyevery=30 sweetsample=SpringBoard,backboardd plus pralog=1
+praloglba=794623 and the 11 critical args. NEVER boot without pralog=1 praloglba=794623.
+cpus=8 requires PRA_ALLOW_ANY_CMDLINE=1 + explicit approval and is expected to panic
+(diagnostic only). The T21c base cmdline is work/0198/cmdline.txt (517 B) +
+prakeyevery=30; T24 additionally removed a5fb_keep_on=1 (517 B).
 
-DELIVERABLE
-Touch works from boot with NO synthetic key; recorded in boots.md, claim-XXXX.md, and a new dated handoff. Until then the answer stands as evidence: wake re-enables the digitizer; SpringBoard's asserted LockButton sensor-mode (score 4108, multitouchHostStateKeys incl. WakeOnTapEnabled) is what makes backboardd believe the panel is awake.
+HARDWARE TRACKS (designed, awaiting CI slots after 0203 clears the queue):
+- 8-core: work/hw-8core-design.md. Patch 0204 (commit 9d6b497) instruments
+  __lck_ticket_owned_panic (lock_ticket.c:143) to print owner+re-acquirer ctids;
+  three-way verified, zero skips on 195-patch stack; CI not yet run (cancelled run
+  45246061084 behind the slow queue). cpus=8 boot = EXPECTED panic on pset0.sched_lock;
+  console capture (wdt=-1 keeps it on screen), then 0205 fix. Needs explicit user
+  approval for the cpus=8 flash.
+- RAM 1.375 GiB: work/hw-3gb-design.md (this is the active blocker above).
+- GPU: work/hw-gpu-status.md. G3D is LPM3-IPC power-managed
+  (hi3xxx_to_lpm3_enable_step <0x00030004>); blocker is establishing G3D power/clock
+  before any MMIO (ring26 precedent: sync external abort panic). Not flashable in
+  parallel with touch.
 
-RULES (AGENTS.md authoritative): kernel-side only; flash p27 only via pra_flash_skip.sh with readback; never p30/p32/bootloaders; serials via PRA_SERIAL only; durable numbers via python3/bc quoted and labelled VERIFIED/INFERRED/UNKNOWN; commit subject `pra: ...`, no AI footer; push master and trigger CI with RUNNER=macos-15 (push-triggered run targets A5XELTE — cancel it); battery >= 25%; get explicit user approval (exact command shown first) before any flash.
+DELIVERABLE: touch works from boot with NO synthetic key; record in boots.md,
+claim-XXXX.md, and a new dated handoff. Until then the answer stands as evidence:
+a wake event DOES re-enable the digitizer; SpringBoard's asserted LockButton
+sensor-mode (score 4108, multitouchHostStateKeys incl. WakeOnTapEnabled) is what
+makes backboardd believe the panel is awake.
+
+RULES (AGENTS.md authoritative): kernel-side only; flash only p27 via
+pra_flash_skip.sh readback-verified; never p30/p32/bootloaders; serials via
+PRA_SERIAL only; durable numbers via python3/bc quoted and labelled VERIFIED/
+INFERRED/UNKNOWN; three-way patch verify; marker assert per patch; commit subject
+`pra: ...`; no AI footer; push master, trigger CI with RUNNER=macos-15 (push-triggered
+run targets A5XELTE — cancel it); battery >= 25%; explicit user approval (exact
+command shown first) before any flash; do not commit work/ci*/, work/pkt-*/,
+shim/pra/out* or raw rings.
