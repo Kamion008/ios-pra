@@ -1,0 +1,148 @@
+pra: 0203 - display power honesty: real power transitions, notifications, read-back
+
+Provenance: T23/ring66 falsified 0202's host-state lever (claim-0202 K5): the
+advertised MultitouchHostStateKeys produced ZERO host-state pushes — backboardd
+read the service (40 property pushes again) but never drove ScreenOn etc., and
+touch still only worked after a synthetic power press. The T21-era tracev3
+already showed the actual gate: SpringBoard's asserted BKSHIDUISensorMode
+(score 4108) carries `digitizerEnabled: NO; displayState: off` from the BLS
+`idle timer` sleep, and only a wake event flips it to YES/on. The kernel has
+been LYING about display power since 0179's `a5fb_keep_on=1` (ring65/66:
+`powerreq n=N arg=0 off=1 keep=1 applied=1` every boot — the off request is
+REFUSED, the panel stays lit while userland believes `displayState: off`).
+That state split is what latches the digitizer off. 0203 makes the framebuffer
+tell the truth so the idle-timer sleep mode never latches at boot.
+
+BASE: work/0202/SweetFramebuffer-pre0202.cpp (= the post-0202 CI build tree
+file — 0202 touches no framebuffer file, cmp rc=0, evidence-0202 section 2).
+This is the first patch to touch SweetFramebuffer.cpp since 0171/0201; the
+context anchors are the 0201 additions (fPowerReq/fUserlandOff) so a drift in
+the base would refuse loudly (fuzz=0).
+
+WHAT CHANGES (three items, digitizer-gate-2026-11-22.md section 4 0203):
+ 1. NOTIFICATION CONTRACT (honest by default): new AppleCLCD::notifyAll()
+    walks every open IOMobileFramebufferUserClient and calls notify(type,
+    values, count) — notify() already returns silently when the client has no
+    function registered for the type (fFunc[type]==0) or no port, so a type
+    with no subscriber costs one null check. On every APPLIED power transition
+    (off != previous fPowerOff, i.e. the keep_on path did NOT swallow it) the
+    kernel now: publishes the read-back property `DisplayPowerOff` = true/false
+    (setProperty, kOSBoolean) so the divergence is queryable; logs
+    `SWEET FB: power change notified (off=N)` once per transition; and calls
+    notifyAll(0..7, {off,0}, 2) for EVERY registered type (8 types, bounded
+    by SWEET_FB_NOTIFY_TYPES). No client registers today (ring65/66 notifyreg
+    = 0 lines), so this is a zero-cost contract: the first real subscriber's
+    type shows up in 0201's notifyreg log and its payload can be shaped then.
+    The vsync fan-out (type 5, 6 words) is unchanged.
+ 2. READ-BACK: `DisplayPowerOff` property above (item 1), kept in sync on
+    every applied transition.
+ 3. COMMAND-LINE (NOT this patch — the flash step): drop `a5fb_keep_on=1`
+    from the cmdline so RequestPowerChange(0) actually applies. With keep_on
+    gone the panel really goes dark when backboardd asks for sleep, and the
+    wake path must work — that is exactly what 0203 tests. The A5XELTE
+    display-off-ignored line becomes unreachable only when keep_on is absent.
+    RULE: keep the 11 critical args; the flash gate passes (they are still
+    all present).
+
+MARKER (workflow assert): `SWEET FB: power change notified` — contiguous
+literal, one per applied transition backed by the 0201 `powerreq` lines.
+
+Ring lines that prove the gate moved (next boot, ring67):
+    SWEET FB: powerreq n=.. arg=0 off=1 keep=0 applied=1    <- keep_on GONE, the
+        off request APPLIES (this line's keep=0 is the falsifier for the
+        cmdline change)
+    SWEET FB: display off  /  SWEET FB: display on           <- the transition
+    SWEET FB: power change notified (off=1)                  <- notifications +
+        read-back property published
+    A5XELTE FB: display-off request ignored (keep_on)        <- ABSENT (the
+        case arm is unreachable without keep_on)
+
+FALSIFIERS: (a) `keep=1` anywhere = the cmdline change did not land — stop,
+re-package without a5fb_keep_on=1. (b) The panel going dark with the wake path
+still broken = the power key (synthetic or real) must now prove it wakes the
+UI: with `prapowerkey=900` the first pair must bring the display back on
+(`powerreq arg=1 off=0 applied=1` + a user-visible wake); if the display stays
+dark after the press, the wake path is display-gated and the keyless
+deliverable moves to a real wake driver. (c) SpringBoard does not come back up
+after a real off->on cycle = the display-off removed something the userland
+needs (falsifier for the fade/black path in vsyncFired; the 0179 fade is
+bounded to 7 steps).
+
+PROOF LINE (the deliverable): the KEYLESS boot — same 0203 image, cmdline
+WITHOUT prapowerkey/prakeyevery AND without a5fb_keep_on=1 — must reach the
+lock screen with touch working from boot (digitizerEnabled: YES at boot, no
+idle-timer latch). That boot is recorded as the deliverable test in boots.md.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -144,6 +144,7 @@
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
++	void notifyAll(uint32_t type, const uint64_t *values, uint32_t count);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ #if defined(ARM64_BOARD_CONFIG_PRA)
+@@ -329,6 +330,23 @@
+ 	IOLockUnlock(fLock);
+ }
+ 
++/*
++ * 0203: notify() for one type to every open client, under the lock. notify()
++ * itself returns silently when the client has no function registered for the
++ * type (fFunc[type] == 0), so a type with no subscriber costs nothing.
++ */
++void
++AppleCLCD::notifyAll(uint32_t type, const uint64_t *values, uint32_t count)
++{
++	IOLockLock(fLock);
++	for (unsigned int i = 0; i < fClients->getCount(); i++) {
++		IOMobileFramebufferUserClient *client =
++		    (IOMobileFramebufferUserClient *)fClients->getObject(i);
++		client->notify(type, values, count);
++	}
++	IOLockUnlock(fLock);
++}
++
+ void
+ AppleCLCD::removeClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -697,6 +715,7 @@
+ 				break;
+ 			}
+ 			IOLockLock(fFB->fLock);
++			bool changed = off != fFB->fPowerOff;
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+@@ -704,6 +723,31 @@
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			if (changed) {
++				/*
++				 * 0203: publish the read-back so the divergence is
++				 * queryable (and backboardd's model can be corrected
++				 * the next time it asks), and notify every registered
++				 * type: no client registers today (ring65/66 notifyreg
++				 * = 0), so this is a free contract — a future
++				 * subscriber's type shows up in the 0201 notifyreg log
++				 * and its payload can be shaped then. Two words
++				 * {off, 0}; vsync subscribers keep the 6-word shape
++				 * from vsyncFired.
++				 */
++				setProperty("DisplayPowerOff",
++				    fFB->fPowerOff ? kOSBooleanTrue : kOSBooleanFalse);
++				uint64_t pv[2] = { off ? 0 : 1, 0 };
++				IOLog("SWEET FB: power change notified (off=%d)\n", (int)off);
++				fFB->notifyAll(0, pv, 2);
++				fFB->notifyAll(1, pv, 2);
++				fFB->notifyAll(2, pv, 2);
++				fFB->notifyAll(3, pv, 2);
++				fFB->notifyAll(4, pv, 2);
++				fFB->notifyAll(SWEET_FB_NOTIFY_VSYNC, pv, 2);
++				fFB->notifyAll(6, pv, 2);
++				fFB->notifyAll(7, pv, 2);
++			}
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
