@@ -1,98 +1,43 @@
-NEXT SESSION PROMPT - PRA Touch, after T21c (2026-11-22c)
+NEXT SESSION PROMPT - PRA Touch, after HANDOFF_2026-11-23d (2026-11-23d)
 
-You are continuing a 9-day bring-up: the unmodified iPhone X iOS 16.7.16
-userland now boots on a Huawei PRA-LX1 (Kirin 655) and, as of the last boot,
-TOUCH WORKED and the phone was used. Read HANDOFF_2026-11-22c.md first (it
-supersedes 11-22b and is self-contained), then AGENTS.md for mechanics.
+You are continuing a 9-day bring-up: the unmodified iPhone X iOS 16.7.16 userland boots on a Huawei PRA-LX1 (Kirin 655) and TOUCH WORKED in T21c, but only via a synthetic wake key. Read HANDOFF_2026-11-23d.md first (supersedes 11-22c, self-contained), then AGENTS.md for mechanics.
 
-FIRST ACTION (no boot required, do this before anything else)
-The phone should be idle in TWRP with ring64 unread and a brand-new boot's
-worth of userland log unharvested. Pull the ring, then re-harvest the
-tracev3 archives:
+THE QUESTION IS NOW ANSWERED BY EVIDENCE: a wake event DOES re-enable the digitizer, and backboardd believes the panel is awake because SpringBoard publishes an asserted BKSHIDUISensorMode (score 4108 vs backboardd's baseline 1) carrying digitizerEnabled: YES, displayState: on, reason backlight-on/DeviceWake, changeSource LockButton, multitouchHostStateKeys including WakeOnTapEnabled — while the idle timer's backlight-off mode carries digitizerEnabled: NO; displayState: off. The synthetic 0x30 POWER key from 0198/0199 was acting as that wake (candidate cause (a) confirmed). The digitizer events were never rejected for shape — they arrived while administratively disabled.
 
-  PRA_SERIAL=<serial> OUT=work/ring64.raw TXT=work/ring64-full.txt \
-    tools/pra_readlog.sh
-  cmp work/ring63.raw work/ring64.raw          # must differ = new boot
-  TXT=work/ring64-full.txt RAW=work/ring64.raw sh work/0198/decode-ring63.sh
+REMAINING WORK: make touch work from boot with NO synthetic key, via 0202 (publish MultitouchHostStateKeys + accept host-state usages in setElementValue) then 0203 (display power honesty, LAST — can blank the panel). 0201 is already built and packaged locally but NOT flashed.
 
-and then repeat the block-wise HFSX read from work/userland-logs-2026-11-22.md
-(no HFS+ driver in TWRP: read the volume in 4 KiB blocks via `dd bs=4096`,
-resolve the catalog fork through the extents-overflow B-tree; toybox `dd`
-writes its stats line to stdout). Grep the harvested archives for:
-`digitizerEnabled`, `digitizerWake`, `backlight-off`, `BKDigitizerStreamClient`,
-`tapToWake`, `digitizer:%llX - display:`.
-
-THE QUESTION YOU ARE ANSWERING
-Touch works but INTERMITTENTLY, and the user reports it tracks the synthetic
-power button; they never pressed the physical one. Candidate causes, none
-excluded yet: (a) the synthetic POWER key (0x30) from 0198/0199 wakes the
-digitizer, (b) the volume-up pair does, (c) elapsed time / SpringBoard
-bring-up, (d) a combination. The evidence that makes (a) most likely is
-backboardd's own log: the winning `BKSHIDUISensorMode` carries
-`digitizerEnabled: NO` with `display: off` and reason `idle timer`, and a
-wake flips it to the awake mode (`digitizerWake: YES; display: on`). So the
-digitizer is administratively disabled while the panel is considered asleep,
-not rejected for its event shape.
-
-WHAT WOULD SETTLE IT
-- ring64: the 30 s `powerkey N down` cadence vs the first `SWEET HID: touch`
-  transitions, and the buttons-queue `enq` / `head == 64*enq` accounting.
-- the tracev3 harvest: does `digitizerEnabled` flip to YES right after a
-  press and back to NO on the idle timer?
+FIRST ACTION (no boot required, do this before anything else — but it's done; verify state):
+- Ring64 pulled & decoded (work/ring64-*: 113 pairs, head==64*enq OK, arm line landed t=890.9s, selftest t=267s).
+- Tracev3 re-harvested (work/harvest-2026-11-23/: Persist-34..38, launchd.log.1=T21c).
+- Causality evidence extracted (extract-34-36-38.txt): LockButton→digitizerEnabled YES/on; idle timer→NO/off.
+- 0201 packaged locally: shim/pra/outxnu/pra-xnu.img (6039552 B), T21c cmdline 532 B, all 11 critical args present, CI 45075755692 SUCCESS (commit 7f20894).
+- CI build tree for three-way verify: /tmp/opencode/ci-tree-0201/src/.
 
 THEN, IN ORDER
-1. Flash 0201 (already landed; kernel built from 7f20894) - it only
-   instruments: RequestPowerChange with the raw argument, notification
-   registrations, `setElementValue`/`setProperties` pushes from backboardd,
-   plus the one behaviour change that our digitizer events now carry
-   `kIOHIDEventFieldDigitizerIsDisplayIntegrated`. Package with the T21c
-   cmdline and `tools/pra_flash_skip.sh`.
-   If NO `setElementValue`/`setProperties` line ever appears, backboardd
-   never configures us through the event service: 0202 is the wrong lever and
-   the tracev3 route log is the way forward.
-2. Write 0202: publish `MultitouchHostStateKeys` (`ScreenOn`,
-   `DigitizerSurfaceCovered`, `PocketTouchesExpected`, ...) and accept the
-   host-state usages in `setElementValue`. 0203 (display power honesty) comes
-   LAST because it can blank the panel.
+1. FLASH 0201 (requires user approval — show the exact command first). Package already done: shim/pra/outxnu/pra-xnu.img. Flash with tools/pra_flash_skip.sh (p27 only, readback-verified), T21c cmdline:
+   pratouch=1 pratouchreset=1 pratouchdbg=1 pratouchselftest=1 prapowerkey=900 prakeyevery=30 sweetsample=SpringBoard,backboardd
+   Mandatory until 0202 lands: every touch experiment carries those args plus pralog=1 praloglba=794623 and the 11 critical args. Without the power-key args the boot looks like every pre-T21 boot: nothing happens. Battery >= 25%.
+   After boot, pull the ring and grep for:
+   - `SWEET HID: SweetHIDTouch setElementValue page` / `setProperties key`  (backboardd pushing host state)
+   - `SWEET FB: powerreq n=` (display-off requests from userland)
+   - `SWEET FB: notifyreg type` (display notification subscribers)
+   - `SWEET FB: swap ... while userland-display-off` (state split)
+   - `SWEET HID: digitizer events marked display-integrated` (once per boot, before first touch)
+   If NO setElementValue/setProperties line ever appears → backboardd never configures through the event service → 0202 is the wrong lever, fall back to the tracev3 route log instead of writing 0202.
+
+2. WRITE 0202 (only if 0201 shows the push):
+   - SweetHIDTouch::start(): publish MultitouchHostStateKeys as OSArray of OSString with ScreenOn, DigitizerSurfaceCovered, PocketTouchesExpected (honourable from fPowerOff/board data). Add WakeOnTapEnabled only with item 3, never before.
+   - Publish SurfaceDimensions dict next to SurfaceWidth/SurfaceHeight/DisplayIntegrated.
+   - IOHIDEventService::setElementValue: accept the host-state usages, store them, log transitions, return kIOReturnSuccess; keep kIOReturnUnsupported for everything else.
+   - SweetHIDTouch::touch(): set kIOHIDEventFieldDigitizerIsDisplayIntegrated on collection and every child; set Will/DidUpdateMask so parent+children are non-zero (backboardd's `ignoring subevent with nonzero didUpdateMask` check).
+   - Marker assert: a contiguous substring that actually appears in the binary (the 0201 lesson).
+   - Three-way verify: stage scripts + git apply of full stack (zero skips), GNU patch --fuzz=0 --dry-run on index-stripped diffs, byte cmp against post file.
+3. WRITE 0203 LAST (can blank the panel): drop a5fb_keep_on=1 for the test so RequestPowerChange applies; send notify() on power transitions for registered types; publish DisplayPowerOff read-back. Do 0201/0202 first.
 
 BOOT ARGS - MANDATORY UNTIL 0202 LANDS
-Any touch experiment must carry `pratouch=1 pratouchreset=1 pratouchdbg=1
-pratouchselftest=1 prapowerkey=900 prakeyevery=30` plus
-`sweetsample=SpringBoard,backboardd`. Without the power-key args the boot
-will look exactly like every pre-T21 boot: nothing happens. The T21c cmdline
-is work/0199/cmdline.txt (532 B) and the packaging gate checks the 11
-critical args.
-
-DO NOT REDO (all refuted or already measured - details in the handoff)
-- The `{{0,0},{1,1}}` digitizer rect is `normalizedDigitizerRect` in 0..1
-  space: correct. Do not publish a pixel rect.
-- `events:0` in the BKIOHIDService line is a matched-transition snapshot, not
-  a drop counter.
-- `A5XELTE FB: display-off request ignored (keep_on)` is baseline noise (1-3
-  per boot across rings 34-63 with no key press). It is not a positive.
-- SpringBoard's digitizer stream client exists; the service is matched,
-  builtin and authenticated. The consumer was never the problem.
-- The digitizer event shape, senderID and queue accounting are fine.
-- A passive swipe with no wake ahead of it proves nothing.
-
-FACTS YOU CAN TRUST
-- Anything in HANDOFF_2026-11-22c.md marked VERIFIED.
-- 0201's marker assert lesson: assert on text that appears contiguously in
-  the binary (`setElementValue page 0x%x`), not across a `%s`.
-- 0200's patch header claim about which timer "is armed first" is wrong; the
-  order of the two log lines is not guaranteed.
-
-RULES
-AGENTS.md is authoritative: kernel-side only; flash p27 via
-tools/pra_flash_skip.sh with readback; never p30/p32/bootloaders; never boot
-without pralog=1 praloglba=794623; serials via PRA_SERIAL only; every durable
-number from a quoted python3/bc; three-way patch verify plus a contiguous
-marker assert; `pra: ` commit subjects, no AI footer; push master and
-dispatch CI with RUNNER=macos-15 (a push-triggered run targets A5XELTE -
-cancel it); battery >= 25%.
+Any touch experiment: pratouch=1 pratouchreset=1 pratouchdbg=1 pratouchselftest=1 prapowerkey=900 prakeyevery=30 sweetsample=SpringBoard,backboardd plus pralog=1 praloglba=794623 and the 11 critical args. The T21c cmdline is work/0198/cmdline.txt (532 B base) + prakeyevery=30; the packaged gate checks the 11 critical args. Never boot without pralog=1 praloglba=794623.
 
 DELIVERABLE
-The answer to "does a wake event re-enable the digitizer, and what makes
-backboardd believe the panel is awake" - as evidence, then as a patch that
-makes touch work from boot with NO synthetic key, recorded in boots.md,
-claim-XXXX.md and a new dated handoff.
+Touch works from boot with NO synthetic key; recorded in boots.md, claim-XXXX.md, and a new dated handoff. Until then the answer stands as evidence: wake re-enables the digitizer; SpringBoard's asserted LockButton sensor-mode (score 4108, multitouchHostStateKeys incl. WakeOnTapEnabled) is what makes backboardd believe the panel is awake.
+
+RULES (AGENTS.md authoritative): kernel-side only; flash p27 only via pra_flash_skip.sh with readback; never p30/p32/bootloaders; serials via PRA_SERIAL only; durable numbers via python3/bc quoted and labelled VERIFIED/INFERRED/UNKNOWN; commit subject `pra: ...`, no AI footer; push master and trigger CI with RUNNER=macos-15 (push-triggered run targets A5XELTE — cancel it); battery >= 25%; get explicit user approval (exact command shown first) before any flash.

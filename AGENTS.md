@@ -4,15 +4,17 @@
 Goal: boot the iPhone X iOS 16.7.16 userland on a Huawei PRA-LX1 (Kirin 655 /
 hi6250) via the Android boot image → EL1 loader (`shim/pra`) → a ported XNU
 (xnu-8796.141.3). Donor tree: `ios-galaxy-s8` (SWEET/A5XELTE).
-READ FIRST: the latest `HANDOFF_*.md` (currently `HANDOFF_2026-11-22c.md`, written
-  after T21c - the boot where touch first worked - and self-contained) — the
+READ FIRST: the latest `HANDOFF_*.md` (currently `HANDOFF_2026-11-23d.md`, written
+  after the ring64 + tracev3 causality evidence - wake re-enables the digitizer -
+  and self-contained) — the
 single source of truth for status, verified facts, refuted theories and the
 do-not-do list. This file holds stable mechanics only.
 
 ## Repo layout
 - `PRA-LX1_PROGRESS.md` — PRA-specific evidence log (hardware facts, boot history).
-- `HANDOFF_2026-11-22c.md` — active handoff (post-T21c: touch worked, the blocker is a wake/display-state gate);
-  `HANDOFF_2026-11-22b.md` is superseded. Add newer dated ones after it.
+- `HANDOFF_2026-11-23d.md` — active handoff (causality answered: a wake event re-enables the digitizer;
+  0201 packaged, awaiting flash); `HANDOFF_2026-11-22c.md` and `HANDOFF_2026-11-22b.md` are superseded.
+  Add newer dated ones after it.
 - `NOTES.md`, `A5XELTE_PROGRESS.md`, `docs/` — donor history; inherited claims
   there (fastboot boot, BOOT p10, 12-arg gate, sweetsample=Setup) are STALE.
 - `xnu/patches/` — the numbered patch stack (`NNNN-*.patch` + stager `.sh`).
