@@ -70,12 +70,13 @@ def build():
     # live/iomem.txt, so the only limit is that end address.
     #
     # 1 GiB here (0x88000000..0xc8000000) is the first step up from the 512 MiB
-    # the donor used; the ceiling for this single window is 1.375 GiB. The
-    # bootstrap page tables are sized for 2 GiB (osfmk/arm/pmap/pmap.h
+    # the donor used; 0x58000000 (1.375 GiB, 0x88000000..0xe0000000) is the
+    # ceiling for this single window (live/iomem.txt RAM ends at 0xe0000000).
+    # The bootstrap page tables are sized for 2 GiB (osfmk/arm/pmap/pmap.h
     # BOOTSTRAP_TABLE_SIZE), so no kernel change is needed to grow further.
     # Keep in sync with RAM_END in shim/pra/boot_main.c.
     set_prop(chosen, 'dram-base', mkadt.u64(0x88000000))
-    set_prop(chosen, 'dram-size', mkadt.u64(0x40000000))
+    set_prop(chosen, 'dram-size', mkadt.u64(0x58000000))
     set_prop(chosen, 'firmware-version', mkadt.cstr('pra-hi6250-entry'))
     set_prop(chosen, 'system-firmware-version', mkadt.cstr('pra-hi6250-entry'))
     # The donor (S8) proved this block is what lets Setup's scene go

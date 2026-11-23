@@ -26,7 +26,7 @@
  * bounds-checks against this; the real size is the payload's mem_size, which
  * mkpayload.py copies from the ADT. Keep in sync with dram-size in
  * tools/mkadt_pra.py. Ceiling for one contiguous window is 0xe0000000. */
-#define RAM_END  0xC8000000UL
+#define RAM_END  0xE0000000UL
 #define PAGE_SIZE 4096UL
 #define BOOT_LINE_LENGTH 608
 
