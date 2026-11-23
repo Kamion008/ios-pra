@@ -737,7 +737,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 				 */
 				setProperty("DisplayPowerOff",
 				    fFB->fPowerOff ? kOSBooleanTrue : kOSBooleanFalse);
-				uint64_t pv[2] = { off ? 0 : 1, 0 };
+				uint64_t pv[2] = { off ? 0ULL : 1ULL, 0ULL };
 				IOLog("SWEET FB: power change notified (off=%d)\n", (int)off);
 				fFB->notifyAll(0, pv, 2);
 				fFB->notifyAll(1, pv, 2);
