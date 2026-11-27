@@ -72,3 +72,24 @@ the recomputed tool output, not a new hand calculation.
 - Get explicit user approval (exact command shown first) before any flash, restage or destructive eMMC write.
 - Keep build success, on-screen reports and runtime behavior as separate claims;
   label evidence VERIFIED (file:line/command) vs INFERRED vs UNKNOWN.
+
+## iOSOnAnd tracker
+
+This port's per-phone status is on the iOSOnAnd tracker
+(https://hackios.appaiproxy.com/device/huawei-p8-lite-2017), repo
+Kamion008/ios-pra, phone huawei-p8-lite-2017. Follow the `iosonand-tracker`
+skill (`.claude/skills/iosonand-tracker/SKILL.md`; latest at
+https://hackios.appaiproxy.com/SKILL.md):
+
+- keep `cli.mjs` outside the repo (`~/.local/share/iosonand/cli.mjs`) and
+  read/verify its sha256 before running;
+- ask the user once how tracker updates and release posts should go (`auto`,
+  `ask`, `off` in `~/.config/iosonand/agent-prefs.json`) and update after a
+  phone boot or release as they chose — this repo's saved preference: updates
+  `auto` unless a boot kernel panics before loading userspace; release posts
+  `ask`;
+- always ask and show the file and caption before uploading any image or video
+  (`--photo`, `media-upload`, `update` with files), even when updates are set
+  to `auto`;
+- never include personal data, vendor files or keys, and only claim what a log,
+  capture or pushed doc shows.

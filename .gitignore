@@ -22,3 +22,9 @@ logs/
 
 # CI artifacts and downloaded build trees
 out/
+
+# iOSOnAnd tracker: keep the CLI, the offline queue and secrets out of the repo
+.env
+.env.*
+cli.mjs
+TRACKER_QUEUE.md
