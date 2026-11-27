@@ -6,8 +6,9 @@ the Huawei PRA-LX1 (hi6250 / Kirin 655, 1080×1920).**
 This repo ports Apple's open-source XNU kernel (xnu-8796, the iOS 16
 generation) to the Kirin 655 and boots the **unmodified iPhone X iOS 16.7.16
 (20H392) userland** on top of it: launchd, the system daemons, backboardd,
-SpringBoard. Donor tree: [ios-galaxy-s8](https://github.com/Kamion008/ios-galaxy-s8)
-(Samsung S8 / SWEET, which reached the iOS home screen).
+SpringBoard. Donor tree: [ios-galaxy-s8](https://github.com/Floppikrob/ios-galaxy-s8)
+(Samsung S8 / SWEET, which reached the iOS home screen; itself based on
+[ios-sweet](https://github.com/dipa-studio/ios-sweet)).
 
 > ⚠️ Experimental bring-up, not a usable phone OS. Installing it **erases the
 > userdata partition** (all Android data). Only PRA-LX1 (hi6250). Kernel and
