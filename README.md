@@ -18,14 +18,14 @@ SpringBoard. Donor tree: [ios-galaxy-s8](https://github.com/Kamion008/ios-galaxy
 
 | Area | State |
 | --- | --- |
-| Boot | Stock Huawei bootloader → LK failsafe loads p27 → our boot image (ADT + payload + cmdline) → XNU; **~6 minutes power-to-lock-screen** (T22, known-good) |
-| CPU | 4× Cortex-A53 (ARMv8.0, no LSE, no PAN), GIC-400, armv8 timer; 8-core cluster-1 boot = expected sched_lock panic (diagnostic, patch 0204 instruments it) |
-| Storage | Own Arasan SDHCI eMMC driver (polled PIO). Journaled case-sensitive HFS+ iOS root in `userdata`, read/write; GPT-probed |
+| Boot | Stock Huawei bootloader → LK failsafe loads p27 → our boot image (ADT + payload + cmdline) → XNU. **~6–15 min to the lock screen** (the 0176/0177 eMMC-lock fix landed; the pre-0176 "wedge" that hung some boots on `_pra_emmc_lock` is root-caused and fixed) |
+| CPU | 4× Cortex-A53 (ARMv8.0, no LSE, no PAN), GIC-400, armv8 timer. The port is already 8-core capable in source/ADT/config (a cmdline-only change), but `cpus=8` panics on a recursive `pset0.sched_lock` ticket-lock while registering cluster 1 — patch 0204 instruments that panic for the diagnostic |
+| Storage | Own Arasan SDHCI eMMC driver (polled PIO). Journaled case-sensitive HFS+ iOS root in `userdata`, read/write; GPT-probed. The 0176 per-sector locking closed the boot-wedge blocker |
 | Logs | 4 MiB console ring at the tail of `erecovery_kernel`, flushed every 10 s and on panic; pulled from TWRP |
-| iOS userland | launchd → 100+ daemons exec; **the Setup wizard is bypassed** (purplebuddy prefs) and DataMigration is skipped |
-| GUI | **The iOS 16.7.16 lock screen renders** (clock, unlock grabber) — CPU-only, no GPU; ~2 of the last 3 boots reach it |
-| Touch | The CYTT21403 probe is read-only I2C; causality answered — **a wake event DOES re-enable the digitizer**, and backboardd believes the panel is awake because SpringBoard publishes an asserted sensor mode (score 4108, LockButton, WakeOnTapEnabled). The keyless-boot deliverable (no synthetic key) is the open step |
-| Diagnostics | In-kernel per-thread sampler (`sweetsample=…`): user pc/bt + kernel-side state (thread pointer, wait state, wait event, wait queue, block caller, kernel fp chain) printed to the ring every 2 min |
+| iOS userland | launchd → 100+ daemons exec; the Setup wizard is bypassed (purplebuddy prefs) and DataMigration is skipped |
+| GUI | **The iOS 16.7.16 lock screen renders** (clock, unlock grabber) — CPU-only, no GPU; the wall clock was confirmed advancing (the frozen-clock theory was refuted) |
+| Touch | The CYTT21403 digitizer is fully driven from the kernel: I2C bring-up, app-mode, 10 ms input poll, HID events injected into a queue backboardd maps/arms/drains. **Causality answered — a wake event DOES re-enable the digitizer**: the idle timer's `displayState: off` sensor-mode latches the digitizer off, and backboardd believes the panel is awake only after a wake/power event. The deliverable (touch works from boot with **no synthetic key**) is the open step |
+| Diagnostics | In-kernel per-thread sampler (`sweetsample=…`): user pc/bt + kernel-side state printed to the ring; queue telemetry (enq/drop/head/tail), powerreq/display-power traces |
 | Crashes | Panic backtraces go to screen AND the eMMC ring; every kernel panic since 0156 was root-caused and fixed |
 
 **Current blockers (named, in fix order):**
@@ -33,28 +33,34 @@ SpringBoard. Donor tree: [ios-galaxy-s8](https://github.com/Kamion008/ios-galaxy
 1. **1.375 GiB RAM change panics early VM init** — T24 (patch 0203 + RAM
    `0x40000000 → 0x58000000`, no `a5fb_keep_on`) panicked ~2 s after power-on:
    `kmem_range_init: vm_map_locate_space failing for claim compressor
-   @ vm_kern.c:3645`. The RAM change alone (never boot-tested) is the prime
-   suspect; the isolation flash (`out/pra-xnu-0202-1375mb.img`) is queued.
-2. **`_pra_emmc_lock` wedge** — on some boots, launchd's `sync()` and a
-   backboardd thread block uninterruptibly on the eMMC driver's own mutex
-   (a lost wakeup / hold-across-sleep in the driver's lock discipline; the
-   ring flusher keeps acquiring the same lock, which rules out a stuck
-   holder). Fix: the driver lock audit → patch 0176.
-3. **The wall clock is frozen** (the lock screen shows 4:08 forever):
-   timers tick but `gettimeofday` does not advance — the
-   timebase→wallclock conversion (ADT 1.92 MHz vs the real CNTFRQ).
+   @ vm_kern.c:3645`. The phone's 3 GB is **not** one contiguous block (8 fragments,
+   a 512 MiB gap at 0x60000000, a 32 KiB hole at 0x87b00000); 1.375 GiB is the
+   largest contiguous window. The RAM change alone (never boot-tested) is the
+   prime suspect; the isolation flash (`out/pra-xnu-0202-1375mb.img`) is queued.
+2. **The touch deliverable is gated on a wake/display-state path** — a synthetic
+   power key (0198/0199/0200) makes touch work, but a keyless boot does not yet.
+   0202's host-state lever was **refuted by ring66** (ZERO host-state pushes
+   despite the advertisement); 0203 (display-power honesty) is the next lever,
+   compiled and CI-green but boot-tested only in the T24 combination that hit the
+   RAM panic.
+3. **8-core (cluster-1) scheduler panic** — `cpus=8` is cmdline-only but panics on
+   `pset0.sched_lock`; patch 0204 instruments it. Expected to panic (diagnostic).
 
-**Touch status, in short:** patch 0202's advertised host-state lever
-(MultitouchHostStateKeys) was **refuted by ring66** — ZERO host-state pushes
-despite the advertisement. Patch 0203 (display-power honesty) is compiled
-and CI-green but boot-tested only in the T24 combination that hit the RAM
-panic. The 1×1-rect / events:0 / event-shape theories are refuted — do not
-re-litigate them without new evidence. Hardware tracks: 8-core (patch 0204,
-CI pending), RAM 1.375 GiB (the active blocker), GPU (G3D LPM3-IPC gate).
+**Touch status, in short:** the kernel half is fully proven (descriptor valid,
+app mode, ~10–27 reports/s, HID events injected and drained by backboardd at
+9.2× the queue capacity with zero drops). The blocker is **above the kernel**:
+backboardd drains the queue intact but its HIDEventSystem does not route
+digitizer events to SpringBoard's gesture recognizers while the display is
+believed off. The 1×1-rect / events:0 / event-shape theories are refuted — do
+not re-litigate them without new evidence.
 
 The active handoff with the full state, evidence and next steps:
 [HANDOFF_2026-11-23e.md](HANDOFF_2026-11-23e.md). Run diary:
-[PRA-LX1_PROGRESS.md](PRA-LX1_PROGRESS.md) and [PRA-LX1-noted.md](PRA-LX1-noted.md).
+[PRA-LX1_PROGRESS.md](PRA-LX1_PROGRESS.md), [PRA-LX1-noted.md](PRA-LX1-noted.md)
+and [work/boots.md](work/boots.md) (every boot T1→T24 with ring evidence).
+Per-claim evidence: [work/claim-*.md](work/claim-0181.md). Hardware tracks:
+[work/hw-3gb-design.md](work/hw-3gb-design.md), [work/hw-8core-design.md](work/hw-8core-design.md),
+[work/hw-gpu-status.md](work/hw-gpu-status.md).
 
 ## The boot command line
 
